@@ -77,7 +77,12 @@ func main() {
 			nix("flake", "update")
 		}
 		w.True(w.Exists(filepath.Join(ws, "flake.lock")), "nix left no flake.lock")
-		w.Put(filepath.Join(ws, "flake.lock"), "/cas/out")
+		// The answer under the root contract (design/tool-contract.md):
+		// `{stdout}`, the new lock, for the caller to write.
+		const out = "/tmp/flake-update-out"
+		w.Must(os.MkdirAll(out, 0o755))
+		w.Must(os.WriteFile(filepath.Join(out, "stdout"), []byte(w.Read(filepath.Join(ws, "flake.lock"))), 0o644))
+		w.Put(out, "/cas/out")
 	})
 }
 
