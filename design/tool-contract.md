@@ -306,6 +306,10 @@ The rule: **a tool that reads or changes anything outside caos declares
 cached old commit, a repeated publish would report a stale result, and
 `ci-status` would not see CI move.
 
+A tool that hands work to `std/github` passes its own `request-id` on, so the
+github request is as fresh as the call that made it, and a retry of the outer
+call with the same id reaches the same github results.
+
 `salt` and `test-salt` stay: they re-run everything below a point, or one
 tier, which a per-request id cannot.
 
