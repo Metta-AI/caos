@@ -44,7 +44,7 @@ jq -e --arg commit "$imported" '.commit == $commit and .repository == "https://g
 # `tool_help` describes the entry: its parameters are the model's whole documentation.
 jq -r '.messages[].content | select(type == "array") | .[] | select(.type == "tool_result" and .tool_use_id == "help") | .content | if type == "array" then .[0].text else . end' /tmp/stub/request-3.json > /tmp/help.text
 grep -q "into" /tmp/help.text || fail "tool_help did not describe the entry: $(cat /tmp/help.text)"
-grep -q "Unused session path" /tmp/help.text || fail "tool_help lost the parameter docs: $(cat /tmp/help.text)"
+grep -q "Unused name inside root" /tmp/help.text || fail "tool_help lost the parameter docs: $(cat /tmp/help.text)"
 grep -qF 'Hello World!' /tmp/stub/request-4.json || fail "the read could not see the imported blob"
 
 # Mistakes are values the model can act on: a taken path, and an argument the operation
