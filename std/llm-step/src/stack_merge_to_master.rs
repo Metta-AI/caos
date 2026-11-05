@@ -315,11 +315,7 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
             )),
         );
     };
-    let github = Github {
-        owner,
-        repo,
-        token: ci_status::token_for(&repository)?,
-    };
+    let github = Github::new(owner, repo, ci_status::token_for(&repository)?);
     let prefix = p.branch_prefix.clone().unwrap_or_default();
 
     // The reads: each layer's pull request and the checks on its head.
