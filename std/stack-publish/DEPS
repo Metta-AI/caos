@@ -1,3 +1,6 @@
-# What this entry builds from (format `<path> <name>`): the step, which performs the
-# operation (`@op`) and is the image the entry curries its help onto.
-../llm-step llm-step
+# What this entry builds from (format `<path> <name>`): the Go worker image,
+# which carries git for the ancestry check, and its neighbour std/github, the
+# one image the github-token is granted to, which every remote action goes
+# through (design/tool-contract.md, "One grant").
+../go go
+../github github
