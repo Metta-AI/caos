@@ -349,7 +349,7 @@ fn a_root_parents_its_content_commit_and_a_fork_merges_a_newer_one_in() {
 #[test]
 fn a_v6_session_appends_as_v6_and_forks_into_v7() {
     let mut store = MemoryStore::new();
-    let genesis = oid::ensure_genesis(&mut store).unwrap();
+    let genesis = super::oid::ensure_genesis(&mut store).unwrap();
     let signature = client_signature("Old", "old@example.com", 1_700_000_000);
     let root = Transition::SessionRoot {
         identity: Identity {
@@ -362,13 +362,13 @@ fn a_v6_session_appends_as_v6_and_forks_into_v7() {
     };
     let applied = apply(&mut store, None, &root).unwrap();
     // What a pre-rename build wrote: the v6 marker, under `conversation.root`.
-    let mut tree = tree::TreeBuilder::from(Some(applied.tree.clone()));
-    tree.put(
+    let mut v6 = tree::TreeBuilder::from(Some(applied.tree.clone()));
+    v6.put(
         paths::FORMAT,
         Mode::Blob,
         paths::V6_FORMAT_BYTES.as_bytes().to_vec(),
     );
-    let tree = tree.build(&mut store).unwrap();
+    let v6 = v6.build(&mut store).unwrap();
     let message = events::encode(Kind::SessionRoot, &[]);
     let message = [
         b"conversation.root".as_slice(),
@@ -377,7 +377,7 @@ fn a_v6_session_appends_as_v6_and_forks_into_v7() {
     .concat();
     let root_commit = store
         .write_commit(&tree::CommitInfo {
-            tree,
+            tree: v6,
             parents: vec![genesis],
             author: signature.clone(),
             committer: signature.clone(),
