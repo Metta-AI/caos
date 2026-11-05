@@ -1523,7 +1523,7 @@ mod tests {
                     new: Some(tree),
                 },
                 RefUpdate {
-                    refname: "refs/caos/v3/conversations/test/head".to_string(),
+                    refname: "refs/caos/v4/sessions/test/head".to_string(),
                     expected: None,
                     new: Some(commit.clone()),
                 },

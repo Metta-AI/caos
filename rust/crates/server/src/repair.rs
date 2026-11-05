@@ -155,11 +155,17 @@ enum IntegrityDepth {
 }
 
 const V3_PREFIX: &str = "refs/caos/v3/";
+const V4_PREFIX: &str = "refs/caos/v4/";
+
+/// Session refs: v4, and v3 from before the rename.
+fn is_session_ref(refname: &str) -> bool {
+    refname.starts_with(V3_PREFIX) || refname.starts_with(V4_PREFIX)
+}
 
 fn integrity_depth(refname: &str) -> IntegrityDepth {
     if refname.starts_with("refs/caos/req/")
         || refname.starts_with("refs/caos/res/")
-        || refname.starts_with(V3_PREFIX)
+        || is_session_ref(refname)
     {
         IntegrityDepth::TargetOnly
     } else {
@@ -167,12 +173,12 @@ fn integrity_depth(refname: &str) -> IntegrityDepth {
     }
 }
 
-// A v3 session head is never rewound: an older reflog value can name a
+// A session head is never rewound: an older reflog value can name a
 // state whose write-ahead effects (a landed publication push, half of an atomic
 // spawn) already happened. The loose ref is dropped and the reflog kept for a
 // human to restore from.
 fn reflog_recoverable(refname: &str) -> bool {
-    !refname.starts_with(V3_PREFIX)
+    !is_session_ref(refname)
 }
 
 #[derive(Default)]
