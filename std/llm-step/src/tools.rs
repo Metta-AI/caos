@@ -189,6 +189,10 @@ pub struct TreeTool {
     /// The tool declared `@call`: bind this tool call's id as `call`. See
     /// [`Help::call`].
     pub call: bool,
+    /// The tool declared `@request-id`: an optional `request-id` parameter that
+    /// the harness fills with the tool call's id when the caller omits it. See
+    /// [`Help::request_id`].
+    pub request_id: bool,
     /// The tool declared `@scope <param>`: the SOURCE TREE it runs over, and
     /// changes if it is a writer, is the one the argument `<param>` names. See
     /// [`Help::scope`].
