@@ -220,7 +220,7 @@ fn v5_calls(
                 }
             }
         }
-        if matches!(kind, "session.root" | "conversation.root") {
+        if matches!(kind.as_str(), "session.root" | "conversation.root") {
             break;
         }
         current = info.parents.first().cloned();
