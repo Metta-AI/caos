@@ -422,14 +422,14 @@ and pick it up with `result`, so the wait does not hold up other work:
 
 ```text
 start(path="caos-std/ci-status", arguments={
-  "stack": "sources/<repo>", "branch": "02-tests", "wait-min": "30"})
+  "root": "sources/<repo>", "branch": "02-tests", "wait-min": "30"})
 ... other work ...
 result(ticket=<ticket>)
 ```
 
-Every call reads GitHub afresh: `ci-status` runs inside the step, which is
-keyed on the call itself, so the same arguments after a new push are a new
-read, not a cached answer. A check that has not been created yet is not
+Every call reads GitHub afresh: `ci-status` declares `@request-id`, which the
+harness fills with the call's own id, so the same arguments after a new push
+are a new read, not a cached answer. A check that has not been created yet is not
 waited for: right after a push the answer can be `no checks`.
 
 ### The repository's squash setting
