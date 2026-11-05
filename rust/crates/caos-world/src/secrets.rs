@@ -218,6 +218,20 @@ mod tests {
         assert_eq!(pushed.value, None);
     }
 
+    /// A secret file written before the rename names its session `conversation=`.
+    #[test]
+    fn reads_the_pre_rename_session_field() {
+        let spec = parse_spec("f", "name=gh\nreader:@=imports/y/tool conversation=c1\n").unwrap();
+        assert_eq!(
+            spec.readers,
+            vec![Reader::Session {
+                path: "imports/y/tool".into(),
+                session: "c1".into(),
+            }]
+        );
+        assert!(spec.render_pushed().contains("reader:@=imports/y/tool session=c1"));
+    }
+
     #[test]
     fn refuses_what_it_cannot_honour() {
         assert!(parse_spec("f", "reader:@=a/b\n").is_err());
