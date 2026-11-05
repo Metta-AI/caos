@@ -3,8 +3,9 @@
 > **Historical context only.** The authoritative chat design is
 > [`chat.md`](chat.md) (v3). The schemas and ref layouts described below
 > document the superseded prototype; the current design does not read or
-> migrate them. Current chat is isolated below `refs/caos/v3/`; the old
-> refs may remain in place and are invisible to the v3 clients.
+> migrate them. Current chat is isolated below `refs/caos/v4/` (and
+> `refs/caos/v3/`, read for sessions recorded before the rename); the old
+> refs may remain in place and are invisible to current clients.
 
 **Status:** historical for session storage and turn lifecycle. The
 run-then, tool, and model-loop background remains useful, but the commit shapes,
