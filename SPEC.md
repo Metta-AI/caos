@@ -542,7 +542,9 @@ reader:@=imports/caos/std/llm-step session=<id>
   moves with it — and trusts whoever can move that branch.
 - **`reader:@=<path> session=<id>`** grants whatever is at `path` in that
   session's tree, and only in that session. The agent can edit that
-  code, so this exposes the secret to the agent.
+  code, so this exposes the secret to the agent. Secret files written
+  before caos called a conversation a session say `conversation=<id>`,
+  which still reads the same.
 
 Matching happens where evaluation applies a node's `.caos-expr`. Every node
 has an origin `(T, P)`: a root tree and the node's path in it. A walk's start
