@@ -44,7 +44,7 @@ MIXED_CALLS='[
  {"id":"tu_mtool","input":{"file-path":"tools/merge/.caos-expr","content":"curry --base:hash='"$merge_img"'\n"},"name":"write","type":"tool_use"},
  {"id":"tu_mw","input":{"file-path":"main/mix.txt","content":"hello"},"name":"write","type":"tool_use"},
  {"id":"tu_create","input":{"arguments":{"root":".","cmd":"cp -a main side; mkdir -p memories; echo remembered > memories/test.txt","paths":["main"]},"path":"tools/sh"},"name":"run_tool","type":"tool_use"},
- {"id":"tu_mb","input":{"arguments":{"cmd":"tr a-z A-Z < side/mix.txt > main/mix3.txt; echo second > side/second.txt; mv side review; cp -a review side","paths":["main","side"]},"path":"tools/sh"},"name":"run_tool","type":"tool_use"},
+ {"id":"tu_mb","input":{"arguments":{"root":".","cmd":"tr a-z A-Z < side/mix.txt > main/mix3.txt; echo second > side/second.txt; mv side review; cp -a review side","paths":["main","side"]},"path":"tools/sh"},"name":"run_tool","type":"tool_use"},
  {"id":"tu_me","input":{"source_tree":"main","file-path":"mix.txt","old-string":"hello","new-string":"world"},"name":"edit","type":"tool_use"},
  {"id":"tu_mg","input":{"pattern":"world"},"name":"grep","type":"tool_use"},
  {"id":"tu_mm","input":{"arguments":{"source-tree":"main","theirs":"'"$feature"'"},"path":"tools/merge"},"name":"run_tool","type":"tool_use"},
