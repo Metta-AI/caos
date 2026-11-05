@@ -451,6 +451,34 @@ func merge(base, ours, theirs, message string) (string, []string) {
 	return commit, nil
 }
 
+// export checks a merged tree out into a fresh directory for caos to ingest:
+// `read-tree -u` fetches the blobs it lacks from caos in one go and keeps
+// modes and symlinks. A gitlink checks out as an empty directory, so each is
+// replaced by its commit.
+func export(tree string) string {
+	work := fmt.Sprintf("/tmp/merged-%d", minted)
+	w.Must(os.MkdirAll(work, 0o755))
+	index := fmt.Sprintf("/tmp/index-%d", minted)
+	cmd := exec.Command("git", "-C", graph, "--work-tree="+work, "read-tree", "-m", "-u", tree)
+	cmd.Env = append(os.Environ(), "GIT_INDEX_FILE="+index)
+	out, err := cmd.CombinedOutput()
+	w.True(err == nil, "git read-tree -u %s: %v: %s", tree, err, out)
+	listing := mustGit("ls-tree", "-r", "-z", tree)
+	for _, entry := range strings.Split(listing, "\x00") {
+		meta, path, ok := strings.Cut(entry, "\t")
+		fields := strings.Fields(meta)
+		if !ok || len(fields) != 3 || fields[0] != "160000" {
+			continue
+		}
+		at := fmt.Sprintf("/cas/gitlink-%d-%s", minted, fields[2])
+		w.Caos("get-hash", fields[2], at)
+		w.Must(os.RemoveAll(filepath.Join(work, path)))
+		w.Must(os.MkdirAll(filepath.Dir(filepath.Join(work, path)), 0o755))
+		w.Must(os.Symlink(at, filepath.Join(work, path)))
+	}
+	return work
+}
+
 func hint(layer, theirs string) string {
 	return fmt.Sprintf("Run run_tool(path=\"caos-std/merge\", arguments={\"root\": \"<stack>/%s\", \"theirs\": \"%s\"}) to get a conflict ledger, resolve it, and run stack-sync again.", layer, theirs)
 }
