@@ -671,7 +671,11 @@ fn parse_help(ctx: &str, text: &str) -> Help {
     // one of them as well would ask for two inputs at once: reported, and the
     // old one not obeyed.
     if root {
-        for (declared, tag) in [(wants_in, "@in"), (git, "@git"), (scope.is_some(), "@scope")] {
+        for (declared, tag) in [
+            (wants_in, "@in"),
+            (git, "@git"),
+            (scope.is_some(), "@scope"),
+        ] {
             if declared {
                 eprintln!("{ctx}: {tag} cannot be declared with @root — ignored");
             }
