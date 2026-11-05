@@ -268,6 +268,7 @@ impl TreeTool {
             wants_in: help.wants_in,
             call: help.call,
             request_id: help.request_id,
+            root: help.root,
             scope: help.scope,
             op: help.op,
         }
