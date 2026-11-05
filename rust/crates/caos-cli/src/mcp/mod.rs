@@ -755,7 +755,7 @@ mod tests {
             let id = recorded_session(&payload).unwrap();
             let refname = session_ref(&id).unwrap();
             assert!(
-                refname.starts_with("refs/caos/v3/conversations/"),
+                refname.starts_with("refs/caos/v4/sessions/"),
                 "session id {hostile:?} named {refname}"
             );
             assert_eq!(refs::parse_head_ref(&refname).unwrap(), id);

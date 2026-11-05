@@ -33,7 +33,7 @@ stop() { # <session> <closing message>
     '{hook_event_name:"Stop",session_id:$s,last_assistant_message:$m}')" >/dev/null
 }
 ref_of() { # <session id>
-  printf 'refs/caos/v3/conversations/%s/head' \
+  printf 'refs/caos/v4/sessions/%s/head' \
     "$(printf '%s' "$1" | od -An -tx1 | tr -d ' \n')"
 }
 # The step writes the session on the server, so this checkout has only

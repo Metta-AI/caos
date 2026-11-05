@@ -162,7 +162,7 @@ record "$initial_head" .caos/identity.json > /tmp/child-identity.json
 
 child_key=$(printf '%s' "$child" | od -An -tx1 | tr -d ' \n')
 membership=$(git ls-remote --refs caos \
-  "refs/caos/v3/users/*/conversations/*/$child_key") \
+  "refs/caos/v4/users/*/sessions/*/$child_key") \
   || fail "checking child membership refs"
 [ -z "$membership" ] || fail "child unexpectedly has a user membership ref"
 

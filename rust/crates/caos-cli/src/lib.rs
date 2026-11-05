@@ -2965,7 +2965,7 @@ mod tests {
     fn session_refs_are_v3() {
         assert_eq!(
             session_ref("talk-1").unwrap(),
-            "refs/caos/v3/conversations/74616c6b2d31/head"
+            "refs/caos/v4/sessions/74616c6b2d31/head"
         );
     }
 

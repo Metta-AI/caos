@@ -213,7 +213,7 @@ git ls-remote --refs caos "$session_prefix/*" > session.refs
   || fail "session does not have exactly one canonical ref"
 session_key=$(printf '%s' "$conv" | od -An -v -tx1 | tr -d '[:space:]')
 git ls-remote --refs caos \
-  "refs/caos/v3/users/*/conversations/active/$session_key" > membership.refs
+  "refs/caos/v4/users/*/sessions/active/$session_key" > membership.refs
 [ "$(wc -l < membership.refs)" -eq 1 ] \
   || fail "session does not have exactly one active creator membership"
 [ "$($TOOL read --repo "$PWD" --head "$tip" --path .caos/title)" = "fresh start" ] \

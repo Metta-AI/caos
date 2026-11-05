@@ -3997,7 +3997,7 @@ mod tests {
                 record: AsyncRecord {
                     task: task.clone(),
                     status: TaskStatus::Pending,
-                    target_ref: Some("refs/caos/v3/conversations/session/head".to_string()),
+                    target_ref: Some("refs/caos/v4/sessions/session/head".to_string()),
                     result: None,
                     reason: None,
                 },
