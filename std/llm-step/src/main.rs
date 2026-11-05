@@ -4446,6 +4446,84 @@ mod tests {
         let error = lookup_theirs(Some(&refs), Some("missing")).unwrap_err();
         assert!(error.contains("main") && error.contains("origin/main"));
     }
+    /// A call a previous step left started is answered as unfinished, never run
+    /// again; and a step that finds another one finished it first leaves that
+    /// answer alone.
+    #[test]
+    fn a_call_left_started_is_closed_as_unfinished() {
+        for concurrent in [false, true] {
+            let args = json!({"path":"caos-std/github","arguments":{}});
+            let golden = golden_with_first("run_tool", args.clone()).unwrap();
+            let call = Call {
+                id: "first".into(),
+                name: "run_tool".into(),
+                input: args,
+            };
+            let site = CallSite::at(&golden.request, &call, ASSISTANT_ID);
+            let mut started = site.stub(None);
+            started.status = CallStatus::Started;
+            let started_head = append_memory(
+                &mut golden.store.clone(),
+                &golden.head,
+                Transition::ToolStart {
+                    record: started.clone(),
+                    payloads: Vec::new(),
+                },
+            );
+            assert!(started_head.is_ok());
+            let mut objects = golden.store;
+            let head = append_memory(
+                &mut objects,
+                &golden.head,
+                Transition::ToolStart {
+                    record: started.clone(),
+                    payloads: Vec::new(),
+                },
+            )
+            .unwrap();
+            // The other step's answer, landing between this step's look and its push.
+            let race = concurrent.then(|| {
+                let record = completed_record(
+                    &started,
+                    ToolResult::Complete {
+                        observation: observation_path(&started),
+                        proposal: None,
+                    },
+                    None,
+                );
+                tool_complete_transition(record, &result_block("first", "done", false), Vec::new())
+                    .unwrap()
+            });
+            let store = ImportStore {
+                objects,
+                head: head.clone(),
+                race,
+                lost_ack: false,
+            };
+            let mut state = progress::State::from_store(
+                store,
+                "refs/conversations/session/head".into(),
+                head,
+            )
+            .unwrap();
+            close_unfinished(&mut state, &started).unwrap();
+            state.reload().unwrap();
+            let record = state.session().unwrap().tool("first").unwrap().unwrap();
+            assert_eq!(
+                record.status,
+                if concurrent {
+                    CallStatus::Complete
+                } else {
+                    CallStatus::Failed
+                }
+            );
+            // Looking again changes nothing.
+            let before = state.head().clone();
+            close_unfinished(&mut state, &started).unwrap();
+            assert_eq!(*state.head(), before);
+        }
+    }
+
     struct ImportStore {
         objects: MemoryStore,
         head: Oid,
