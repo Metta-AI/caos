@@ -234,14 +234,7 @@ pub fn apply(
             files,
         } => {
             let session = parent(store, parent_head)?;
-            validate_tool_completion(
-                &session,
-                record,
-                payloads,
-                files,
-                &mut builder,
-                &mut events,
-            )?;
+            validate_tool_completion(&session, record, payloads, files, &mut builder, &mut events)?;
         }
         Transition::AsyncStart { record } => {
             let session = parent(store, parent_head)?;
@@ -584,10 +577,7 @@ fn validate_entry_payloads(
 /// An assistant message's `tool_use` ids are the ids its calls are recorded
 /// under, so they are unique: within the message, and against every call the
 /// session has already recorded.
-fn validate_declared_calls(
-    session: &Session<'_>,
-    entry: &TranscriptEntry,
-) -> Result<(), String> {
+fn validate_declared_calls(session: &Session<'_>, entry: &TranscriptEntry) -> Result<(), String> {
     let ids: Vec<String> = entry.tool_uses().map(|(id, _, _)| id.to_string()).collect();
     paths::validate_unique(&ids, "declared call id")?;
     for id in &ids {
@@ -630,10 +620,7 @@ fn validate_entry_resolution(
     Ok(())
 }
 
-fn validate_tool_source_tree(
-    session: &Session<'_>,
-    record: &CallRecord,
-) -> Result<(), String> {
+fn validate_tool_source_tree(session: &Session<'_>, record: &CallRecord) -> Result<(), String> {
     if record.source_tree_name.is_some() && record.input_commit.is_none() {
         return Err("a selected source tree requires an input commit".to_string());
     }

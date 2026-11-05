@@ -113,9 +113,7 @@ pub fn parse_spec(file_name: &str, text: &str) -> Result<Spec, String> {
             "value" => spec.value = Some(Value::Inline(val.to_string())),
             "value:@" => spec.value = Some(Value::File(val.trim().to_string())),
             "reader:@@" => spec.readers.push(parse_locator_reader(file_name, val)?),
-            "reader:@" => spec
-                .readers
-                .push(parse_session_reader(file_name, val)?),
+            "reader:@" => spec.readers.push(parse_session_reader(file_name, val)?),
             other => return Err(format!("secret {file_name}: unknown key {other:?}")),
         }
     }
@@ -155,7 +153,9 @@ fn parse_session_reader(file_name: &str, val: &str) -> Result<Reader, String> {
     let mut session = None;
     for word in words {
         match word.split_once('=') {
-            Some(("conversation" | "session", id)) if !id.is_empty() => session = Some(id.to_string()),
+            Some(("conversation" | "session", id)) if !id.is_empty() => {
+                session = Some(id.to_string())
+            }
             _ => return Err(format!("secret {file_name}: unknown reader field {word:?}")),
         }
     }

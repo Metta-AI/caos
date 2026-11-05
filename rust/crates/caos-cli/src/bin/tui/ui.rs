@@ -14,7 +14,7 @@ use ratatui_widgets::paragraph::{Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
-    short_hash, ActivityState, App, Command, SessionState, EntryRole, Focus, ScrollState,
+    short_hash, ActivityState, App, Command, EntryRole, Focus, ScrollState, SessionState,
     TranscriptPoint, View, COMMANDS, PALETTE_COMMANDS,
 };
 use caos_cli::TurnPhase;
@@ -276,12 +276,7 @@ pub(super) fn reference_copy_at(
     }
 }
 
-pub(super) fn content_contains(
-    state: &SessionState,
-    area: Rect,
-    column: u16,
-    row: u16,
-) -> bool {
+pub(super) fn content_contains(state: &SessionState, area: Rect, column: u16, row: u16) -> bool {
     layout(state, false, area)
         .content
         .contains(Position::new(column, row))
@@ -436,53 +431,51 @@ fn render_sessions(app: &App, frame: &mut Frame<'_>, area: Rect) {
     // The list's two-cell highlight symbol and our two-cell status prefix are
     // both inside the border, even for unselected rows.
     let detail_width = inner.width.saturating_sub(4);
-    let items: Vec<ListItem<'_>> = app
-        .sessions
-        .iter()
-        .map(|state| {
-            let is_child = state.parent.as_ref().is_some_and(|parent| {
-                app.sessions
-                    .iter()
-                    .any(|candidate| candidate.id == *parent)
-            });
-            let indent = if is_child { "  " } else { "" };
-            let (mark, color) = if state.running {
-                ("*", Color::Yellow)
-            } else if state.generating_title {
-                ("~", Color::Magenta)
-            } else {
-                (" ", Color::DarkGray)
-            };
-            let (title, detail) = state.sidebar_text(
-                detail_width.saturating_sub(u16::try_from(indent.len()).unwrap_or(u16::MAX)),
-            );
-            ListItem::new(vec![
-                Line::from(vec![
-                    Span::raw(indent),
-                    Span::styled(format!("{mark} "), Style::default().fg(color)),
-                    Span::styled(
-                        title,
-                        if state.has_placeholder_title() {
+    let items: Vec<ListItem<'_>> =
+        app.sessions
+            .iter()
+            .map(|state| {
+                let is_child = state.parent.as_ref().is_some_and(|parent| {
+                    app.sessions.iter().any(|candidate| candidate.id == *parent)
+                });
+                let indent = if is_child { "  " } else { "" };
+                let (mark, color) = if state.running {
+                    ("*", Color::Yellow)
+                } else if state.generating_title {
+                    ("~", Color::Magenta)
+                } else {
+                    (" ", Color::DarkGray)
+                };
+                let (title, detail) = state.sidebar_text(
+                    detail_width.saturating_sub(u16::try_from(indent.len()).unwrap_or(u16::MAX)),
+                );
+                ListItem::new(vec![
+                    Line::from(vec![
+                        Span::raw(indent),
+                        Span::styled(format!("{mark} "), Style::default().fg(color)),
+                        Span::styled(
+                            title,
+                            if state.has_placeholder_title() {
+                                Style::default()
+                                    .fg(Color::DarkGray)
+                                    .add_modifier(Modifier::DIM)
+                            } else {
+                                Style::default()
+                            },
+                        ),
+                    ]),
+                    Line::from(vec![
+                        Span::raw(format!("{indent}  ")),
+                        Span::styled(
+                            detail,
                             Style::default()
                                 .fg(Color::DarkGray)
-                                .add_modifier(Modifier::DIM)
-                        } else {
-                            Style::default()
-                        },
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::raw(format!("{indent}  ")),
-                    Span::styled(
-                        detail,
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::DIM),
-                    ),
-                ]),
-            ])
-        })
-        .collect();
+                                .add_modifier(Modifier::DIM),
+                        ),
+                    ]),
+                ])
+            })
+            .collect();
     let inner_height = inner.height;
     let offset = session_list_offset(app.selected, app.sessions.len(), inner_height);
     let mut selected = ListState::default()
@@ -1098,10 +1091,7 @@ pub(super) fn transcript_point(
     ((absolute_row as usize) < line_count).then_some(point)
 }
 
-pub(super) fn transcript_selection_text(
-    state: &SessionState,
-    terminal: Rect,
-) -> Option<String> {
+pub(super) fn transcript_selection_text(state: &SessionState, terminal: Rect) -> Option<String> {
     let selection = state.transcript_selection?;
     let area = layout(state, true, terminal).content;
     let inner = transcript_inner(area);

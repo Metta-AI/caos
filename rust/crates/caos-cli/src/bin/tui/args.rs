@@ -53,7 +53,9 @@ impl Args {
                 "--username" => user_flag = Some(value(&mut args, arg)?),
                 "--list-archived" => parsed.list_archived = true,
                 "--unarchive" => parsed.unarchive = Some(value(&mut args, arg)?),
-                "-c" | "--session" | "--conversation" => parsed.session = Some(value(&mut args, arg)?),
+                "-c" | "--session" | "--conversation" => {
+                    parsed.session = Some(value(&mut args, arg)?)
+                }
                 "--new" => parsed.new_session = true,
                 "--empty" => {
                     parsed.empty = true;
@@ -126,9 +128,7 @@ impl Args {
             return Err("--from and --base are mutually exclusive".to_string());
         }
         if parsed.from_commit.is_some() && parsed.session.is_some() {
-            return Err(
-                "--from starts a fresh session and cannot be combined with -c".to_string(),
-            );
+            return Err("--from starts a fresh session and cannot be combined with -c".to_string());
         }
         if let Some(from) = &parsed.from_commit {
             parsed.new_session = true;
@@ -145,8 +145,7 @@ impl Args {
                 || parsed.turn != TurnOptions::default())
         {
             return Err(
-                "archive-management options cannot be combined with session options"
-                    .to_string(),
+                "archive-management options cannot be combined with session options".to_string(),
             );
         }
         // A session that only lists or restores archives touches no worker, and

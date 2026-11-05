@@ -219,10 +219,7 @@ fn validate_root_shape(store: &dyn ObjectStore, tree: &Oid) -> Result<(), String
             entry.name.as_str(),
             "format" | "identity.json" | "title" | "transcript"
         ) {
-            return Err(format!(
-                "unknown session metadata .caos/{}",
-                entry.name
-            ));
+            return Err(format!("unknown session metadata .caos/{}", entry.name));
         }
     }
     Session::open_tree(store, tree)?.identity()?;

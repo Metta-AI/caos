@@ -318,10 +318,7 @@ impl Secrets {
             headers.push((caos_world::secrets::READERS_HEADER, self.readers.join(" ")));
         }
         if let Some(session) = &self.session {
-            headers.push((
-                caos_world::secrets::SESSION_HEADER,
-                session.clone(),
-            ));
+            headers.push((caos_world::secrets::SESSION_HEADER, session.clone()));
         }
         headers
     }

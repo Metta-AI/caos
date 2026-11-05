@@ -379,11 +379,10 @@ fn overview(config: &Config, caller: &Caller, claude_session: Option<&str>) -> V
              PreToolUse hook that supplies it is not installed\n"
         ),
         Some(claude_session) => match session_id_for(claude_session) {
-            Err(error) => format!("session: Claude Code session {claude_session:?} is unusable: {error}\n"),
-            Ok(id) => format!(
-                "session: {id}\nsession head: {}\n",
-                head_of(config, &id)
-            ),
+            Err(error) => {
+                format!("session: Claude Code session {claude_session:?} is unusable: {error}\n")
+            }
+            Ok(id) => format!("session: {id}\nsession head: {}\n", head_of(config, &id)),
         },
     };
     let step = match caller.step {
