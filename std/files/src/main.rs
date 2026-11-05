@@ -534,6 +534,7 @@ mod tests {
         );
         assert!(message.starts_with("caos-std/README.md is not in this tree"));
         assert!(message.contains("EVALUATED tree"), "{message}");
+        assert!(message.contains("`root`"), "{message}");
         let other = resolve_failure("a", "caos: \"a\" traverses a non-directory");
         assert_eq!(other, "resolving a: \"a\" traverses a non-directory");
     }
