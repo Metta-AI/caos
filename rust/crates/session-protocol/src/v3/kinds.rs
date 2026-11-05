@@ -90,6 +90,17 @@ mod tests {
     }
 
     #[test]
+    fn v6_root_and_fork_names_still_parse() {
+        assert_eq!(Kind::parse("conversation.root"), Ok(Kind::SessionRoot));
+        assert_eq!(Kind::parse("conversation.fork"), Ok(Kind::SessionFork));
+        assert_eq!(
+            Kind::parse_message(b"conversation.fork\n\n{\"events\":[]}"),
+            Ok(Kind::SessionFork)
+        );
+        assert_eq!(Kind::SessionRoot.as_str(), "session.root");
+    }
+
+    #[test]
     fn commit_messages_are_exact() {
         for message in [
             b"tool.complete".as_slice(),
