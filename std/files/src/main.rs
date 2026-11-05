@@ -7,17 +7,17 @@
 //! path, a `help` and a place in `tool_help`/`run_tool` like any other, and
 //! `llm-step` is no longer the only way to reach them.
 //!
-//! THE INPUT IS `in`, the tree the tool runs over (`@in`: a caller can redirect
-//! it, and it defaults to the tree the tool's own path selects). Paths are
-//! relative to it and traverse code references, so `feature/dirty/README.md`
-//! reaches into a source tree. A reader's answer is a BLOB. A writer's is the
-//! tree a writer returns (SPEC, "Writers"): `prop`, the new tree for the harness
-//! to apply, `out`, what the model reads, and `failed` when the call failed.
+//! THE INPUT IS `root` (design/tool-contract.md, "`root`"): the object at the
+//! path the call named, bound as `/cas/args/root`, and absent when nothing is
+//! there. `read`, `write`, `edit` and `remove` work on that object itself;
+//! `ls`, `copy` and `move` on a directory or source tree, with `from` and `to`
+//! relative to it. Every answer is a tree: `stdout`, what the model reads, and
+//! `failed` on a mistake; a writer's adds `root`, the new object for the root
+//! path, or `deleted`. The harness puts it back and makes the commits above it.
 //!
-//! A call the model got wrong is a VALUE, never a failed worker: a reader says so
-//! in a `report` that opens `FAILED`, a writer in a `failed` marker over an
-//! unchanged `prop`. Only a broken installation (a transport error, a missing
-//! input) fails the job.
+//! A call the model got wrong is a VALUE, never a failed worker: `failed` and
+//! the reason in `stdout`. Only a broken installation (a transport error)
+//! fails the job.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
