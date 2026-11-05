@@ -642,6 +642,7 @@ fn parse_help(ctx: &str, text: &str) -> Help {
         writer,
         wants_in,
         call,
+        request_id,
         scope,
         op,
     }
