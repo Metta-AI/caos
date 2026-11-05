@@ -3,8 +3,7 @@
 # from the tree the build sees: editing the docs re-keys this tool's ArgTree and
 # nothing it builds from.
 HELP=<<END
-Show a source tree's first-parent commit history newest-first: one line per commit with its short hash, date, author and subject. Optionally start from a given revision and/or restrict to commits that changed a path. Reads git history the tree alone can't show.
-@param source-tree Path of the source tree (a code reference in the session), such as feature/01-change.
+Show a source tree's first-parent commit history newest-first: one line per commit with its short hash, date, author and subject. Optionally start from a given revision and/or restrict to commits that changed a path. Reads git history the tree alone can't show. `root` is the source tree, such as sources/repo/01-layer.
 @param [rev] Where to start (default HEAD, the source tree's own commit). A commit hash, or HEAD with ~N or ^ ancestry.
 @param [path] Only show commits that changed this source-tree-relative path.
 @param [count] Maximum number of commits to show (default 20).
