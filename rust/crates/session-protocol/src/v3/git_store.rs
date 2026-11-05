@@ -672,7 +672,7 @@ impl GitStore {
         updates
             .iter()
             .find(|update| {
-                update.refname.starts_with("refs/caos/v3/conversations/") && update.new.is_some()
+                update.refname.starts_with(super::refs::SESSIONS_PREFIX) && update.new.is_some()
             })
             .and_then(|update| update.new.clone())
             .or_else(|| {
