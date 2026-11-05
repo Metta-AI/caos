@@ -1076,8 +1076,9 @@ fn op_call(call: &Call) -> Call {
 
 /// Perform a step operation (`@op` in a tool's help). Each owns its call's
 /// lifecycle: it writes the call's start, the records it exists for, and the
-/// call's completion itself. `started` is the call's record when this is a RESUME
-/// of an operation that began and has not finished.
+/// call's completion itself. `started` is the call's record when the step picks
+/// up an `agent-wait` that began in an earlier invocation; no other operation is
+/// ever run a second time (design/tool-contract.md, "No automatic resume").
 ///
 /// Returns whether the step should carry on at once. The one that does not is
 /// `agent-wait`, which dispatches a join on the child's relay and waits for its
