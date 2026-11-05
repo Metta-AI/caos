@@ -75,10 +75,11 @@ pub(super) fn wait_until(
         }
         first = false;
         let now = Instant::now();
-        if now >= deadline {
-            return Ok(false);
+        match deadline {
+            Some(deadline) if now >= deadline => return Ok(false),
+            Some(deadline) => sleep(POLL.min(deadline - now)),
+            None => sleep(POLL),
         }
-        sleep(POLL.min(deadline - now));
     }
 }
 
