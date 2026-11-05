@@ -2150,7 +2150,8 @@ fn root_callback(
         Ok(result) => result,
         Err(error) => return fail(format!("{}: {error}", writer.unwrap_or("the tool"))),
     };
-    let block = result_block(&record.id, &tools::keep_tail(&result.stdout), result.failed);
+    let text = tools::keep_tail(&result.stdout);
+    let block = result_block(&record.id, &text, result.failed);
     let Some(tool) = writer else {
         return Ok((block, None));
     };
