@@ -395,11 +395,7 @@ impl<'s> Session<'s> {
             .async_tasks()?
             .into_iter()
             .map(super::TaskRecord::Computation)
-            .chain(
-                self.children()?
-                    .into_iter()
-                    .map(super::TaskRecord::Session),
-            )
+            .chain(self.children()?.into_iter().map(super::TaskRecord::Session))
             .collect())
     }
 

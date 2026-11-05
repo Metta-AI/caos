@@ -1,4 +1,4 @@
-use super::{ui, App, Composer, SessionState, EntryRole};
+use super::{ui, App, Composer, EntryRole, SessionState};
 use ratatui_core::buffer::CellWidth;
 
 /// A browsing session freezes the transcript order while remote updates arrive.

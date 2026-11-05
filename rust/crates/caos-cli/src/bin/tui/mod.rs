@@ -358,8 +358,7 @@ pub(crate) fn run(raw: &[String]) -> Result<(), String> {
         let transport = GitTransport::from_cwd()?;
         transport.ensure_server_reachable()?;
         if args.list_archived {
-            for session in
-                list_user_sessions(&transport, &args.user, UserSessionStatus::Archived)?
+            for session in list_user_sessions(&transport, &args.user, UserSessionStatus::Archived)?
             {
                 println!("{}\t{}", session.id, session.title);
             }

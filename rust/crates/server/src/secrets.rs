@@ -65,9 +65,9 @@ impl Context {
                     });
                     pins.insert(locator.clone(), pinned.ok());
                 }
-                Reader::Session {
-                    session: id, ..
-                } if Some(id) == session.as_ref() && head.is_none() => {
+                Reader::Session { session: id, .. }
+                    if Some(id) == session.as_ref() && head.is_none() =>
+                {
                     head = session_head(config, id).unwrap_or_else(|e| {
                         eprintln!("secrets: session {id}: {e}");
                         None
@@ -571,12 +571,11 @@ impl<'a> Matcher<'a> {
                 components(&origin.path).eq(dir.iter().map(String::as_str))
                     && roots.contains(&origin.root)
             }
-            Matcher::Session { config, head, path } => {
-                match_session(config, head, path, origin).unwrap_or_else(|e| {
+            Matcher::Session { config, head, path } => match_session(config, head, path, origin)
+                .unwrap_or_else(|e| {
                     eprintln!("secrets: a reader could not be checked, so it grants nothing: {e}");
                     false
-                })
-            }
+                }),
         }
     }
 }
@@ -606,12 +605,7 @@ fn session_head(config: &Config, session: &str) -> Result<Option<String>, String
 /// `path` in the session's head tree, evaluated the way the session
 /// evaluates it: from the root of whichever tree along the path the walk
 /// started at, a source tree's gitlink included.
-fn match_session(
-    config: &Config,
-    head: &str,
-    path: &str,
-    origin: &Origin,
-) -> Result<bool, String> {
+fn match_session(config: &Config, head: &str, path: &str, origin: &Origin) -> Result<bool, String> {
     let parts: Vec<&str> = components(path).collect();
     let rest: Vec<&str> = components(&origin.path).collect();
     if rest.len() > parts.len() || parts[parts.len() - rest.len()..] != rest[..] {

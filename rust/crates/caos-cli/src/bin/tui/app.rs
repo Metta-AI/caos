@@ -6,12 +6,11 @@ use std::time::Duration;
 
 use caos::{GitTransport, Transport};
 use caos_cli::{
-    archive_user_session, compare_and_set_session_title, session_load,
-    session_load_at, session_ref, session_snapshot, default_title,
-    describe_tool_set, fork_session, generate_session_title, interrupt_session,
-    invite_user_to_session, list_user_sessions, publish_user_session, run_chat_turn,
-    set_session_title, submit_interjection, unarchive_user_session, SessionLoad,
-    SessionRole, SessionSnapshot, InviteOutcome, PublicationSummary, SourceTreeDiff,
+    archive_user_session, compare_and_set_session_title, default_title, describe_tool_set,
+    fork_session, generate_session_title, interrupt_session, invite_user_to_session,
+    list_user_sessions, publish_user_session, run_chat_turn, session_load, session_load_at,
+    session_ref, session_snapshot, set_session_title, submit_interjection, unarchive_user_session,
+    InviteOutcome, PublicationSummary, SessionLoad, SessionRole, SessionSnapshot, SourceTreeDiff,
     ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase, UserSessionStatus,
     UserSessionSummary, DEFAULT_MODEL,
 };
@@ -1182,11 +1181,7 @@ impl SessionState {
         }
     }
 
-    fn reload(
-        &mut self,
-        transport: &GitTransport,
-        current_user: &str,
-    ) -> Option<SessionSnapshot> {
+    fn reload(&mut self, transport: &GitTransport, current_user: &str) -> Option<SessionSnapshot> {
         match session_load(transport, &self.id) {
             Ok(Some(load)) => {
                 let snapshot = load.snapshot.clone();
@@ -1719,33 +1714,21 @@ impl App {
             args.from_commit = Some(commit.clone());
             args.turn.base = Some(commit);
         }
-        let mut sessions =
-            list_user_sessions(&transport, &args.user, UserSessionStatus::Active)?;
+        let mut sessions = list_user_sessions(&transport, &args.user, UserSessionStatus::Active)?;
         let mut relist = false;
         if let Some(requested) = args.session.clone() {
             if args.new_session
-                && (sessions
-                    .iter()
-                    .any(|session| session.id == requested)
+                && (sessions.iter().any(|session| session.id == requested)
                     || session_snapshot(&transport, &requested)?.is_some())
             {
                 return Err(format!(
                     "--new: session {requested:?} already exists; omit --new to continue it"
                 ));
             }
-            if sessions
-                .iter()
-                .all(|session| session.id != requested)
-            {
-                let archived = list_user_sessions(
-                    &transport,
-                    &args.user,
-                    UserSessionStatus::Archived,
-                )?;
-                if archived
-                    .iter()
-                    .any(|session| session.id == requested)
-                {
+            if sessions.iter().all(|session| session.id != requested) {
+                let archived =
+                    list_user_sessions(&transport, &args.user, UserSessionStatus::Archived)?;
+                if archived.iter().any(|session| session.id == requested) {
                     unarchive_user_session(&transport, &args.user, &requested)?;
                     relist = true;
                 } else if session_snapshot(&transport, &requested)?.is_some() {
@@ -1755,14 +1738,9 @@ impl App {
             }
         }
         if relist {
-            sessions =
-                list_user_sessions(&transport, &args.user, UserSessionStatus::Active)?;
+            sessions = list_user_sessions(&transport, &args.user, UserSessionStatus::Active)?;
         }
-        let choice = choose_session(
-            args.session.as_deref(),
-            args.new_session,
-            &sessions,
-        )?;
+        let choice = choose_session(args.session.as_deref(), args.new_session, &sessions)?;
         let (tx, rx) = mpsc::channel();
         let initial_status = args
             .from_commit
@@ -1793,12 +1771,7 @@ impl App {
                 };
                 states.insert(
                     0,
-                    SessionState::new_virtual(
-                        id.clone(),
-                        title,
-                        args.turn.clone(),
-                        initial_status,
-                    ),
+                    SessionState::new_virtual(id.clone(), title, args.turn.clone(), initial_status),
                 );
                 id
             }
@@ -2240,9 +2213,7 @@ impl App {
             spawn(
                 title_repo_dir,
                 tx.clone(),
-                move |transport| {
-                    generate_session_title(transport, &title_options, &first_message)
-                },
+                move |transport| generate_session_title(transport, &title_options, &first_message),
                 move |result| UiMessage::TitleGenerated {
                     session: title_session,
                     result,
@@ -2560,10 +2531,7 @@ impl App {
                     source,
                     result,
                 } => self.finish_fork(&session, &source, result),
-                UiMessage::Turn {
-                    session,
-                    event,
-                } => {
+                UiMessage::Turn { session, event } => {
                     if let Some(index) = self.session_index(&session) {
                         self.on_turn_event(index, event);
                     }
@@ -2592,18 +2560,12 @@ impl App {
                         state.status = "turn failed".to_string();
                     }
                 }
-                UiMessage::Completed {
-                    session,
-                    outcome,
-                } => {
+                UiMessage::Completed { session, outcome } => {
                     if let Some(index) = self.session_index(&session) {
                         self.finish_turn(index, outcome);
                     }
                 }
-                UiMessage::Interrupted {
-                    session,
-                    result,
-                } => {
+                UiMessage::Interrupted { session, result } => {
                     if let Some(index) = self.session_index(&session) {
                         let state = &mut self.sessions[index];
                         match result {
@@ -2665,18 +2627,12 @@ impl App {
                         ));
                     }
                 }
-                UiMessage::TitleGenerated {
-                    session,
-                    result,
-                } => {
+                UiMessage::TitleGenerated { session, result } => {
                     if let Some(index) = self.session_index(&session) {
                         self.finish_title_generation(index, result);
                     }
                 }
-                UiMessage::SourceTreeUpdated {
-                    session,
-                    result,
-                } => {
+                UiMessage::SourceTreeUpdated { session, result } => {
                     let user = self.user.clone();
                     if let Some(index) = self.session_index(&session) {
                         let state = &mut self.sessions[index];
@@ -2743,8 +2699,7 @@ impl App {
             self.repo_dir.clone(),
             self.tx.clone(),
             move |transport| {
-                let summaries =
-                    list_user_sessions(transport, &user, UserSessionStatus::Active)?;
+                let summaries = list_user_sessions(transport, &user, UserSessionStatus::Active)?;
                 Ok(summaries
                     .into_iter()
                     .map(|summary| {
@@ -3846,19 +3801,12 @@ fn choose_session(
     sessions: &[UserSessionSummary],
 ) -> Result<SessionChoice, String> {
     if let Some(requested) = requested {
-        if new
-            && sessions
-                .iter()
-                .any(|session| session.id == requested)
-        {
+        if new && sessions.iter().any(|session| session.id == requested) {
             return Err(format!(
                 "--new: session {requested:?} already exists; omit --new to continue it"
             ));
         }
-        if sessions
-            .iter()
-            .any(|session| session.id == requested)
-        {
+        if sessions.iter().any(|session| session.id == requested) {
             return Ok(SessionChoice::Existing(requested.to_string()));
         }
         return Ok(SessionChoice::New {
@@ -3881,9 +3829,12 @@ fn choose_session(
 mod tests {
 
     use super::*;
-    use caos_cli::{
-        session_head, session_ref, first_available_session_name, SessionReplay,
-    };
+    use caos_cli::{first_available_session_name, session_head, session_ref, SessionReplay};
+    use ratatui_core::backend::TestBackend;
+    use ratatui_core::layout::Rect;
+    use ratatui_core::style::{Color, Modifier};
+    use ratatui_core::terminal::Terminal;
+    use ratatui_widgets::paragraph::{Paragraph, Wrap};
     use session_protocol::v3::apply::{apply, client_signature, mint, Transition};
     use session_protocol::v3::oid::ensure_genesis;
     use session_protocol::v3::records::{
@@ -3891,11 +3842,6 @@ mod tests {
     };
     use session_protocol::v3::refs;
     use session_protocol::v3::{GitStore, Oid, RefUpdate};
-    use ratatui_core::backend::TestBackend;
-    use ratatui_core::layout::Rect;
-    use ratatui_core::style::{Color, Modifier};
-    use ratatui_core::terminal::Terminal;
-    use ratatui_widgets::paragraph::{Paragraph, Wrap};
 
     use super::ui::{
         content_contains, paragraph_scroll, render, scroll_offset, transcript_contains,
@@ -4247,9 +4193,7 @@ mod tests {
             source_tree_diff("main", 'a', 'b', ""),
             source_tree_diff("side", 'c', 'd', ""),
         ];
-        session
-            .composer
-            .insert_str("/update-tree include edits");
+        session.composer.insert_str("/update-tree include edits");
         let (mut app, _) = app_with(vec![session]);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
@@ -4526,10 +4470,7 @@ mod tests {
             "ready".to_string(),
         );
         session.apply_load(load.clone(), "tester");
-        assert_eq!(
-            session.remote_title.as_deref(),
-            Some(NEW_SESSION_TITLE)
-        );
+        assert_eq!(session.remote_title.as_deref(), Some(NEW_SESSION_TITLE));
         assert!(session.automatic_title);
 
         let (mut app, _) = app_with(vec![SessionState::new_virtual(
@@ -4791,8 +4732,7 @@ mod tests {
             app.selected().remote_title.as_deref(),
             Some("Generated title")
         );
-        let listed =
-            list_user_sessions(&transport, "tester", UserSessionStatus::Active).unwrap();
+        let listed = list_user_sessions(&transport, "tester", UserSessionStatus::Active).unwrap();
         assert_eq!(listed[0].title, "Generated title");
 
         std::fs::remove_dir_all(&repo).unwrap();
@@ -4827,8 +4767,7 @@ mod tests {
         app.finish_title_generation(0, Ok("Generated title".to_string()));
 
         assert_eq!(app.selected().title, "Generated title");
-        let listed =
-            list_user_sessions(&transport, "tester", UserSessionStatus::Active).unwrap();
+        let listed = list_user_sessions(&transport, "tester", UserSessionStatus::Active).unwrap();
         assert_eq!(listed[0].title, "Generated title");
 
         std::fs::remove_dir_all(repo).unwrap();
@@ -5153,9 +5092,7 @@ mod tests {
             .join("\n");
         assert!(rendered.contains("> /from <commit> — start a session from a completed turn"));
         assert!(rendered.contains("/title <new title> — rename the selected session"));
-        assert!(
-            rendered.contains("/update-tree <session/gitlink> <message> — submit local edits")
-        );
+        assert!(rendered.contains("/update-tree <session/gitlink> <message> — submit local edits"));
 
         app.selected_mut().composer = Composer::default();
         app.selected_mut().composer.insert_str("/model sonnet-5");
@@ -6584,10 +6521,7 @@ mod tests {
 
         session.apply_load(load.clone(), "Alice");
         assert_eq!(session.pending_submissions.len(), 1);
-        assert_eq!(
-            session.transcript.last().unwrap().text,
-            "another prompt"
-        );
+        assert_eq!(session.transcript.last().unwrap().text, "another prompt");
         assert_eq!(
             session.transcript.last().unwrap().pending_id,
             Some(pending_id)
@@ -6910,9 +6844,7 @@ mod tests {
             },
             observed_head: session.remote_head.clone(),
             observed_title: session.remote_title.clone(),
-            load: Some(Ok(Box::new(
-                session_load(&transport, id).unwrap().unwrap(),
-            ))),
+            load: Some(Ok(Box::new(session_load(&transport, id).unwrap().unwrap()))),
         };
         let (mut app, _) = app_with(vec![session, state("other")]);
         app.repo_dir = repo.clone();
@@ -6932,22 +6864,15 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
-            list_user_sessions(&transport, "Alice", UserSessionStatus::Archived).unwrap()
-                [0]
-            .id,
+            list_user_sessions(&transport, "Alice", UserSessionStatus::Archived).unwrap()[0].id,
             id
         );
         assert_eq!(
-            list_user_sessions(&transport, "Bob", UserSessionStatus::Active).unwrap()[0]
-                .id,
+            list_user_sessions(&transport, "Bob", UserSessionStatus::Active).unwrap()[0].id,
             id
         );
         assert_eq!(
-            session_load(&transport, id)
-                .unwrap()
-                .unwrap()
-                .snapshot
-                .head,
+            session_load(&transport, id).unwrap().unwrap().snapshot.head,
             head
         );
         assert!(!app.apply_remote_poll(vec![stale]));
@@ -7253,10 +7178,7 @@ mod tests {
         assert!(app.selected().command_error.is_none());
         assert_eq!(app.selected().title, "My project");
         assert_eq!(
-            session_snapshot(&transport, id)
-                .unwrap()
-                .unwrap()
-                .title,
+            session_snapshot(&transport, id).unwrap().unwrap().title,
             "My project"
         );
 
@@ -7675,9 +7597,7 @@ mod tests {
         assert_eq!(app.selected().composer.text, "must not submit");
         let error = app.selected().command_error.as_deref().unwrap();
         assert!(error.contains("must have a parent"), "{error}");
-        assert!(session_head(&transport, &pending_id)
-            .unwrap()
-            .is_none());
+        assert!(session_head(&transport, &pending_id).unwrap().is_none());
 
         std::fs::remove_dir_all(&repo).unwrap();
         std::fs::remove_dir_all(&remote).unwrap();

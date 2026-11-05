@@ -89,11 +89,7 @@ pub(super) fn prepare(args: &mut Args) -> Result<PathBuf, String> {
                     .as_deref()
                     .or(args.turn.base.as_deref()),
             )?;
-        seed.put_oid(
-            name,
-            session_protocol::v3::Mode::Commit,
-            commit.clone(),
-        );
+        seed.put_oid(name, session_protocol::v3::Mode::Commit, commit.clone());
         if let Some((path, bytes)) = metadata {
             seed.put(&path, session_protocol::v3::Mode::Blob, bytes);
         }
@@ -556,8 +552,7 @@ mod tests {
             fs::read_to_string(first.join("DEPS")).unwrap(),
             "./std/llm-step llm-step\n"
         );
-        let error =
-            checkout_for(&first, "session", "feature/dirty", &"a".repeat(40)).unwrap_err();
+        let error = checkout_for(&first, "session", "feature/dirty", &"a".repeat(40)).unwrap_err();
         assert!(error.contains("choose a local destination"));
         remember_checkout(&first, "session", "feature/dirty", &first).unwrap();
         let head = git(&first, &["rev-parse", "HEAD"]).unwrap();

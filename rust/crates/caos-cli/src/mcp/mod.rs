@@ -440,10 +440,7 @@ fn on_user_prompt(config: &Config, payload: &Value) -> Result<(), String> {
             "caos session ref {} forked from {from}; {readers}",
             session_ref(&id)?
         ),
-        ("created", _) => format!(
-            "caos session ref {}; {readers}",
-            session_ref(&id)?
-        ),
+        ("created", _) => format!("caos session ref {}; {readers}", session_ref(&id)?),
         _ => return Ok(()),
     };
     let mut message = json!({ "systemMessage": text });
@@ -471,9 +468,7 @@ fn agents_md(config: &Config, head: &str) -> Result<Option<String>, String> {
     let object = |oid: &str| caos::Transport::get_object(&transport, oid);
     let (kind, bytes) = object(head)?;
     if kind != "commit" {
-        return Err(format!(
-            "session head {head} is a {kind}, not a commit"
-        ));
+        return Err(format!("session head {head} is a {kind}, not a commit"));
     }
     let commit = gix::objs::CommitRef::from_bytes(&bytes, gix::hash::Kind::Sha1)
         .map_err(|error| format!("invalid commit {head}: {error}"))?;

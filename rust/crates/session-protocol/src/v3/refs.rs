@@ -61,8 +61,7 @@ pub fn parse_head_ref(refname: &str) -> Result<String, String> {
         return Err(format!("invalid session head ref {refname:?}"));
     }
     let id = id_of_key(key).map_err(|_| format!("invalid session head ref {refname:?}"))?;
-    validate_session_id(&id)
-        .map_err(|_| format!("invalid session head ref {refname:?}"))?;
+    validate_session_id(&id).map_err(|_| format!("invalid session head ref {refname:?}"))?;
     Ok(id)
 }
 
@@ -83,8 +82,8 @@ pub fn parse_membership_ref(refname: &str) -> Result<(String, Membership, String
     if user_key.contains('/') || session_key.contains('/') {
         return Err(format!("invalid session membership ref {refname:?}"));
     }
-    let user = id_of_key(user_key)
-        .map_err(|_| format!("invalid session membership ref {refname:?}"))?;
+    let user =
+        id_of_key(user_key).map_err(|_| format!("invalid session membership ref {refname:?}"))?;
     let session = id_of_key(session_key)
         .map_err(|_| format!("invalid session membership ref {refname:?}"))?;
     validate_user_id(&user)

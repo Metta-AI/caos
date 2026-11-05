@@ -53,8 +53,7 @@ pub const LLM_CALL_ARG: &str = "llm-call";
 const AUTO_NAME_PREFIX: &str = "talk-";
 
 pub const DEFAULT_MODEL: &str = "claude-opus-4-8";
-const DEFAULT_SYSTEM: &str =
-    "You are a coding agent operating on a session filesystem. Use the \
+const DEFAULT_SYSTEM: &str = "You are a coding agent operating on a session filesystem. Use the \
     available tools for file access, builds, tests, and edits. Keep responses concise.";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -432,10 +431,7 @@ fn user_entry(
     }
 }
 
-fn select_source_tree(
-    session: &Session<'_>,
-    requested: Option<&str>,
-) -> Result<String, String> {
+fn select_source_tree(session: &Session<'_>, requested: Option<&str>) -> Result<String, String> {
     let names = session.source_tree_names()?;
     if let Some(name) = requested {
         if names.iter().any(|existing| existing == name) {
@@ -1118,10 +1114,7 @@ pub fn session_head(t: &GitTransport, id: &str) -> Result<Option<String>, String
     Ok(store.read_ref(&refname)?.map(|head| head.to_string()))
 }
 
-pub fn session_snapshot(
-    t: &GitTransport,
-    id: &str,
-) -> Result<Option<SessionSnapshot>, String> {
+pub fn session_snapshot(t: &GitTransport, id: &str) -> Result<Option<SessionSnapshot>, String> {
     let store = open_store(t)?;
     let Some((_, head)) = fetch_head(t, &store, id)? else {
         return Ok(None);
@@ -1144,11 +1137,7 @@ fn snapshot_at(store: &GitStore, id: &str, head: &Oid) -> Result<SessionSnapshot
     snapshot_from(&Session::open(store, head)?, id, head)
 }
 
-fn snapshot_from(
-    session: &Session<'_>,
-    id: &str,
-    head: &Oid,
-) -> Result<SessionSnapshot, String> {
+fn snapshot_from(session: &Session<'_>, id: &str, head: &Oid) -> Result<SessionSnapshot, String> {
     // How the latest turn ended, read off its newest entry: background notices
     // (system messages caos writes) come after a turn without ending it.
     let mut interrupted = false;
@@ -1358,9 +1347,7 @@ fn source_tree_diff(
     })
 }
 
-fn publication_summaries(
-    session: &Session<'_>,
-) -> Result<Vec<PublicationSummary>, String> {
+fn publication_summaries(session: &Session<'_>) -> Result<Vec<PublicationSummary>, String> {
     Ok(session
         .publications_by_creation()?
         .into_iter()
@@ -1381,11 +1368,7 @@ pub fn session_load(t: &GitTransport, id: &str) -> Result<Option<SessionLoad>, S
     load_at(t, &store, id, &head).map(Some)
 }
 
-pub fn session_load_at(
-    t: &GitTransport,
-    id: &str,
-    head: &str,
-) -> Result<SessionLoad, String> {
+pub fn session_load_at(t: &GitTransport, id: &str, head: &str) -> Result<SessionLoad, String> {
     let store = open_store(t)?;
     let head = oid(head, "session head")?;
     store.ensure_local(&head)?;
@@ -1413,9 +1396,7 @@ fn load_at(
             None => session.reference_start(&name)?,
         };
         let mut diff = source_tree_diff(t, store, &name, &base, &source_tree.commit)?;
-        diff.base_name = session
-            .previous_reference(&name)?
-            .map(|(path, _)| path);
+        diff.base_name = session.previous_reference(&name)?.map(|(path, _)| path);
         source_trees.push(diff);
     }
     Ok(SessionLoad {
@@ -1761,11 +1742,7 @@ fn summary_for_advertised_id(
     summary_at_head(store, id, head)
 }
 
-fn summary_at_head(
-    store: &GitStore,
-    id: &str,
-    head: &Oid,
-) -> Result<UserSessionSummary, String> {
+fn summary_at_head(store: &GitStore, id: &str, head: &Oid) -> Result<UserSessionSummary, String> {
     let session = Session::open(store, head)?;
     let info = store.read_commit(head).map_err(String::from)?;
     let identity = session.identity()?;
@@ -1873,11 +1850,7 @@ fn pick_session(
     }
     let refs = remote_refs(
         t,
-        [format!(
-            "{}*{}",
-            refs::SESSIONS_PREFIX,
-            refs::HEAD_SUFFIX
-        )],
+        [format!("{}*{}", refs::SESSIONS_PREFIX, refs::HEAD_SUFFIX)],
     )?;
     let heads = advertised_session_heads(&refs);
     let local_heads = local_session_heads(t)?;
@@ -1987,8 +1960,7 @@ pub fn fork_session_in(
                     source: from.clone(),
                 },
             };
-            if identity.id == id && identity.kind == expected_kind && session.title()? == title
-            {
+            if identity.id == id && identity.kind == expected_kind && session.title()? == title {
                 repair_creation_membership(&*store, user, id, &observed)?;
                 Ok(observed.to_string())
             } else {
@@ -2254,8 +2226,8 @@ pub fn run_chat_turn(
             }
         };
         if let Some(result) = finished {
-            let snapshot = session_snapshot(t, id)?
-                .ok_or_else(|| format!("session {id:?} disappeared"))?;
+            let snapshot =
+                session_snapshot(t, id)?.ok_or_else(|| format!("session {id:?} disappeared"))?;
             // The step's own failure message says why better than the run's
             // error does, when it got as far as writing one.
             if let Err(error) = result {
@@ -2269,8 +2241,7 @@ pub fn run_chat_turn(
             });
         }
         std::thread::sleep(Duration::from_millis(250));
-        let head =
-            session_head(t, id)?.ok_or_else(|| format!("session {id:?} disappeared"))?;
+        let head = session_head(t, id)?.ok_or_else(|| format!("session {id:?} disappeared"))?;
         if head != last_head {
             last_head = head;
             emit(TurnEvent::Status("agent running".to_string()));
@@ -2316,8 +2287,8 @@ pub fn generate_session_title(
             "session title result {hash} is a {kind}, expected a blob"
         ));
     }
-    let text = String::from_utf8(bytes)
-        .map_err(|_| "session title result is not UTF-8".to_string())?;
+    let text =
+        String::from_utf8(bytes).map_err(|_| "session title result is not UTF-8".to_string())?;
     parse_generated_title(&text)
 }
 
@@ -2584,7 +2555,9 @@ fn parse_cli_args(args: &[String], positional_message: bool) -> Result<LineArgs,
                 .ok_or_else(|| format!("{argument} needs a value"))
         };
         match argument.as_str() {
-            "-c" | "--session" | "--conversation" if positional_message => parsed.name = Some(next(&mut index)?),
+            "-c" | "--session" | "--conversation" if positional_message => {
+                parsed.name = Some(next(&mut index)?)
+            }
             "-m" | "--message" => {
                 if message_from_position {
                     return Err(
@@ -3003,11 +2976,7 @@ mod tests {
         let store = open_store(&transport).unwrap();
         assert!(spine_contains(
             &store,
-            oid(
-                &session_head(&transport, "empty").unwrap().unwrap(),
-                "head"
-            )
-            .unwrap(),
+            oid(&session_head(&transport, "empty").unwrap().unwrap(), "head").unwrap(),
             &oid(&head, "root").unwrap()
         )
         .unwrap());
@@ -3429,9 +3398,7 @@ mod tests {
             },
         )
         .unwrap();
-        let load = session_load(&transport, "records-talk")
-            .unwrap()
-            .unwrap();
+        let load = session_load(&transport, "records-talk").unwrap().unwrap();
         assert_eq!(
             load.publications,
             vec![PublicationSummary {
@@ -3501,8 +3468,7 @@ mod tests {
             assert_ne!(commit.parents[0].as_str(), base);
             cursor = commit.parents[0].clone();
         }
-        let session_ref_prefix =
-            format!("{}{}/*", refs::SESSIONS_PREFIX, refs::key_of("talk-1"));
+        let session_ref_prefix = format!("{}{}/*", refs::SESSIONS_PREFIX, refs::key_of("talk-1"));
         assert_eq!(
             git(
                 transport.work_dir(),
@@ -3565,10 +3531,7 @@ mod tests {
         .unwrap();
         assert_eq!(next_request, "b".repeat(40));
         assert_ne!(next_request, base);
-        let replay = session_load(&transport, "talk-1")
-            .unwrap()
-            .unwrap()
-            .replay;
+        let replay = session_load(&transport, "talk-1").unwrap().unwrap().replay;
         assert_eq!(replay.turns.len(), 4);
         assert_eq!(replay.turns[0].commit, first_message);
         assert_eq!(replay.turns[1].commit, active_head.to_string());
@@ -3589,8 +3552,7 @@ mod tests {
         let other = git(transport.work_dir(), &["rev-parse", "HEAD"]);
         fixture_reference(&transport, "talk-1", "other", Some(&other)).unwrap();
         fixture_reference(&transport, "talk-1", "other", None).unwrap();
-        let summaries =
-            list_user_sessions(&transport, "Alice", UserSessionStatus::Active).unwrap();
+        let summaries = list_user_sessions(&transport, "Alice", UserSessionStatus::Active).unwrap();
         assert_eq!(summaries[0].title, "hello");
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -3670,9 +3632,7 @@ mod tests {
         drop(session);
 
         fixture_reference(&transport, "proposal-talk", "main", Some(&base)).unwrap();
-        let load = session_load(&transport, "proposal-talk")
-            .unwrap()
-            .unwrap();
+        let load = session_load(&transport, "proposal-talk").unwrap().unwrap();
         assert_eq!(load.source_trees[0].head, base);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -3776,9 +3736,7 @@ mod tests {
         let active_source = session_head(&transport, "source").unwrap().unwrap();
         // A session is a flat transcript, so it forks as it stands, with its
         // prompt still unanswered.
-        assert!(
-            fork_session(&transport, "Alice", "forked-active", "Fork", &active_source).is_ok()
-        );
+        assert!(fork_session(&transport, "Alice", "forked-active", "Fork", &active_source).is_ok());
         let source = session_head(&transport, "source").unwrap().unwrap();
         let fork = fork_session(&transport, "Alice", "forked", "Fork", &source).unwrap();
         let store = open_store(&transport).unwrap();
@@ -3792,13 +3750,9 @@ mod tests {
         );
         assert!(validate_spine(&store, &fork_oid, &mut HashSet::new()).is_ok());
 
-        assert!(
-            compare_and_set_session_title(&transport, "forked", "Fork", "Generated").unwrap()
-        );
+        assert!(compare_and_set_session_title(&transport, "forked", "Fork", "Generated").unwrap());
         set_session_title(&transport, "forked", "Manual").unwrap();
-        assert!(
-            !compare_and_set_session_title(&transport, "forked", "Generated", "Late").unwrap()
-        );
+        assert!(!compare_and_set_session_title(&transport, "forked", "Generated", "Late").unwrap());
         assert_eq!(
             session_snapshot(&transport, "forked")
                 .unwrap()
