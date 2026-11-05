@@ -3480,7 +3480,7 @@ mod ticket_state_tests {
         let state = settle_ticket_state("pending".into(), live_sequence(&[false]), || {
             Ok("ok tree abc".into())
         });
-        assert_eq!(state.unwrap(), "ok tree abc");
+        assert_eq!(answer(state), "ok tree abc");
     }
 
     #[test]
