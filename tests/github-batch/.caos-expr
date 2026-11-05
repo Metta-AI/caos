@@ -1,0 +1,7 @@
+# tests/github-batch, as an ENTRY: evaluating this directory yields the test's
+# ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST: std/github's batch is the subject (design/tool-contract.md,
+# "One grant"). It never reaches GitHub: every remote is a `.invalid` host and
+# every pushed commit is one the server does not hold.
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --github:@=DEEP-DEPS/github
