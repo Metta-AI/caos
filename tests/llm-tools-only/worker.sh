@@ -42,7 +42,10 @@ run_tools_only() {
       | jq -r --arg id "$call" 'select(.id == $id) | .status') || status=""
     case "$status" in
       complete) return 0 ;;
-      failed | cancelled) fail "call $call ended $status" ;;
+      failed | cancelled)
+        $TOOL tool-observation --repo /tmp/repo --head "$head" --id "$call" >&2 || true
+        fail "call $call ended $status"
+        ;;
     esac
     sleep 0.2
   done
