@@ -34,10 +34,10 @@ Run sh -c over a scratch copy of the directory `root` names: a source tree such 
 
 THE ONE RULE: content is lazy. Put in `paths` every existing file or directory the command reads, edits, copies or moves. A directory brings everything under it, source trees included. Anything not listed is a placeholder link into /cas. Naming one in cat, ls, cp, grep, find or rm says Permission denied. cd says Not a directory, and then the rest of the command runs from the root, where grep -r . and find . print nothing at all because they do not follow those links. Every one of these means: add that path to `paths` and run it again. "No matches" from a command that touched a placeholder is not an answer.
 
-Example (count the lines of every markdown file in an import):
-  run_tool(path="caos-std/bash-tool", arguments={"cmd": "find imports/repo/base -name '*.md' | xargs wc -l", "paths": ["imports/repo/base"]})
+Example (count the lines of every markdown file in a source tree):
+  run_tool(path="caos-std/bash-tool", arguments={"root": "sources/repo/00-base", "cmd": "find . -name '*.md' | xargs wc -l", "paths": ["."]})
 
-New files and new directories need no `paths`. Whatever the command writes is saved to the session, even if the command then exits non-zero; there is no commit step, and editing files in a source tree creates its child commits.
+New files and new directories need no `paths`. Whatever the command writes is saved to the session, even if the command then exits non-zero (the exit code leads the output); there is no commit step, and changing a source tree creates its child commit.
 
 Not available here: git (use the log, show and diff tools), caos-std/ (it exists only in the evaluated tree: use eval_path, then read or ls with root), and the harness's own shell. The root .caos metadata is read-only; a source tree's .caos/conflicts ledger is editable.
 @param cmd The command to run with sh -c.
