@@ -343,22 +343,24 @@ fn ls(root: Option<&str>) -> Result<String, Fail> {
 
 // ---- the writers -------------------------------------------------------------
 //
-// Each returns `(prop, out, message)`: the CAS path of the new tree, what the
-// model reads, and the commit message the harness uses when it mints.
+// Each returns what goes at the root path and what the model reads. The
+// harness writes the commit message (the tool and the root path) unless a tool
+// has something better to say.
 
-type Written = (String, String, String);
+type Written = (New, String);
 
-fn write(ws: &str) -> Result<Written, Fail> {
-    let comps = components("file-path")?;
-    reject_protocol(&comps)?;
+fn write(root: Option<&str>) -> Result<Written, Fail> {
     let content =
         input("content")?.ok_or_else(|| User("write needs a string `content`".to_string()))?;
-    let prop = rebuild(ws, &comps, content.as_bytes(), None)?;
-    Ok((
-        prop,
-        format!("wrote {} ({} bytes)", comps.join("/"), content.len()),
-        format!("write {}", comps.join("/")),
-    ))
+    if let Some(root) = root {
+        if cas_kind(root).map_err(Infra)? != "blob" {
+            return Err(User(
+                "the root is a directory; write replaces one file".to_string(),
+            ));
+        }
+    }
+    let out = format!("wrote {} bytes", content.len());
+    Ok((New::Content(content.into_bytes()), out))
 }
 
 fn edit(ws: &str) -> Result<Written, Fail> {
