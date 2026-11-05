@@ -3468,6 +3468,11 @@ mod ticket_state_tests {
         panic!("redis was read again")
     }
 
+    /// The answer, or a panic naming the error (`HttpError` is not `Debug`).
+    fn answer(state: Result<String, HttpError>) -> String {
+        state.unwrap_or_else(|e| panic!("{} {}", e.status(), e.message()))
+    }
+
     #[test]
     fn a_run_that_finishes_during_the_poll_answers_its_result() {
         // Read 1 saw `pending`; the guard then recorded `ok` and left the live
