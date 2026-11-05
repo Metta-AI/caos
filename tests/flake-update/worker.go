@@ -71,9 +71,7 @@ func main() {
 		switch stage {
 		case "":
 			w.Step("lock from flake.nix alone")
-			w.Caos("run-then", "/cas/args/flake",
-				"--run:hash="+w.Caos("curry", "--base:@=/cas/args/update"),
-				"--then:hash="+next("locked"))
+			update("/cas/args/flake", "locked")
 
 		case "locked":
 			raw, lock := result()
