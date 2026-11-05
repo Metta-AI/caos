@@ -119,8 +119,8 @@ failed)
 execbit)
   R=/cas/args/result; caos get -r "$R" || fail "reading the result"
   [ "$(cat "$R/exit")" = "0" ] || fail "exec run: exit $(cat "$R/exit")"
-  [ "$(cat "$R/stdout")" = "hi" ] || fail "declared file was not executable"
-  [ "$(caos hash "$R/prop")" = "$(ws_oid)" ] || fail "exec bit lost round-tripping"
+  [ "$(cat "$R/command-stdout")" = "hi" ] || fail "declared file was not executable"
+  [ "$(caos hash "$R/root")" = "$(ws_oid)" ] || fail "exec bit lost round-tripping"
   echo "  ok: ./run.sh ran and the 100755 mode round-tripped" >&2
 
   printf 'bash-tool: ALL PASS\n' > /tmp/report
