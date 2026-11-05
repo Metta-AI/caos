@@ -80,5 +80,6 @@ for name in test-salt only max-parallel; do
 done
 
 request=$(caos prepare-request --base:@=/cas/args/daemon \
-  "--affinity=$tree" --op=run-tests --in:@=/cas/args/in "${forward[@]}")
-caos run-request-then "$request"
+  "--affinity=$tree" --op=run-tests --in:@="$in" "${forward[@]}")
+then=$(caos curry --base:@=/cas/args/base --worker1:@=/cas/args/worker1 --stage=answer)
+caos run-request-then "$request" --then:hash="$then"
