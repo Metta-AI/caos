@@ -1814,6 +1814,112 @@ fn launch_resolved_tool(
     }
 }
 
+/// Launch a `@root` tool (design/tool-contract.md, "`root`"): it is given the
+/// object at its `root` path in the session as it is now, and nothing else.
+/// Where the tool sits decided which definition runs, never what it runs
+/// over. The session commit is the call's input, so a writer's result is put
+/// back against exactly what it was given.
+fn launch_root_tool(
+    cfg: &Config,
+    state: &mut progress::State,
+    turn: &Turn,
+    call: &Call,
+    tool: &tools::TreeTool,
+    image: &str,
+    declaration: &str,
+) -> Result<(), String> {
+    let id = call.id.as_str();
+    let site = CallSite::at(&turn.request, call, declaration);
+    let arguments = call
+        .input
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let nested = json!({"id": id, "input": arguments});
+    let session = state.session()?.tree().clone();
+    let bound = match tools::tree_tool_args(&nested, tool, Some(session.as_str())) {
+        Ok(bound) => bound,
+        Err(block) => {
+            site.failed(state, &block, None)?;
+            return resume(cfg, state, turn);
+        }
+    };
+    let root_path = nested["input"][tools::ROOT].as_str().unwrap_or_default();
+    let base = state.head().clone();
+    let located = root::components(root_path).and_then(|components| {
+        let tree = state.store().tree_of(&base)?;
+        root::resolve(state.store(), &tree, &components)
+    });
+    let object = match located {
+        Ok(object) => object,
+        Err(error) => {
+            site.failed(state, &error_block(id, &error), None)?;
+            return resume(cfg, state, turn);
+        }
+    };
+    let ready: Vec<(String, tools::ReadyArg)> = bound
+        .iter()
+        .filter(|(key, _)| key.as_str() != tools::ROOT)
+        .map(|(key, value)| Ok((key.clone(), value.ready()?)))
+        .collect::<Result<_, String>>()?;
+    let mut args: Vec<(&str, Arg)> = ready
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.arg()))
+        .collect();
+    // The object itself, materialized so it binds at its own kind: a blob, a
+    // tree, or a gitlink's commit. Nothing there binds nothing.
+    let materialized = fresh("root");
+    if let Some((_, oid)) = &object {
+        caos(["get-hash", oid.as_str(), &materialized])?;
+        args.push((tools::ROOT, Arg::Path(&materialized)));
+    }
+    if tool.call {
+        args.push(("call", Arg::Lit(id)));
+    }
+    if tool.request_id && !args.iter().any(|(name, _)| *name == tools::REQUEST_ID) {
+        args.push((tools::REQUEST_ID, Arg::Lit(id)));
+    }
+    let tool_tree = cas_hash(image)?;
+    let task = (|| {
+        let curried = caos_curry(Arg::Hash(&tool_tree), &args)?;
+        let task_text = prepare_request(Arg::Hash(&curried), &[])?;
+        Oid::parse(&task_text, "root tool task")
+    })();
+    let task = match task {
+        Ok(task) => task,
+        Err(error) => {
+            site.failed(state, &error_block(id, &error), None)?;
+            return resume(cfg, state, turn);
+        }
+    };
+    let started = CallRecord {
+        id: id.to_string(),
+        name: call.name.clone(),
+        declaration_message: declaration.to_string(),
+        source_tree_name: None,
+        input_commit: Some(base),
+        status: CallStatus::Started,
+        task: Some(task),
+        result: None,
+        source_tree_resolution: None,
+        files: Vec::new(),
+        files_outcome: None,
+    };
+    let expected = state.head().clone();
+    match state.try_append_at(
+        &expected,
+        Transition::ToolStart {
+            payloads: Vec::new(),
+            record: started.clone(),
+        },
+    )? {
+        progress::TryAppend::HeadChanged(_) => resume(cfg, state, turn),
+        progress::TryAppend::Appended(_) => {
+            dispatch_started(state, &turn.request, call, &started)
+        }
+    }
+}
+
 fn dispatch_started(
     state: &mut progress::State,
     request: &Oid,
