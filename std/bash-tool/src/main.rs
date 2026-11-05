@@ -104,19 +104,26 @@ fn run() -> Result<(), String> {
     // while this is presentation — and presentation duplicated across callers
     // is how one tool ends up reading two ways depending on who ran it.
     // llm-step used to re-render exactly this from `exit`/`stdout`/`stderr`.
-    fs::write(res.join("out"), report(exit, &out.stdout, &out.stderr, &denied))
-        .map_err(|e| format!("writing out: {e}"))?;
-    // `failed` PRESENT means the call failed, which for a shell is a non-zero
-    // exit. A marker entry rather than a banner inside `out`, because `out`
-    // here is arbitrary command output and says FAILED in passing all the time
-    // (SPEC, "CaosTools" — Writers).
-    if exit != 0 {
-        fs::write(res.join("failed"), format!("exit {exit}\n"))
-            .map_err(|e| format!("writing failed: {e}"))?;
-    }
-    // `prop`: the proposed tree. The harness mints the commit — this tool has
-    // no reason to know what a commit is.
-    link("/cas/newtree", res.join("prop"))?;
+    fs::write(res.join("stdout"), report(exit, &out.stdout, &out.stderr, &denied))
+        .map_err(|e| format!("writing stdout: {e}"))?;
+    // NO `failed` FOR A NON-ZERO EXIT. Under the root contract `failed` means
+    // nothing is applied, and what a command wrote is saved even when it then
+    // exits non-zero (a build's output, a half-finished edit to look at). The
+    // exit code leads `stdout`, which is how the model reads it.
+    //
+    // `root`: the new tree. The harness commits it for a source tree — this
+    // tool has no reason to know what a commit is.
+    link("/cas/newtree", res.join("root"))?;
+    caos(["put", path(&res), "/cas/out"])
+}
+
+/// A call the model got wrong: `{stdout, failed}`, and nothing to apply.
+fn refuse(message: &str) -> Result<(), String> {
+    let res = scratch("result")?;
+    fs::write(res.join("stdout"), format!("bash-tool: {message}\n"))
+        .map_err(|e| format!("writing stdout: {e}"))?;
+    fs::write(res.join("failed"), "bash-tool refused\n")
+        .map_err(|e| format!("writing failed: {e}"))?;
     caos(["put", path(&res), "/cas/out"])
 }
 
