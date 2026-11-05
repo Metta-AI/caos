@@ -369,11 +369,7 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
             ),
         );
     };
-    let github = Github {
-        owner,
-        repo,
-        token: token_for(&repository)?,
-    };
+    let github = Github::new(owner, repo, token_for(&repository)?);
     let mut last: Option<Checks> = None;
     let waited = wait_until(p.wait_min, || {
         let checks = read(&github, &reference)?;
