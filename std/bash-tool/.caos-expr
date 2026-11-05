@@ -41,10 +41,10 @@ New files and new directories need no `paths`. Whatever the command writes is sa
 
 Not available here: git (use the log, show and diff tools), caos-std/ (it exists only in the evaluated tree: use eval_path, then read or ls with root), and the harness's own shell. The root .caos metadata is read-only; a source tree's .caos/conflicts ledger is editable.
 @param cmd The command to run with sh -c.
-@param {string} [cwd] Optional session-relative working directory; defaults to the session root. It must already exist, so if it is existing content it must also be in `paths`.
-@param {array} [paths] Session-relative files or directories to materialize, independent of cwd. A directory includes its descendants, including source trees.
+@param {string} [cwd] Optional working directory, relative to root; defaults to root itself. It must already exist, so if it is existing content it must also be in `paths`.
+@param {array} [paths] Files or directories to materialize, relative to root and independent of cwd. A directory includes its descendants, including source trees; `.` is all of root.
 @writer
-@in
+@root
 END
 IMAGE=run --base:@=DEEP-DEPS/rustc --src:@=.
 curry --base=$IMAGE --help=$HELP
