@@ -51,6 +51,12 @@ impl Kind {
     }
 
     pub fn parse(name: &str) -> Result<Kind, String> {
+        // The names a v6 session's commits carry, from before the rename.
+        match name {
+            "conversation.root" => return Ok(Kind::SessionRoot),
+            "conversation.fork" => return Ok(Kind::SessionFork),
+            _ => {}
+        }
         Self::ALL
             .into_iter()
             .find(|kind| kind.as_str() == name)
