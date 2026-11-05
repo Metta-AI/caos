@@ -48,7 +48,7 @@ MIXED_CALLS='[
  {"id":"tu_me","input":{"source_tree":"main","file-path":"mix.txt","old-string":"hello","new-string":"world"},"name":"edit","type":"tool_use"},
  {"id":"tu_mg","input":{"pattern":"world"},"name":"grep","type":"tool_use"},
  {"id":"tu_mm","input":{"arguments":{"root":"main","theirs":"'"$feature"'"},"path":"tools/merge"},"name":"run_tool","type":"tool_use"},
- {"id":"tu_mp","input":{"arguments":{"source-tree":"main","theirs":"side"},"path":"tools/merge"},"name":"run_tool","type":"tool_use"},
+ {"id":"tu_mp","input":{"arguments":{"root":"main","theirs":"side"},"path":"tools/merge"},"name":"run_tool","type":"tool_use"},
  {"id":"tu_side","input":{"source_tree":"side","file-path":"side.txt","content":"isolated"},"name":"write","type":"tool_use"}]'
 printf '{"content":%s,"stop_reason":"tool_use"}' \
   "$(printf '%s' "$MIXED_CALLS" | tr -d '\n')" > /tmp/stub/response-1.json
