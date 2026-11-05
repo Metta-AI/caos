@@ -1,0 +1,14 @@
+100644 a53a6a0f35f416283d739a8190394d86fcce64c3 1	rust/crates/caos/src/lib.rs
+100644 e1eaf87e6fc2ae9f6e4038677fdf5000875eb1f5 2	rust/crates/caos/src/lib.rs
+100644 2a0d70893c6394c663596ca60b82f6f04e904ebc 3	rust/crates/caos/src/lib.rs
+
+Auto-merging rust/crates/caos-cli/src/lib.rs
+Auto-merging rust/crates/caos-cli/src/mcp/mod.rs
+Auto-merging rust/crates/caos-world/src/secrets.rs
+Auto-merging rust/crates/caos/src/lib.rs
+CONFLICT (content): Merge conflict in rust/crates/caos/src/lib.rs
+Auto-merging rust/crates/server/src/mcp.rs
+Auto-merging rust/crates/server/src/secrets.rs
+Auto-merging rust/crates/session-protocol/src/v3/apply.rs
+Auto-merging rust/crates/session-protocol/src/v3/refs.rs
+Auto-merging rust/crates/session-protocol/src/v3/view.rs
