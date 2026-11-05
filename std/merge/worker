@@ -133,7 +133,7 @@ rm -rf "$res"; mkdir -p "$res"
 if [ "$code" = 1 ]; then
   # A quoted heredoc: this prose contains apostrophes and backticks, and
   # printf with single quotes turns it into unreadable '"'"' escapes.
-  cat > "$res/out" <<'CONFLICTS'
+  cat > "$res/stdout" <<'CONFLICTS'
 merge produced conflicts. The source tree now carries git's inline conflict
 markers in the affected files, plus .caos/conflicts (git's unmerged notation,
 richer than markers). Resolve each path -- edit the file, reading a stage's
