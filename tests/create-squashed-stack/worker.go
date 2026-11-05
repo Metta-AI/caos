@@ -262,8 +262,8 @@ func check(i int) {
 		for _, commit := range squashed {
 			w.True(strings.Contains(out, commit), "case %s: out does not name %s: %s", c.name, commit, out)
 		}
-		_, err := os.Lstat(filepath.Join(r, "message"))
-		w.True(err == nil, "case %s: no commit message for the session", c.name)
+		_, err := os.Lstat(filepath.Join(r, "commit-message"))
+		w.True(err == nil, "case %s: no commit message", c.name)
 		fmt.Fprintf(os.Stderr, "  ok: %s = {01-core: C1, 02-tests: C2, 03-docs: C3}, nothing else changed\n", c.into)
 		return
 	}
