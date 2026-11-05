@@ -195,33 +195,33 @@ func check(i int) {
 	c := cases[i]
 	const r = "/cas/args/result"
 	w.Get(r)
-	for _, part := range []string{"prop", "out"} {
-		w.True(w.Exists(filepath.Join(r, part)), "case %s: the result has no %s", c.name, part)
-	}
-	out := w.Read(filepath.Join(r, "out"))
+	w.True(w.Exists(filepath.Join(r, "stdout")), "case %s: the result has no stdout", c.name)
+	out := w.Read(filepath.Join(r, "stdout"))
 	failed := w.Exists(filepath.Join(r, "failed"))
-	prop := w.Hash(filepath.Join(r, "prop"))
 	for _, s := range c.says {
 		w.True(strings.Contains(out, s), "case %s does not say %q: %s", c.name, s, out)
 	}
 	switch {
 	case c.renames != nil:
 		w.True(!failed, "case %s was refused: %s", c.name, out)
-		expect := session("/tmp/expect", c.dir, c.renames)
-		w.True(prop == expect, "case %s: the proposal is not the fixture with %v renamed in %q; out: %s", c.name, c.renames, c.dir, out)
+		session("/tmp/expect", c.dir, c.renames)
+		expect := w.Hash(object("/cas/expect", c.dir))
+		got := w.Hash(filepath.Join(r, "root"))
+		w.True(got == expect, "case %s: the answer is not %q with %v renamed; out: %s", c.name, c.dir, c.renames, out)
 		for from, to := range c.renames {
 			w.True(strings.Contains(out, from+" -> "+to), "case %s: out does not list %s -> %s: %s", c.name, from, to, out)
 		}
-		w.True(w.Exists(filepath.Join(r, "message")), "case %s: no commit message for the session", c.name)
+		w.True(w.Exists(filepath.Join(r, "commit-message")), "case %s: no commit message", c.name)
 		fmt.Fprintf(os.Stderr, "  ok: %s", out)
 	case c.dryRun:
 		w.True(!failed, "case %s was refused: %s", c.name, out)
-		w.True(prop == conv, "case %s: a dry run changed the session", c.name)
+		w.True(w.Hash(filepath.Join(r, "root")) == w.Hash(object("/cas/conv", c.dir)),
+			"case %s: a dry run changed the directory", c.name)
 		fmt.Fprintf(os.Stderr, "  ok: %s", out)
 	default:
 		w.True(failed, "case %s was not refused: %s", c.name, out)
-		w.True(strings.HasPrefix(out, "FAILED: "), "case %s has no FAILED banner: %s", c.name, out)
-		w.True(prop == conv, "case %s: a refusal changed the session", c.name)
+		w.True(strings.HasPrefix(out, "move-sed: "), "case %s does not say who refused: %s", c.name, out)
+		w.True(!w.Exists(filepath.Join(r, "root")), "case %s: a refusal answered a root", c.name)
 		fmt.Fprintf(os.Stderr, "  ok: %s", out)
 	}
 }
