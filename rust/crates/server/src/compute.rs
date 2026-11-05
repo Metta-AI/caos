@@ -3493,11 +3493,10 @@ mod ticket_state_tests {
 
     #[test]
     fn pending_twice_and_not_live_is_a_restart() {
-        let state =
-            settle_ticket_state("pending".into(), live_sequence(&[false, false]), || {
-                Ok("pending".into())
-            });
-        assert_eq!(state.unwrap(), RESTARTED);
+        let state = settle_ticket_state("pending".into(), live_sequence(&[false, false]), || {
+            Ok("pending".into())
+        });
+        assert_eq!(answer(state), RESTARTED);
     }
 
     #[test]
