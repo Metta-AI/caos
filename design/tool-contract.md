@@ -68,7 +68,8 @@ used only by `publish_source.rs` and `stack_publish.rs`, for their own resume.
 
 The second is not a reason for an operation once a writer can return a
 directory of gitlinks (below). `stack-publish` never needed it: it changes no
-tree. The third is configuration: `std/github` already has its own grant.
+tree. The third disappears if every remote action goes through `std/github`,
+which already has its own grant (section 2).
 
 ### The writer contract is harder than it needs to be
 
