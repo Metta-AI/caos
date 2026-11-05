@@ -232,7 +232,10 @@ mod tests {
         let notes = blob(store, "notes\n");
         let root = tree(
             store,
-            vec![("notes.md", Mode::Blob, notes), ("sources", Mode::Tree, sources)],
+            vec![
+                ("notes.md", Mode::Blob, notes),
+                ("sources", Mode::Tree, sources),
+            ],
         );
         (root, layer)
     }
