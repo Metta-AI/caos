@@ -32,10 +32,32 @@ import (
 )
 
 const (
-	in     = "/cas/args/in"
 	result = "/tmp/squash-result"
 	repo   = "/tmp/squash-repo"
 )
+
+// in is the root as a folder: a tree as it is, a source tree's commit as its
+// code tree. Set first thing in main.
+var in string
+
+// directory finds the root and returns it as a folder.
+func directory() string {
+	const root = "/cas/args/root"
+	if !exists(root) {
+		refuse("nothing is at the root path: root is the directory holding the plan and the stack, such as `.`")
+	}
+	switch k := kind(root); k {
+	case "tree":
+		return root
+	case "commit":
+		const code = "/cas/squash-code"
+		run("caos", "resolve", hash(root), "", code)
+		return code
+	default:
+		refuse("the root is a %s, not a directory", k)
+		return ""
+	}
+}
 
 // refusal is a problem with the input, answered as a value.
 type refusal struct{ msg string }
