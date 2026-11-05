@@ -55,7 +55,11 @@ pub fn session_root(store: &dyn ObjectStore, head: &Oid) -> Result<Oid, String> 
     let mut current = head.clone();
     loop {
         let info = store.read_commit(&current).map_err(String::from)?;
-        if kind_name(&info.message) == "conversation.root" {
+        // `session.root` since the rename; `conversation.root` in v6 and v5.
+        if matches!(
+            kind_name(&info.message),
+            "session.root" | "conversation.root"
+        ) {
             return Ok(current);
         }
         current = info
@@ -219,7 +223,7 @@ fn v5_calls(
                 }
             }
         }
-        if kind == "conversation.root" {
+        if matches!(kind.as_str(), "session.root" | "conversation.root") {
             break;
         }
         current = info.parents.first().cloned();

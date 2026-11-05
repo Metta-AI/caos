@@ -799,17 +799,24 @@ func conv(o opts) error {
 			"  A Claude Code session that has not run a turn has no caos session yet.", id)
 	}
 	name := "cc/" + internal
-	ref := "refs/caos/v3/conversations/" + fmt.Sprintf("%x", name) + "/head"
 	server := os.Getenv("CAOS_SERVER_URL")
 	if server == "" {
 		server = "http://localhost:9090"
 	}
-	fmt.Println("session:      " + id)
+	// v4, or for a session recorded before the rename and not written since, v3.
+	var ref string
+	var head []string
+	for _, prefix := range []string{"refs/caos/v4/sessions/", "refs/caos/v3/conversations/"} {
+		ref = prefix + fmt.Sprintf("%x", name) + "/head"
+		ls, _ := exec.Command("git", "ls-remote", server, ref).Output()
+		if head = strings.Fields(string(ls)); len(head) > 0 {
+			break
+		}
+	}
+	fmt.Println("claude code:  " + id)
 	fmt.Println("internal id:  " + internal)
-	fmt.Println("session: " + name)
+	fmt.Println("caos session: " + name)
 	fmt.Println("ref:          " + ref)
-	ls, _ := exec.Command("git", "ls-remote", server, ref).Output()
-	head := strings.Fields(string(ls))
 	if len(head) == 0 {
 		fmt.Println("head:         (not on " + server + " — wrong server, or no turn yet)")
 		return errors.New("session head not found on " + server)
@@ -1071,7 +1078,7 @@ later push from that checkout dies for an unrelated-looking reason.
 
 Every session, with the names decoded:
 
-  git ls-remote %s 'refs/caos/v3/conversations/*' |
+  git ls-remote %s 'refs/caos/v4/sessions/*' |
     while read -r sha ref; do
       hex=$(echo "$ref" | cut -d/ -f5)
       echo "$sha $(echo "$hex" | fold -w2 | while read -r b; do printf "\x$b"; done)"

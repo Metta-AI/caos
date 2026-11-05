@@ -247,7 +247,7 @@ caos +<ref>:<ref>`); it used to be current because the hook pushed from here.
 
 | Hook | Transitions |
 |---|---|
-| `UserPromptSubmit` | `conversation.root` (the first only), `message.append` (the prompt) |
+| `UserPromptSubmit` | `session.root` (the first only), `message.append` (the prompt) |
 | tool call | the step's own `message.append` of an assistant message declaring the call, then its `tool.start` and `tool.complete` -- this process writes nothing |
 | `Stop` | `message.append` (the closing message, as the assistant's) -- nothing when there is none |
 | `StopFailure` | `message.append` (the error, as a system message) |
@@ -310,7 +310,7 @@ from — the `caos head <hash>` a turn prints, or `session head:` from `help`
 with no path. A commit, because it is immutable where a ref moves.
 
 `/fork-caos-session <hash>` makes a NEW branch: the session's own
-`cc/<session>` session, made by `conversation.fork` on `<hash>`. The original
+`cc/<session>` session, made by `session.fork` on `<hash>`. The original
 does not move. There is no command that continues the SAME branch from a new
 session: a Claude Code session's caos session is always the one its id derives, so nothing
 about it is kept locally.

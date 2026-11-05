@@ -668,7 +668,7 @@ mod tests {
         };
         let mut state = State::from_store(
             store,
-            "refs/caos/v3/conversations/session/head".to_string(),
+            "refs/caos/v4/sessions/session/head".to_string(),
             root,
         )
         .unwrap();
@@ -706,7 +706,7 @@ mod tests {
             };
             let mut state = State::from_store(
                 store,
-                "refs/caos/v3/conversations/session/head".to_string(),
+                "refs/caos/v4/sessions/session/head".to_string(),
                 root.clone(),
             )
             .unwrap();

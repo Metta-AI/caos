@@ -353,8 +353,8 @@ impl_record!(SourceTreeResolution, validate);
 #[serde(deny_unknown_fields)]
 pub struct TranscriptEntry {
     pub message_id: String,
-    /// Stored as `conversation`: the transcript format predates the rename.
-    #[serde(rename = "conversation")]
+    /// `conversation` in a v6 session ([`TranscriptEntry::encode_as`]).
+    #[serde(alias = "conversation")]
     pub session: String,
     pub role: Role,
     pub actor: String,
@@ -369,6 +369,24 @@ pub struct TranscriptEntry {
 }
 
 impl_record!(TranscriptEntry, validate);
+
+impl TranscriptEntry {
+    /// The entry's bytes in a session of `format`: v6 spells the `session` key
+    /// `conversation`, as it was written before the rename.
+    pub fn encode_as(&self, format: super::paths::Format) -> Vec<u8> {
+        let mut value = self.to_value();
+        if format == super::paths::Format::V6 {
+            let object = value
+                .as_object_mut()
+                .expect("a transcript entry is an object");
+            let session = object
+                .remove("session")
+                .expect("an entry names its session");
+            object.insert("conversation".to_string(), session);
+        }
+        encode_record(value)
+    }
+}
 
 /// The text of the system message a person appends to stop whatever is driving
 /// the session. It is a fact in the transcript like any other: a driver

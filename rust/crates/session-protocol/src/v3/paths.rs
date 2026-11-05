@@ -1,7 +1,19 @@
 use super::oid::hex_lower;
 
 pub const FORMAT: &str = ".caos/format";
-pub const FORMAT_BYTES: &str = "caos-conversation-v6\n";
+/// The format this build writes into every new session.
+pub const FORMAT_BYTES: &str = "caos-session-v7\n";
+/// v6 is v7 under the names from before caos called a conversation a session:
+/// `conversation.root`/`conversation.fork` commits and a transcript entry's
+/// `conversation` key. A v6 session is read and appended to as v6; forking one
+/// makes a v7 session.
+pub const V6_FORMAT_BYTES: &str = "caos-conversation-v6\n";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Format {
+    V6,
+    V7,
+}
 pub const IDENTITY: &str = ".caos/identity.json";
 pub const TITLE: &str = ".caos/title";
 pub const TRANSCRIPT_DIR: &str = ".caos/transcript";
@@ -16,10 +28,15 @@ pub const MAX_TITLE: usize = 1024;
 pub const MAX_JSON_INT: u64 = 9_007_199_254_740_991;
 
 pub fn validate_format(bytes: &[u8]) -> Result<(), String> {
+    parse_format(bytes).map(|_| ())
+}
+
+pub fn parse_format(bytes: &[u8]) -> Result<Format, String> {
     match bytes {
-        bytes if bytes == FORMAT_BYTES.as_bytes() => Ok(()),
-        b"caos-conversation-v5\n" => Err("unsupported session format v5 (turn records); this build reads v6, a flat transcript. Open it with an earlier v5 build".into()),
-        b"caos-conversation-v4\n" => Err("unsupported session format v4; this build reads v6. Open it with the earlier v4 build".into()),
+        bytes if bytes == FORMAT_BYTES.as_bytes() => Ok(Format::V7),
+        bytes if bytes == V6_FORMAT_BYTES.as_bytes() => Ok(Format::V6),
+        b"caos-conversation-v5\n" => Err("unsupported session format v5 (turn records); this build reads v6 and v7, a flat transcript. Open it with an earlier v5 build".into()),
+        b"caos-conversation-v4\n" => Err("unsupported session format v4; this build reads v6 and v7. Open it with the earlier v4 build".into()),
         _ => Err("session format is invalid".into()),
     }
 }

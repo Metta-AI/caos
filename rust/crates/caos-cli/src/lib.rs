@@ -2145,7 +2145,7 @@ pub fn image_arg_reader(argument: &str, session: &str) -> String {
         .map(|(key, value)| (key.split_once(':').map_or("", |(_, ty)| ty), value));
     match value {
         Some(("@@", locator)) => format!("reader:@@={locator}"),
-        Some(("@", path)) => format!("reader:@={path} conversation={session}"),
+        Some(("@", path)) => format!("reader:@={path} session={session}"),
         _ => format!("a reader for {argument}"),
     }
 }
@@ -2938,7 +2938,7 @@ mod tests {
     fn session_refs_are_v3() {
         assert_eq!(
             session_ref("talk-1").unwrap(),
-            "refs/caos/v3/conversations/74616c6b2d31/head"
+            "refs/caos/v4/sessions/74616c6b2d31/head"
         );
     }
 

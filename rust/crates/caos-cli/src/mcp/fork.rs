@@ -26,11 +26,16 @@ use session_protocol::v3::oid::Oid;
 use crate::oid;
 
 pub(super) const FORK_COMMAND: &str = "fork-caos-session";
+/// The command's name before caos called a conversation a session, which an
+/// environment set up before the rename still has installed.
+const LEGACY_FORK_COMMAND: &str = "fork-caos-conversation";
 
 /// A line the slash command's expanded text carries, so the hook still finds the
 /// request if Claude Code hands it the expansion rather than what was typed.
 /// `caos-session-command: fork <hash>`.
 pub(super) const MARKER: &str = "caos-session-command:";
+/// What [`MARKER`] was before the rename, in a command installed before it.
+const LEGACY_MARKER: &str = "caos-conversation-command:";
 
 /// The commit a prompt asks to fork, if it asks for one.
 ///
@@ -41,12 +46,16 @@ pub(super) fn parse_command(prompt: &str) -> Result<Option<Oid>, String> {
     let trimmed = prompt.trim_start();
     if let Some(first) = trimmed.lines().next().and_then(|l| l.strip_prefix('/')) {
         let mut words = first.split_whitespace();
-        if words.next() == Some(FORK_COMMAND) {
+        if matches!(words.next(), Some(FORK_COMMAND | LEGACY_FORK_COMMAND)) {
             return commit(words.next()).map(Some);
         }
     }
     for line in prompt.lines() {
-        let Some(rest) = line.trim().strip_prefix(MARKER) else {
+        let line = line.trim();
+        let Some(rest) = line
+            .strip_prefix(MARKER)
+            .or_else(|| line.strip_prefix(LEGACY_MARKER))
+        else {
             continue;
         };
         let mut words = rest.split_whitespace();
@@ -89,6 +98,20 @@ mod tests {
         assert_eq!(
             parse_command(&prompt).unwrap(),
             Some(commit(Some(HASH)).unwrap())
+        );
+    }
+
+    /// A command installed before the rename still forks.
+    #[test]
+    fn the_pre_rename_command_and_marker_still_fork() {
+        let want = Some(commit(Some(HASH)).unwrap());
+        assert_eq!(
+            parse_command(&format!("/fork-caos-conversation {HASH}")).unwrap(),
+            want
+        );
+        assert_eq!(
+            parse_command(&format!("text\ncaos-conversation-command: fork {HASH}")).unwrap(),
+            want
         );
     }
 

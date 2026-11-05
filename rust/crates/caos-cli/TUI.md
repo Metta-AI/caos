@@ -88,7 +88,7 @@ changed under it:
 - Run in caos itself, `--llm-step:@=std/llm-step` evaluates the working tree,
   which no `reader:@@=` grant covers once it differs from a commit in the
   grant's range. A grant on a branch you commit to covers committed work;
-  uncommitted work needs `reader:@=std/llm-step conversation=<id>`.
+  uncommitted work needs `reader:@=std/llm-step session=<id>`.
 
 Before submitting a chat turn, the client asks the server which secrets the
 request would be given, and refuses to send a turn whose `llm-step` would not
@@ -112,7 +112,7 @@ caos tui --unarchive ID      restore one session to the active list
 `--username` defaults to `$USER`. If `$USER` is a shared container account such
 as `root` or `ubuntu`, pass a personal `--username`; persisted identity is future
 work. Active and archived membership is stored on the
-CAOS server under `refs/caos/v3/users/<user-key>/conversations/{active,archived}/`.
+CAOS server under `refs/caos/v4/users/<user-key>/sessions/{active,archived}/`.
 User and session keys are lowercase hex of their UTF-8 IDs, without an
 extra prefix. Usernames are limited to 126 bytes and session IDs to 124.
 Only v3 refs populate this sidebar; earlier namespaces remain untouched.

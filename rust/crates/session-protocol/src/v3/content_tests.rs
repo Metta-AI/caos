@@ -342,3 +342,107 @@ fn a_root_parents_its_content_commit_and_a_fork_merges_a_newer_one_in() {
     .unwrap_err()
     .contains("only a session fork"));
 }
+
+/// A session recorded before the rename -- format v6, a `conversation.root`
+/// commit, transcript entries keyed `conversation` -- still validates, is
+/// appended to as v6, and forks into a v7 session that carries its history.
+#[test]
+fn a_v6_session_appends_as_v6_and_forks_into_v7() {
+    let mut store = MemoryStore::new();
+    let genesis = super::oid::ensure_genesis(&mut store).unwrap();
+    let signature = client_signature("Old", "old@example.com", 1_700_000_000);
+    let root = Transition::SessionRoot {
+        identity: Identity {
+            id: "old-talk".to_string(),
+            kind: IdentityKind::Root,
+            owner: None,
+        },
+        title: "Old talk".to_string(),
+        content: None,
+    };
+    let applied = apply(&mut store, None, &root).unwrap();
+    // What a pre-rename build wrote: the v6 marker, under `conversation.root`.
+    let mut v6 = tree::TreeBuilder::from(Some(applied.tree.clone()));
+    v6.put(
+        paths::FORMAT,
+        Mode::Blob,
+        paths::V6_FORMAT_BYTES.as_bytes().to_vec(),
+    );
+    let v6 = v6.build(&mut store).unwrap();
+    let message = events::encode(Kind::SessionRoot, &[]);
+    let message = [
+        b"conversation.root".as_slice(),
+        &message[b"session.root".len()..],
+    ]
+    .concat();
+    let root_commit = store
+        .write_commit(&tree::CommitInfo {
+            tree: v6,
+            parents: vec![genesis],
+            author: signature.clone(),
+            committer: signature.clone(),
+            extra_headers: Vec::new(),
+            message,
+        })
+        .unwrap();
+
+    let append = Transition::MessageAppend {
+        entry: TranscriptEntry {
+            message_id: "user-0".to_string(),
+            session: "old-talk".to_string(),
+            role: Role::User,
+            actor: "user".to_string(),
+            model: None,
+            blocks: vec![Block::Text {
+                text: "hello".to_string(),
+            }],
+            proposal: None,
+            source_tree_resolution: None,
+        },
+        payloads: Vec::new(),
+    };
+    let applied = apply(&mut store, Some(&root_commit), &append).unwrap();
+    let head = mint(
+        &mut store,
+        &root_commit,
+        &applied,
+        append.kind(),
+        &signature,
+    )
+    .unwrap();
+    validate_spine(&store, &head, &mut HashSet::new()).unwrap();
+    let view = Session::open(&store, &head).unwrap();
+    assert_eq!(view.format().unwrap(), paths::Format::V6);
+    let entry_path = paths::transcript_entry_path(0, "user-0");
+    let stored = String::from_utf8(view.snapshot().read(&entry_path).unwrap().unwrap()).unwrap();
+    assert!(stored.contains("\"conversation\":\"old-talk\""), "{stored}");
+    assert_eq!(
+        view.transcript_entry(0).unwrap().unwrap().1.session,
+        "old-talk"
+    );
+
+    let fork = Transition::SessionFork {
+        identity: Identity {
+            id: "new-talk".to_string(),
+            kind: IdentityKind::Fork {
+                source: head.clone(),
+            },
+            owner: None,
+        },
+        title: "Old talk".to_string(),
+        content: None,
+    };
+    let applied = apply(&mut store, Some(&head), &fork).unwrap();
+    let forked = mint(&mut store, &head, &applied, fork.kind(), &signature).unwrap();
+    validate_spine(&store, &forked, &mut HashSet::new()).unwrap();
+    let view = Session::open(&store, &forked).unwrap();
+    assert_eq!(view.format().unwrap(), paths::Format::V7);
+    let stored = String::from_utf8(view.snapshot().read(&entry_path).unwrap().unwrap()).unwrap();
+    assert!(stored.contains("\"session\":\"old-talk\""), "{stored}");
+    assert!(!stored.contains("conversation"), "{stored}");
+    assert!(store
+        .read_commit(&forked)
+        .unwrap()
+        .message
+        .starts_with(b"session.fork\n"));
+}

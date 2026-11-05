@@ -177,7 +177,7 @@ parameter becomes part of an ArgTree and so of a cache key.
 | header | used by | meaning |
 |---|---|---|
 | `X-Caos-Secret-Readers` | all compute endpoints | the secret reader keys the caller presents; they decide which secrets the evaluation can use |
-| `X-Caos-Conversation` | all compute endpoints | the session the secrets are scoped to |
+| `X-Caos-Session` | all compute endpoints | the session the secrets are scoped to (clients also send it as `X-Caos-Conversation`, its name before the rename, which servers still read) |
 | `X-Caos-Git-Token` | `GET /eval`, `POST /start`, `POST /submit`, `POST /git/import` | a token for one HTTPS Git URL, for private repositories |
 | `X-Caos-Step` | `/mcp` | the step that runs tools: a git locator, or a bare 40-hex hash |
 | `X-Caos-Max-Result-Chars` | `/mcp` | how long a tool's text may be before it is kept in the session and answered with a preview (default 50000; `0` for no limit) |

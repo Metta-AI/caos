@@ -83,7 +83,7 @@ new_id() { od -An -N16 -tx1 /dev/urandom | tr -d ' \n'; }
 stage "a session that does not exist yet"
 llm_test_setup
 conv="record-http-$(date +%s%N)-$$"
-ref="refs/caos/v3/conversations/$(printf '%s' "$conv" | od -An -tx1 | tr -d ' \n')/head"
+ref="refs/caos/v4/sessions/$(printf '%s' "$conv" | od -An -tx1 | tr -d ' \n')/head"
 mkdir -p /tmp/repo
 git -C /tmp/repo init -q 2>/dev/null || true
 rm -rf /tmp/ws && mkdir -p /tmp/ws
@@ -96,7 +96,7 @@ record prompt "$p1" "read the greeting" "model=claude-code" "content:hash=$conte
 [ "$status" = created ] || fail "the first prompt was '$status', not created"
 # The prompt is all that is recorded: no turn is opened for it.
 case "$(subjects)" in
-  "message.append conversation.root "*) echo "  ok: $(subjects)" >&2 ;;
+  "message.append session.root "*) echo "  ok: $(subjects)" >&2 ;;
   *) fail "unexpected history: $(subjects)" ;;
 esac
 

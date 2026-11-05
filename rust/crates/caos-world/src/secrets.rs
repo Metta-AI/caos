@@ -5,7 +5,11 @@
 /// band because a key is a credential and an ArgTree is readable by anyone.
 pub const READERS_HEADER: &str = "X-Caos-Secret-Readers";
 /// The session a request is for, which `reader:@=` grants are scoped to.
-pub const SESSION_HEADER: &str = "X-Caos-Conversation";
+pub const SESSION_HEADER: &str = "X-Caos-Session";
+/// What [`SESSION_HEADER`] was called before caos called a conversation a
+/// session. Clients send both, so a server from before the rename still scopes
+/// grants; a server reads either.
+pub const LEGACY_SESSION_HEADER: &str = "X-Caos-Conversation";
 /// The step that runs the tools of an MCP connection (`POST /mcp`): a git
 /// locator, or a bare 40-hex hash. A header because the endpoint is stateless
 /// and every message of a connection must say it.
@@ -39,7 +43,7 @@ pub enum Reader {
         locator: String,
         since: Option<String>,
     },
-    /// `reader:@=<path> conversation=<id>`: whatever is at `path` in one
+    /// `reader:@=<path> session=<id>`: whatever is at `path` in one
     /// session.
     Session { path: String, session: String },
 }
@@ -52,7 +56,7 @@ impl Reader {
                 None => format!("reader:@@={locator}"),
             },
             Reader::Session { path, session } => {
-                format!("reader:@={path} conversation={session}")
+                format!("reader:@={path} session={session}")
             }
         }
     }
@@ -159,8 +163,8 @@ fn parse_session_reader(file_name: &str, val: &str) -> Result<Reader, String> {
             _ => return Err(format!("secret {file_name}: unknown reader field {word:?}")),
         }
     }
-    let session = session
-        .ok_or_else(|| format!("secret {file_name}: reader:@={path} needs conversation=<id>"))?;
+    let session =
+        session.ok_or_else(|| format!("secret {file_name}: reader:@={path} needs session=<id>"))?;
     Ok(Reader::Session { path, session })
 }
 
@@ -185,7 +189,7 @@ mod tests {
             "# a comment\nname=gh\nentropy=E\nvalue=tok\n\
              reader:@@=git+https://x/y?rev={SHA}&dir=std/llm-step since={SHA}\n\
              reader:@@=git+https://x/y?rev={SHA}\n\
-             reader:@=imports/y/tool conversation=c1\n"
+             reader:@=imports/y/tool session=c1\n"
         );
         let spec = parse_spec("file", &text).unwrap();
         assert_eq!(spec.name, "gh");
@@ -212,6 +216,22 @@ mod tests {
         assert_eq!(pushed.readers, spec.readers);
         assert_eq!(pushed.entropy, spec.entropy);
         assert_eq!(pushed.value, None);
+    }
+
+    /// A secret file written before the rename names its session `conversation=`.
+    #[test]
+    fn reads_the_pre_rename_session_field() {
+        let spec = parse_spec("f", "name=gh\nreader:@=imports/y/tool conversation=c1\n").unwrap();
+        assert_eq!(
+            spec.readers,
+            vec![Reader::Session {
+                path: "imports/y/tool".into(),
+                session: "c1".into(),
+            }]
+        );
+        assert!(spec
+            .render_pushed()
+            .contains("reader:@=imports/y/tool session=c1"));
     }
 
     #[test]

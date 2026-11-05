@@ -192,6 +192,24 @@ pub fn apply(
                     builder.put_oid(&entry.name, entry.mode, entry.oid);
                 }
             }
+            // Forking a v6 session (recorded before the rename) makes a v7
+            // one: the history it starts from is re-spelled the v7 way, so
+            // nothing written after the fork has to know about v6.
+            if session.format()? == paths::Format::V6 {
+                builder.put(
+                    paths::FORMAT,
+                    Mode::Blob,
+                    paths::FORMAT_BYTES.as_bytes().to_vec(),
+                );
+                let len = session.transcript_len()?;
+                for (ordinal, message_id, entry) in session.transcript(0, len)? {
+                    builder.put(
+                        &paths::transcript_entry_path(ordinal, &message_id),
+                        Mode::Blob,
+                        entry.encode_as(paths::Format::V7),
+                    );
+                }
+            }
             builder.put(paths::IDENTITY, Mode::Blob, identity.content_bytes());
             builder.put(paths::TITLE, Mode::Blob, encode_title(title)?);
         }
@@ -211,7 +229,7 @@ pub fn apply(
             }
             let next = session.transcript_len()?;
             validate_entry_resolution(&session, entry, &mut builder)?;
-            put_transcript(&mut builder, next, entry, payloads)?;
+            put_transcript(&mut builder, session.format()?, next, entry, payloads)?;
             ordinal = Some(next);
         }
         Transition::ToolStart { record, payloads } => {
@@ -515,6 +533,7 @@ fn put_publication(events: &mut Vec<Event>, record: &PublicationRecord) {
 
 fn put_transcript(
     builder: &mut TreeBuilder,
+    format: paths::Format,
     ordinal: u64,
     entry: &TranscriptEntry,
     payloads: &[(String, Vec<u8>)],
@@ -530,7 +549,7 @@ fn put_transcript(
     builder.put(
         &paths::transcript_entry_path(ordinal, &entry.message_id),
         Mode::Blob,
-        entry.encode(),
+        entry.encode_as(format),
     );
     Ok(())
 }

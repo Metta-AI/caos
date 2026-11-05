@@ -34,6 +34,11 @@ pub struct GitStore {
     git_dir: PathBuf,
     remote: Option<String>,
     remote_tip: RefCell<Option<Oid>>,
+    /// Session refs this store read under their pre-rename name because the v4
+    /// ref did not exist yet (`refs::legacy_ref`), with the value read. A push
+    /// whose lease expects that value expects the v4 ref to be ABSENT instead:
+    /// it is the write that creates it.
+    legacy_reads: RefCell<std::collections::HashMap<String, Oid>>,
     batch: RefCell<Option<BatchReader>>,
     batch_dirty: Cell<bool>,
     #[cfg(test)]
@@ -155,6 +160,7 @@ impl GitStore {
             dir,
             remote: remote.map(str::to_string),
             remote_tip: RefCell::new(None),
+            legacy_reads: RefCell::new(std::collections::HashMap::new()),
             batch: RefCell::new(None),
             batch_dirty: Cell::new(false),
             #[cfg(test)]
@@ -182,7 +188,41 @@ impl GitStore {
         Ok(store)
     }
 
+    /// The ref's value, or for a session ref that does not exist yet, the value
+    /// of its pre-rename name (`refs::legacy_ref`).
     pub fn read_ref(&self, refname: &str) -> Result<Option<Oid>, String> {
+        match self.read_ref_exact(refname)? {
+            Some(found) => Ok(Some(found)),
+            None => self.read_legacy(refname, |legacy| self.read_ref_exact(legacy)),
+        }
+    }
+
+    /// `fetch_ref`, with the same fallback as `read_ref`.
+    pub fn fetch_ref(&self, refname: &str) -> Result<Option<Oid>, String> {
+        match self.fetch_ref_exact(refname)? {
+            Some(found) => Ok(Some(found)),
+            None => self.read_legacy(refname, |legacy| self.fetch_ref_exact(legacy)),
+        }
+    }
+
+    fn read_legacy(
+        &self,
+        refname: &str,
+        read: impl FnOnce(&str) -> Result<Option<Oid>, String>,
+    ) -> Result<Option<Oid>, String> {
+        let Some(legacy) = super::refs::legacy_ref(refname) else {
+            return Ok(None);
+        };
+        let found = read(&legacy)?;
+        if let Some(oid) = &found {
+            self.legacy_reads
+                .borrow_mut()
+                .insert(refname.to_string(), oid.clone());
+        }
+        Ok(found)
+    }
+
+    fn read_ref_exact(&self, refname: &str) -> Result<Option<Oid>, String> {
         let Some(remote) = &self.remote else {
             return self.read_local_ref(refname);
         };
@@ -211,7 +251,7 @@ impl GitStore {
         Ok(matches.pop())
     }
 
-    pub fn fetch_ref(&self, refname: &str) -> Result<Option<Oid>, String> {
+    fn fetch_ref_exact(&self, refname: &str) -> Result<Option<Oid>, String> {
         let remote = self
             .remote
             .as_deref()
@@ -360,8 +400,13 @@ impl GitStore {
         if updates.len() > 1 {
             arguments.push("--atomic".to_string());
         }
+        let legacy_reads = self.legacy_reads.borrow().clone();
         for update in updates {
-            let expected = update.expected.as_ref().map(Oid::as_str).unwrap_or("");
+            let expected = match (&update.expected, legacy_reads.get(&update.refname)) {
+                // Read under the pre-rename name: this write creates the v4 ref.
+                (Some(expected), Some(legacy)) if expected == legacy => "",
+                (expected, _) => expected.as_ref().map(Oid::as_str).unwrap_or(""),
+            };
             arguments.push(format!("--force-with-lease={}:{expected}", update.refname));
         }
         arguments.push(remote.to_string());
@@ -372,6 +417,11 @@ impl GitStore {
         let argument_refs: Vec<&str> = arguments.iter().map(String::as_str).collect();
         let output = self.output(&argument_refs)?;
         if output.status.success() {
+            let mut legacy_reads = self.legacy_reads.borrow_mut();
+            for update in updates {
+                legacy_reads.remove(&update.refname);
+            }
+            drop(legacy_reads);
             if let Err(error) = self.update_local_refs(updates) {
                 eprintln!(
                     "session-protocol: warning: push succeeded but local refs were not advanced: {error}"
@@ -622,7 +672,7 @@ impl GitStore {
         updates
             .iter()
             .find(|update| {
-                update.refname.starts_with("refs/caos/v3/conversations/") && update.new.is_some()
+                update.refname.starts_with(super::refs::SESSIONS_PREFIX) && update.new.is_some()
             })
             .and_then(|update| update.new.clone())
             .or_else(|| {
@@ -1473,7 +1523,7 @@ mod tests {
                     new: Some(tree),
                 },
                 RefUpdate {
-                    refname: "refs/caos/v3/conversations/test/head".to_string(),
+                    refname: "refs/caos/v4/sessions/test/head".to_string(),
                     expected: None,
                     new: Some(commit.clone()),
                 },
@@ -1535,6 +1585,57 @@ mod tests {
             .expect("atomic push");
         assert_eq!(store.read_ref(left).unwrap(), Some(first));
         assert_eq!(store.read_ref(right).unwrap(), Some(second));
+    }
+
+    /// A session recorded before the rename has only its v3 ref. Reading the v4
+    /// name finds it there, and the first write creates the v4 ref, leaving the
+    /// v3 ref where it was so a fork by the old name still finds the history.
+    #[test]
+    fn legacy_session_refs_are_read_and_the_first_write_creates_v4() {
+        let (_directory, _remote, client) = remote_and_client("legacy");
+        let mut store = GitStore::open(&client, Some("caos")).expect("open git store");
+        let tree = store.write_tree(&[]).expect("write empty tree");
+        let first = write_commit(&mut store, &tree, &[], "first\n");
+        let second = write_commit(&mut store, &tree, std::slice::from_ref(&first), "second\n");
+        let head = super::super::refs::head_ref("old-talk").unwrap();
+        let legacy = super::super::refs::legacy_ref(&head).unwrap();
+        store
+            .push(&[RefUpdate {
+                refname: legacy.clone(),
+                expected: None,
+                new: Some(first.clone()),
+            }])
+            .expect("push legacy ref");
+
+        let reader = GitStore::open(&client, Some("caos")).expect("open git store");
+        assert_eq!(reader.fetch_ref(&head).unwrap(), Some(first.clone()));
+        reader
+            .push(&[RefUpdate {
+                refname: head.clone(),
+                expected: Some(first.clone()),
+                new: Some(second.clone()),
+            }])
+            .expect("the first write creates the v4 ref");
+        assert_eq!(reader.read_ref_exact(&head).unwrap(), Some(second.clone()));
+        assert_eq!(reader.read_ref_exact(&legacy).unwrap(), Some(first.clone()));
+        // From now on the lease is on the v4 ref itself.
+        let third = write_commit(&mut store, &tree, std::slice::from_ref(&second), "third\n");
+        assert!(reader
+            .push(&[RefUpdate {
+                refname: head.clone(),
+                expected: Some(first),
+                new: Some(third.clone()),
+            }])
+            .is_err());
+        assert_eq!(reader.read_ref(&head).unwrap(), Some(second.clone()));
+        reader
+            .push(&[RefUpdate {
+                refname: head.clone(),
+                expected: Some(second),
+                new: Some(third.clone()),
+            }])
+            .expect("a lease on the v4 value");
+        assert_eq!(reader.read_ref(&head).unwrap(), Some(third));
     }
 
     #[test]

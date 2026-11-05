@@ -12,9 +12,9 @@ assert_parent_dates() {
     || fail "walking the session spine"
   while read -r oid kind; do
     last=$kind
-    if [ "$kind" = conversation.root ]; then root=$oid; fi
+    if [ "$kind" = session.root ]; then root=$oid; fi
   done <<<"$parents"
-  [ "$last" = conversation.root ] || fail "the session spine did not end at its root"
+  [ "$last" = session.root ] || fail "the session spine did not end at its root"
 
   while read -r oid parent_time; do
     if [ -n "$child_time" ] && [ "$child_time" != "$parent_time" ]; then

@@ -34,8 +34,8 @@ impl Kind {
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Kind::SessionRoot => "conversation.root",
-            Kind::SessionFork => "conversation.fork",
+            Kind::SessionRoot => "session.root",
+            Kind::SessionFork => "session.fork",
             Kind::MetadataTitleSet => "metadata.title.set",
             Kind::MessageAppend => "message.append",
             Kind::ToolStart => "tool.start",
@@ -51,6 +51,12 @@ impl Kind {
     }
 
     pub fn parse(name: &str) -> Result<Kind, String> {
+        // The names a v6 session's commits carry, from before the rename.
+        match name {
+            "conversation.root" => return Ok(Kind::SessionRoot),
+            "conversation.fork" => return Ok(Kind::SessionFork),
+            _ => {}
+        }
         Self::ALL
             .into_iter()
             .find(|kind| kind.as_str() == name)
@@ -81,6 +87,20 @@ mod tests {
                 Ok(kind)
             );
         }
+    }
+
+    #[test]
+    fn v6_root_and_fork_names_still_parse() {
+        assert_eq!(Kind::parse("conversation.root"), Ok(Kind::SessionRoot));
+        assert_eq!(Kind::parse("conversation.fork"), Ok(Kind::SessionFork));
+        let current = super::super::events::encode(Kind::SessionFork, &[]);
+        let v6 = [
+            b"conversation.fork".as_slice(),
+            &current[b"session.fork".len()..],
+        ]
+        .concat();
+        assert_eq!(Kind::parse_message(&v6), Ok(Kind::SessionFork));
+        assert_eq!(Kind::SessionRoot.as_str(), "session.root");
     }
 
     #[test]

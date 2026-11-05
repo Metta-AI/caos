@@ -397,10 +397,14 @@ fn overview(config: &Config, caller: &Caller, claude_session: Option<&str>) -> V
 
 fn head_of(config: &Config, session: &str) -> String {
     let repo = config.repo.to_thread_local();
-    let Ok(refname) = refs::head_ref(session) else {
+    let Ok(names) = refs::head_refs(session) else {
         return "<invalid session id>".to_string();
     };
-    match repo.find_reference(refname.as_str()) {
+    match names
+        .iter()
+        .find_map(|refname| repo.find_reference(refname.as_str()).ok())
+        .ok_or(())
+    {
         Ok(mut reference) => match reference.peel_to_commit() {
             Ok(commit) => commit.id().to_string(),
             Err(error) => format!("<unreadable: {error}>"),

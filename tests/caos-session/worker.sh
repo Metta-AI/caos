@@ -30,7 +30,7 @@ prompt() { hook "$(jq -nc --arg s "$1" --arg p "$2" \
 stop() { hook "$(jq -nc --arg s "$1" --arg m "$2" \
   '{hook_event_name:"Stop",session_id:$s,last_assistant_message:$m}')"; }
 ref_of() {
-  printf 'refs/caos/v3/conversations/%s/head' \
+  printf 'refs/caos/v4/sessions/%s/head' \
     "$(printf '%s' "$1" | od -An -tx1 | tr -d ' \n')"
 }
 

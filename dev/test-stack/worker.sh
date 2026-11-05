@@ -479,7 +479,9 @@ harvest() { # <refs, one pattern per line>
   done <<<"$patterns"
 }
 
-DEFAULT_HARVEST='refs/caos/v3/conversations/*'
+# Session heads: v4, and v3 for sessions recorded before the rename.
+DEFAULT_HARVEST='refs/caos/v4/sessions/*
+refs/caos/v3/conversations/*'
 
 op_harvest() {
   if not_running; then return 0; fi

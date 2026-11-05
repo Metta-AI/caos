@@ -1,7 +1,15 @@
 use super::oid::{hex_lower, hex_nibble, is_lower_hex};
 
-pub const SESSIONS_PREFIX: &str = "refs/caos/v3/conversations/";
-pub const USERS_PREFIX: &str = "refs/caos/v3/users/";
+pub const SESSIONS_PREFIX: &str = "refs/caos/v4/sessions/";
+pub const USERS_PREFIX: &str = "refs/caos/v4/users/";
+const USER_SESSIONS: &str = "/sessions/";
+/// Where sessions recorded before the rename keep their refs: the same keys,
+/// under the names a session had when caos called it a conversation. Nothing
+/// writes them any more; a reader that finds no v4 ref falls back to them
+/// ([`legacy_ref`]), and the first write after that creates the v4 ref.
+pub const LEGACY_SESSIONS_PREFIX: &str = "refs/caos/v3/conversations/";
+pub const LEGACY_USERS_PREFIX: &str = "refs/caos/v3/users/";
+const LEGACY_USER_SESSIONS: &str = "/conversations/";
 pub const HEAD_SUFFIX: &str = "/head";
 pub const MAX_SESSION_ID_BYTES: usize = 124;
 pub const MAX_USER_ID_BYTES: usize = 126;
@@ -55,6 +63,7 @@ pub fn archived_membership_ref(user: &str, id: &str) -> Result<String, String> {
 pub fn parse_head_ref(refname: &str) -> Result<String, String> {
     let key = refname
         .strip_prefix(SESSIONS_PREFIX)
+        .or_else(|| refname.strip_prefix(LEGACY_SESSIONS_PREFIX))
         .and_then(|rest| rest.strip_suffix(HEAD_SUFFIX))
         .ok_or_else(|| format!("invalid session head ref {refname:?}"))?;
     if key.contains('/') {
@@ -66,11 +75,14 @@ pub fn parse_head_ref(refname: &str) -> Result<String, String> {
 }
 
 pub fn parse_membership_ref(refname: &str) -> Result<(String, Membership, String), String> {
-    let rest = refname
+    let (user_key, rest) = refname
         .strip_prefix(USERS_PREFIX)
-        .ok_or_else(|| format!("invalid session membership ref {refname:?}"))?;
-    let (user_key, rest) = rest
-        .split_once("/conversations/")
+        .and_then(|rest| rest.split_once(USER_SESSIONS))
+        .or_else(|| {
+            refname
+                .strip_prefix(LEGACY_USERS_PREFIX)
+                .and_then(|rest| rest.split_once(LEGACY_USER_SESSIONS))
+        })
         .ok_or_else(|| format!("invalid session membership ref {refname:?}"))?;
     let (membership, session_key) = if let Some(key) = rest.strip_prefix("active/") {
         (Membership::Active, key)
@@ -107,10 +119,35 @@ fn membership_ref(user: &str, membership: Membership, id: &str) -> Result<String
         Membership::Archived => "archived",
     };
     Ok(format!(
-        "{USERS_PREFIX}{}/conversations/{kind}/{}",
+        "{USERS_PREFIX}{}{USER_SESSIONS}{kind}/{}",
         key_of(user),
         key_of(id)
     ))
+}
+
+/// The pre-rename name of a v4 head or membership ref, which a reader falls
+/// back to when the v4 ref does not exist: `refs/caos/v4/sessions/<k>/head` ->
+/// `refs/caos/v3/conversations/<k>/head`, and
+/// `refs/caos/v4/users/<u>/sessions/<m>/<k>` ->
+/// `refs/caos/v3/users/<u>/conversations/<m>/<k>`. `None` for any other name.
+pub fn legacy_ref(refname: &str) -> Option<String> {
+    if let Some(rest) = refname.strip_prefix(SESSIONS_PREFIX) {
+        return Some(format!("{LEGACY_SESSIONS_PREFIX}{rest}"));
+    }
+    let (user_key, rest) = refname
+        .strip_prefix(USERS_PREFIX)?
+        .split_once(USER_SESSIONS)?;
+    Some(format!(
+        "{LEGACY_USERS_PREFIX}{user_key}{LEGACY_USER_SESSIONS}{rest}"
+    ))
+}
+
+/// The refs a session's head may be under, newest naming first: where to look
+/// when reading it directly rather than through a store that falls back.
+pub fn head_refs(id: &str) -> Result<[String; 2], String> {
+    let current = head_ref(id)?;
+    let legacy = legacy_ref(&current).expect("a head ref has a legacy name");
+    Ok([current, legacy])
 }
 
 #[cfg(test)]
@@ -120,8 +157,28 @@ mod tests {
     #[test]
     fn head_refs_round_trip() {
         let refname = head_ref("talk-1").unwrap();
-        assert_eq!(refname, "refs/caos/v3/conversations/74616c6b2d31/head");
+        assert_eq!(refname, "refs/caos/v4/sessions/74616c6b2d31/head");
         assert_eq!(parse_head_ref(&refname).unwrap(), "talk-1");
+    }
+
+    #[test]
+    fn legacy_refs_name_the_same_session() {
+        let head = head_ref("talk-1").unwrap();
+        let legacy = legacy_ref(&head).unwrap();
+        assert_eq!(legacy, "refs/caos/v3/conversations/74616c6b2d31/head");
+        assert_eq!(parse_head_ref(&legacy).unwrap(), "talk-1");
+        assert_eq!(head_refs("talk-1").unwrap(), [head, legacy]);
+
+        let active = active_membership_ref("user@example", "talk-1").unwrap();
+        let legacy = legacy_ref(&active).unwrap();
+        assert_eq!(
+            legacy,
+            "refs/caos/v3/users/75736572406578616d706c65/conversations/active/74616c6b2d31"
+        );
+        assert_eq!(parse_membership_ref(&legacy), parse_membership_ref(&active));
+
+        assert_eq!(legacy_ref("refs/heads/main"), None);
+        assert_eq!(legacy_ref(&legacy), None);
     }
 
     #[test]
