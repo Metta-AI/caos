@@ -13,7 +13,8 @@
 # them re-keys this tool's arg tree and nothing it builds. That split is why
 # `@param [test-salt]` can be reworded without re-running a single test.
 HELP=<<END
-Build the caos test stack image from the tree and run the whole test suite — the
+Build the caos test stack image from the tree `root` names (a caos source tree,
+such as sources/caos/02-layer) and run the whole test suite — the
 unit tests and every tests/<name> integration suite — as cached jobs: an
 unchanged test never re-runs. Returns the report: a line per test with its
 time and the hash of its record, the last few lines of every failing test,
