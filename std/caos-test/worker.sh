@@ -65,17 +65,15 @@ caos get "$in/dev" 2>/dev/null || true
 # suite to run: rather than fail the turn, put a plain note saying so and exit 0,
 # so the model reads a calm "not applicable here" tool_result instead of a red
 # one. A plain blob renders through the same tool conventions as the report.
-if [ ! -f /cas/args/in/flake.nix ] || [ ! -e /cas/args/in/dev/stack-up ]; then
+if [ ! -f "$in/flake.nix" ] || [ ! -e "$in/dev/stack-up" ]; then
   { echo "caos-test builds a caos dev stack from the tree and runs the caos suite"
     echo "on it. This source tree is not the caos codebase (no flake.nix / dev/stack-up),"
     echo "so there is nothing here for it to test."
     echo "caos-test is specific to the caos codebase; run it there."
-  } > /tmp/not-caos
-  caos put /tmp/not-caos /cas/out
-  exit 0
+  } | answer
 fi
 
-tree=$(caos hash /cas/args/in)
+tree=$(caos hash "$in")
 forward=()
 for name in test-salt only max-parallel; do
   if [ -e "/cas/args/$name" ]; then forward+=("--$name:@=/cas/args/$name"); fi
