@@ -3618,6 +3618,7 @@ fn self_curry(
         "tool-git",
         "tool-in",
         "tool-writer",
+        "tool-root",
         "op",
         "in",
         "result",
