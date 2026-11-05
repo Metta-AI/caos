@@ -1,13 +1,15 @@
-# std/import-source (design/caos-expr.md): an entry for an OPERATION OF THE STEP. `@op`
-# says llm-step does the work in process (it owns the call's lifecycle: it pins the
-# remote observation before anything is transferred, then attaches the source tree),
-# so this entry exists to give the operation a path, a help and a place in
-# `tool_help`/`run_tool`. The image it curries is never run.
+# std/import-source (design/agent-github.md, "Importing"): an ordinary writer
+# (design/tool-contract.md). It holds no token: it imports through its
+# neighbour `DEEP-DEPS/github`, the one image the github-token is granted to,
+# and answers with its root directory holding the new source tree. Nothing is
+# recorded before the import.
 HELP=<<END
-Import an HTTPS Git repository as a new, unchanged snapshot at an unused session path. Returns its full commit hash; preserves its tree and ancestor history. Does not merge or overwrite code. Import into sources/<repo>/00-base, the upstream tip the stack builds on: it is never edited, so `copy` it to sources/<repo>/99-dirty to work (see std/GIT.md). Public repositories need no token. The remote is observed when the call starts, so to see a branch's CURRENT head call this again with a fresh `into`: the new snapshot is how you learn the hash, and the tree you merge from. To import origin/main, select the repository from the chosen source's .source.json provenance and request main; use an explicit repository when ambiguous. Local checkouts use the client's /import command.
+Import an HTTPS Git repository as a new, unchanged snapshot. Returns its full commit hash; preserves its tree and ancestor history. Does not merge or overwrite code. `root` is the directory it goes in, one per repo, such as sources/<repo> (it may not exist yet); `into` is the new source tree's name there: 00-base, the upstream tip the stack builds on, which is never edited, so `copy` it to 99-dirty to work (see std/GIT.md). Public repositories need no token. The remote is observed when the call runs, so to see a branch's CURRENT head call this again with a fresh `into`, such as 00-base-2: the new snapshot is how you learn the hash, and the tree you merge from. Its provenance is written beside it as <into>.source.json. To import origin/main, take the repository from the stack's 00-base.source.json and request main.
 @param source HTTPS repository URL, without credentials.
-@param [revision] Remote branch, full refs/... name, or full commit hash. Omit for the remote default branch. A new call observes the remote again.
-@param into Unused session path, one directory per repo: sources/<repo>/00-base for the first import, or a fresh sibling such as sources/<repo>/00-base-2 for a newer tip. Its .source.json sibling must also be free.
-@op import-source
+@param [revision] Remote branch, full refs/... name, or full commit hash. Omit for the remote default branch.
+@param into Unused name inside root for the new source tree, such as 00-base, or 00-base-2 for a newer tip. Its .source.json sibling must also be free.
+@writer
+@root
+@request-id
 END
-curry --base:@=DEEP-DEPS/llm-step --help=$HELP
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --github:@=DEEP-DEPS/github --help=$HELP
