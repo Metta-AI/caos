@@ -29,8 +29,8 @@ no path says how caos is doing here.
 strings (an array or object where the help says so).
 - start(path, arguments), then result(ticket): the same without waiting. start returns a \
 ticket; result says pending, or gives the output, or says how it failed.
-- eval-path(path): evaluate a path and get the hash of what it produces. Pass the hash \
-as `in` to read, ls or grep to look inside it.
+- eval-path(path): evaluate a path and get the hash of what it produces. Pass \
+`<hash>[/<path>]` as `root` to read, ls or grep to look inside it.
 
 A tool is a directory of the session. The standard ones are under caos-std/: read, \
 ls, write, edit, copy, move, remove, grep, log, show, diff, merge, import-source, \
