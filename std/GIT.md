@@ -407,7 +407,7 @@ run_tool(path="caos-std/stack-sync", arguments={"stack": "sources/<repo>", "remo
 ### Waiting for CI
 
 GitHub has no long poll for checks, so waiting is polling, and the tools do
-it for you. `wait-min=<minutes>` (at most 180) makes `ci-status` read again
+it for you. `wait-min=<minutes>` makes `ci-status` read again
 every 15 seconds until a check fails or none is pending, then print as usual;
 if the time runs out first it says it is still pending. Run it with `start`
 and pick it up with `result`, so the wait does not hold up other work:
