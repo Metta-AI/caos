@@ -1861,10 +1861,16 @@ fn dispatch_started(
 /// a tool's help now comes from its EVALUATED image, so that would mean
 /// evaluating it twice.
 ///
+/// The second, for a task whose tool declares `@root`: the root path the call
+/// named (design/tool-contract.md, "`root`"), which its result is read against.
+///
 /// `None` for a task whose tool carries no help, which is every reader.
-fn declared_writer(call: &Call, record: &CallRecord) -> Result<Option<String>, String> {
+fn declared_contract(
+    call: &Call,
+    record: &CallRecord,
+) -> Result<(Option<String>, Option<String>), String> {
     let Some(task) = record.task.as_ref() else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let at = fresh("task-image");
     caos(["get-hash", task.as_str(), &at])?;
@@ -1872,19 +1878,23 @@ fn declared_writer(call: &Call, record: &CallRecord) -> Result<Option<String>, S
         Ok(Some(tool)) => tool,
         // A malformed or absent help is not this function's business: the call
         // has already run and its result is about to be read.
-        _ => return Ok(None),
+        _ => return Ok((None, None)),
     };
-    if !described.writer {
-        return Ok(None);
-    }
     // Name it the way the model named it, so an error about the proposal points
     // back at what it called.
-    Ok(Some(
+    let writer = described.writer.then(|| {
         call.input["path"]
             .as_str()
             .unwrap_or(&record.name)
-            .to_string(),
-    ))
+            .to_string()
+    });
+    let root = described.root.then(|| {
+        call.input["arguments"][tools::ROOT]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    });
+    Ok((writer, root))
 }
 
 fn dispatch_wait_started(
