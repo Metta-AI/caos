@@ -326,7 +326,7 @@ tier, which a per-request id cannot.
 | `bash-tool` | `@writer @in` | `@writer`; `root` a directory, `paths` and `cwd` relative to it |
 | `move-sed`, `create-squashed-stack` | `@writer @in` | `@writer`; `root` the directory |
 | `merge` | `@writer @scope source-tree` | `@writer`; `root` the gitlink, returns the merge commit |
-| `github` | `@call` | `@request-id` |
+| `github` | `@call`, one API call | `@request-id`; a batch of `api` / `push` / `import` / `head` operations, with today's `method`/`path`/`body` as the one-call form |
 | git `@op` tools | `@op` | as in section 2 |
 | `publish_source`, `import_source` (registered names) | built into `llm-step` | removed; the std tools replace them |
 
