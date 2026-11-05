@@ -34,6 +34,11 @@ pub struct GitStore {
     git_dir: PathBuf,
     remote: Option<String>,
     remote_tip: RefCell<Option<Oid>>,
+    /// Session refs this store read under their pre-rename name because the v4
+    /// ref did not exist yet (`refs::legacy_ref`), with the value read. A push
+    /// whose lease expects that value expects the v4 ref to be ABSENT instead:
+    /// it is the write that creates it.
+    legacy_reads: RefCell<std::collections::HashMap<String, Oid>>,
     batch: RefCell<Option<BatchReader>>,
     batch_dirty: Cell<bool>,
     #[cfg(test)]
@@ -155,6 +160,7 @@ impl GitStore {
             dir,
             remote: remote.map(str::to_string),
             remote_tip: RefCell::new(None),
+            legacy_reads: RefCell::new(std::collections::HashMap::new()),
             batch: RefCell::new(None),
             batch_dirty: Cell::new(false),
             #[cfg(test)]
@@ -182,7 +188,41 @@ impl GitStore {
         Ok(store)
     }
 
+    /// The ref's value, or for a session ref that does not exist yet, the value
+    /// of its pre-rename name (`refs::legacy_ref`).
     pub fn read_ref(&self, refname: &str) -> Result<Option<Oid>, String> {
+        match self.read_ref_exact(refname)? {
+            Some(found) => Ok(Some(found)),
+            None => self.read_legacy(refname, |legacy| self.read_ref_exact(legacy)),
+        }
+    }
+
+    /// `fetch_ref`, with the same fallback as `read_ref`.
+    pub fn fetch_ref(&self, refname: &str) -> Result<Option<Oid>, String> {
+        match self.fetch_ref_exact(refname)? {
+            Some(found) => Ok(Some(found)),
+            None => self.read_legacy(refname, |legacy| self.fetch_ref_exact(legacy)),
+        }
+    }
+
+    fn read_legacy(
+        &self,
+        refname: &str,
+        read: impl FnOnce(&str) -> Result<Option<Oid>, String>,
+    ) -> Result<Option<Oid>, String> {
+        let Some(legacy) = super::refs::legacy_ref(refname) else {
+            return Ok(None);
+        };
+        let found = read(&legacy)?;
+        if let Some(oid) = &found {
+            self.legacy_reads
+                .borrow_mut()
+                .insert(refname.to_string(), oid.clone());
+        }
+        Ok(found)
+    }
+
+    fn read_ref_exact(&self, refname: &str) -> Result<Option<Oid>, String> {
         let Some(remote) = &self.remote else {
             return self.read_local_ref(refname);
         };
