@@ -316,12 +316,8 @@ fn bounded(bytes: &[u8]) -> Result<String, Fail> {
     Ok(text.into_owned())
 }
 
-fn ls(ws: &str) -> Result<String, Fail> {
-    let comps = components_opt("path")?;
-    let dir = resolve(ws, &comps)?;
-    if !dir.is_dir() {
-        return Err(User(format!("{} is not a directory", comps.join("/"))));
-    }
+fn ls(root: Option<&str>) -> Result<String, Fail> {
+    let dir = directory(root, "use read")?;
     let children = entries(path(&dir)).map_err(Infra)?;
     let mut lines = Vec::with_capacity(children.len());
     for child in &children {
