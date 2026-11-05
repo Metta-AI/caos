@@ -330,8 +330,14 @@ mod tests {
             Some((Mode::Blob, new))
         );
         // Deleting it again drops the directories it alone kept alive.
-        let deleted = replace(&mut store, &created.tree, &path("docs/deep/new.md"), None, "rm")
-            .unwrap();
+        let deleted = replace(
+            &mut store,
+            &created.tree,
+            &path("docs/deep/new.md"),
+            None,
+            "rm",
+        )
+        .unwrap();
         assert_eq!(deleted.tree, root);
         // Deleting a whole source tree is one gitlink gone, no commit made.
         let gone = replace(&mut store, &root, &path("sources/repo/01-a"), None, "rm").unwrap();
