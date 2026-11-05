@@ -28,10 +28,15 @@ pub const MAX_TITLE: usize = 1024;
 pub const MAX_JSON_INT: u64 = 9_007_199_254_740_991;
 
 pub fn validate_format(bytes: &[u8]) -> Result<(), String> {
+    parse_format(bytes).map(|_| ())
+}
+
+pub fn parse_format(bytes: &[u8]) -> Result<Format, String> {
     match bytes {
-        bytes if bytes == FORMAT_BYTES.as_bytes() => Ok(()),
-        b"caos-conversation-v5\n" => Err("unsupported session format v5 (turn records); this build reads v6, a flat transcript. Open it with an earlier v5 build".into()),
-        b"caos-conversation-v4\n" => Err("unsupported session format v4; this build reads v6. Open it with the earlier v4 build".into()),
+        bytes if bytes == FORMAT_BYTES.as_bytes() => Ok(Format::V7),
+        bytes if bytes == V6_FORMAT_BYTES.as_bytes() => Ok(Format::V6),
+        b"caos-conversation-v5\n" => Err("unsupported session format v5 (turn records); this build reads v6 and v7, a flat transcript. Open it with an earlier v5 build".into()),
+        b"caos-conversation-v4\n" => Err("unsupported session format v4; this build reads v6 and v7. Open it with the earlier v4 build".into()),
         _ => Err("session format is invalid".into()),
     }
 }
