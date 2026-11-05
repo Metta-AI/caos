@@ -4,6 +4,11 @@ Status: proposal for discussion. Written against `Metta-AI/caos` at
 `ca150247b2982fd7bf119371aea215def5a433bb`, with PR #351 (`0f41904`,
 2026-10-27) read separately.
 
+Update 2026-11-06: the store question (sections 6 and 8 step 4) is decided
+in `design/loose-object-store.md`: loose objects only, never packed, on a
+btrfs volume, with the measurements behind it. Retention and the collector
+(sections 4, 5 and 7) are still open here.
+
 ## Summary
 
 caos uses git for three separable things: the **object format** (blobs,
