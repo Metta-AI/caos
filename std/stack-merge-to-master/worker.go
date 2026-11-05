@@ -500,7 +500,8 @@ func verdictStage(s *State) {
 	}
 	for k, i := range s.Reading {
 		var checks []Check
-		for _, raw := range obj(rs[2*k]["body"])["check_runs"].([]any) {
+		runs, _ := obj(rs[2*k]["body"])["check_runs"].([]any)
+		for _, raw := range runs {
 			run := obj(raw)
 			state := str(run["conclusion"])
 			if state == "" {
