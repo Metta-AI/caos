@@ -498,6 +498,20 @@ fn remove_entry(ws: &str, comps: &[String]) -> Result<String, Fail> {
         fs::remove_file(&target)
     };
     removal.map_err(|e| Infra(format!("removing {}: {e}", target.display())))?;
+    // A directory the removal left empty goes too: `caos put` would keep it
+    // as an empty tree, which no checkout of it can show.
+    let mut parent = target.parent().map(Path::to_path_buf);
+    while let Some(dir) = parent.filter(|dir| *dir != work) {
+        let empty = fs::read_dir(&dir)
+            .map_err(|e| Infra(format!("reading {}: {e}", dir.display())))?
+            .next()
+            .is_none();
+        if !empty {
+            break;
+        }
+        fs::remove_dir(&dir).map_err(|e| Infra(format!("removing {}: {e}", dir.display())))?;
+        parent = dir.parent().map(Path::to_path_buf);
+    }
     let out = fresh("files-out");
     caos(["put", path(&work), &out]).map_err(Infra)?;
     Ok(out)
