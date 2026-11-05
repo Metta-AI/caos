@@ -4482,8 +4482,12 @@ mod tests {
                     },
                     None,
                 );
-                tool_complete_transition(record, &result_block("first", "done", false), Vec::new())
-                    .unwrap()
+                tool_complete_transition(
+                    record,
+                    &result_block("first", "done", false),
+                    Vec::new(),
+                )
+                .unwrap()
             });
             let store = ImportStore {
                 objects,
