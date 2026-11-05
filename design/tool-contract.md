@@ -337,7 +337,8 @@ the same contract or are removed in favour of their std entries (SPEC,
 ## Order of work
 
 1. No automatic resume (section 1).
-2. `@request-id`, with `std/github` moved to it.
+2. `@request-id`, with `std/github` moved to it, and `std/github`'s batch
+   with the `push`, `import` and `head` operations.
 3. `root` in the harness, accepting old and new tags during the migration.
 4. The std tools, reader by reader and writer by writer.
 5. `ci-status` as the first operation turned worker, since it writes nothing,
