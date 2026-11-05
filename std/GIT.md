@@ -237,10 +237,10 @@ merge it into the first layer, then each layer into the one after it:
 
 ```text
 import_source(source=..., revision="main", into="sources/repo/00-base-2")
-remove(file-path="sources/repo/00-base")
-remove(file-path="sources/repo/00-base.source.json")
-move(from="sources/repo/00-base-2", to="sources/repo/00-base")
-move(from="sources/repo/00-base-2.source.json", to="sources/repo/00-base.source.json")
+remove(root="sources/repo/00-base")
+remove(root="sources/repo/00-base.source.json")
+move(root="sources/repo", from="00-base-2", to="00-base")
+move(root="sources/repo", from="00-base-2.source.json", to="00-base.source.json")
 merge(source-tree="sources/repo/01-feature",
       theirs="<full hash of sources/repo/00-base>")
 merge(source-tree="sources/repo/02-tests",
