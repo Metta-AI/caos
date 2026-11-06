@@ -334,7 +334,7 @@ declares no `@root` either has no input beyond its own expression.
 ## Receiving args
 
 - A bound arg lands at `/cas/args/<name>`, a lazy placeholder like any other
-  arg — `caos get` it before reading. **`/cas/args/in`, not `/cas/in`**
+  arg — `caos get` it before reading. **`/cas/args/root`, not `/cas/root`**
 - An omitted optional arg simply does not exist; test with `[ -e ]`
 - Values are never shell-interpolated. They are argv elements to `caos curry`,
   then bytes in a file
