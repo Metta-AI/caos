@@ -1,7 +1,8 @@
 # caos: a loose-object store on btrfs
 
-Status: decided, not yet built. Measured on a copy of the caosd-prod object
-store on 2026-11-05. Replaces the pack-maintenance part of
+Status: decided; the server change is built (this section's PR), the
+filesystem and the migration are not. Measured on a copy of the caosd-prod
+object store on 2026-11-05. Replaces the pack-maintenance part of
 `design/caos-store-and-gc.md`; retention (the collector) is still open there.
 
 ## Summary
