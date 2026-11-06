@@ -4074,6 +4074,8 @@ pub fn caos_trace_child(t: &dyn Transport, name: &str, arg_tree: &str) -> Result
 enum ContinuationSubject<'a> {
     Input(&'a str),
     Request(&'a str),
+    /// The name of a ref to wait on (`ref-then`), recorded as a blob.
+    Ref(&'a str),
 }
 
 /// Shared body of [`caos_map_then`] / [`caos_run_then`] / [`caos_eval_then`] /
