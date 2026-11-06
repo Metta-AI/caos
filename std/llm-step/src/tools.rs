@@ -145,10 +145,8 @@ pub fn grep_declaration() -> Value {
 
 /// Arg names a tree tool may not declare: the interpreter binds these itself
 /// on every tool run, and `caos curry` errors on a rebind (SPEC, "Currying").
-/// `wc`/`refs` are bound only for `@git` tools, but reserved unconditionally
-/// so a tool can't declare a model arg the interpreter would then clobber.
-/// `in` is reserved for the same reason and asked for with `@in`, which turns
-/// it into a parameter the interpreter still binds.
+/// `in`, `wc`, `refs` and `call` left with the tags that bound them (`@in`,
+/// `@git`, `@call`; design/tool-contract.md, "Tags").
 ///
 /// EVERY NAME HERE IS ONE SOMETHING BINDS. `std` used to be on this list and is
 /// not any more: there is no `std` arg, a dependency rides inside the tree as a
