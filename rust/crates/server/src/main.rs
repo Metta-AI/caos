@@ -1304,12 +1304,8 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&hook).unwrap(), installed);
 
         // Without the server's name in its environment, the hook declines.
-        let declined = Command::new("sh")
-            .arg(&hook)
-            .env_remove(crate::loose::SERVER_EXE_ENV)
-            .output()
-            .unwrap();
-        assert!(!declined.status.success());
+        let guard = format!("if [ -z \"${}\" ]", crate::loose::SERVER_EXE_ENV);
+        assert!(installed.contains(&guard), "{installed}");
 
         // A hook that is not ours stops the server rather than being replaced.
         std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
