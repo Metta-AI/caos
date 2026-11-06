@@ -513,8 +513,8 @@ fn publish_quarantined(quarantine: &Path, objects: &Path, read: Command) -> io::
         for entry in entries.filter_map(Result::ok) {
             if entry.path().extension().is_some_and(|ext| ext == "pack") {
                 return Err(other(
-                    "the push arrived as a pack; the server must run with receive.unpackLimit \
-                     unset to infinity so pushes land as loose objects",
+                    "the push arrived as a pack; the server sets receive.unpackLimit so \
+                     that pushes land as loose objects, and something has overridden it",
                 ));
             }
         }
