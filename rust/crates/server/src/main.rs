@@ -60,6 +60,7 @@ mod git;
 mod grant_history;
 mod import;
 mod locator;
+mod loose;
 mod mcp;
 mod push;
 mod remote_git;
