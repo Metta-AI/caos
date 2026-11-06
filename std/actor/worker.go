@@ -77,12 +77,8 @@ func serverURL() string {
 
 // readRef is the branch's head on the server, or "" if the branch is absent.
 func readRef(ref string) string {
-	out := run("git", "ls-remote", "--refs", serverURL(), ref)
-	for _, line := range strings.Split(out, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) == 2 && fields[1] == ref {
-			return fields[0]
-		}
+	if head := caos("ref-get", ref); head != absent {
+		return head
 	}
 	return ""
 }
