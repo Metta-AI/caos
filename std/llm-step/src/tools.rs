@@ -2018,9 +2018,9 @@ mod tests {
 
     #[test]
     fn parse_help_skips_reserved_and_malformed_params() {
-        // `in` is reserved; `Bad` is not a lowercase name → both skipped, the
+        // `salt` is reserved; `Bad` is not a lowercase name → both skipped, the
         // good one survives.
-        let h = parse_help("t", "d\n@param in nope\n@param Bad nope\n@param ok yes");
+        let h = parse_help("t", "d\n@param salt nope\n@param Bad nope\n@param ok yes");
         assert_eq!(h.args.len(), 1);
         assert_eq!(h.args[0].name, "ok");
     }
@@ -2275,7 +2275,7 @@ mod tests {
 
         // Rejected: an arg the interpreter already binds (curry errors on a
         // rebind), and anything that isn't a plain lower-case flag name.
-        assert!(parse_arg("in The source tree.").is_none());
+        assert!(parse_arg("salt The salt.").is_none());
         assert!(parse_arg("worker1 The script.").is_none());
         assert!(parse_arg("Hash The record hash.").is_none());
         assert!(parse_arg("--hash The record hash.").is_none());
