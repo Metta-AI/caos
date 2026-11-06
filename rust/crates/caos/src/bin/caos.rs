@@ -135,6 +135,13 @@ fn run(args: &[String]) -> Result<(), String> {
         // refs/heads/ (design/refs.md).
         Some("ref-get") => caos::caos_ref_get(&http()?, &args[2..]),
         Some("ref-set") => caos::caos_ref_set(&http()?, &args[2..]),
+        // `ref-then <ref> [--expected=<hash|absent>] [--timeout=<secs>]
+        // [--then:<type>=<image>] [--catch]` — a continuation: the server waits
+        // for the ref to change after this worker exits, holding no slot.
+        Some("ref-then") => match &args[2..] {
+            [name, kvs @ ..] => caos::caos_ref_then(&http()?, name, kvs),
+            _ => Err(usage(args)),
+        },
         // Start an already-stored ArgTree without waiting, preserving this
         // job's server-side run stack and secret store.
         Some("sub-run") => match &args[2..] {
