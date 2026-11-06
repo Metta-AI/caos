@@ -179,10 +179,6 @@ pub struct TreeTool {
     /// The tool declared `@root`: it takes a required `root` path and is given
     /// the object there (design/tool-contract.md, "`root`"). See [`Help::root`].
     pub root: bool,
-    /// The tool declared `@scope <param>`: the SOURCE TREE it runs over, and
-    /// changes if it is a writer, is the one the argument `<param>` names. See
-    /// [`Help::scope`].
-    pub scope: Option<String>,
     /// The tool declared `@op <name>`: the step performs this operation itself.
     /// See [`Help::op`].
     pub op: Option<String>,
