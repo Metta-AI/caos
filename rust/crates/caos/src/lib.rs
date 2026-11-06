@@ -3968,57 +3968,63 @@ pub fn caos_ref_get(t: &dyn Transport, args: &[String]) -> Result<bool, String> 
     Ok(true)
 }
 
-/// `ref-set <ref> <hash|absent> (--expected=<hash|absent> | --force)` — move a
-/// ref, or delete it with `absent`.
+const REF_SET_USAGE: &str = "usage: ref-set <ref> (--new=<hash> | --new:@=<cas-path> | --delete)
+         (--expected=<hash|absent> | --expected:@=<cas-path> | --force)";
+
+/// `ref-set <ref> (--new=<hash> | --new:@=<cas-path> | --delete)
+/// (--expected=<hash|absent> | --expected:@=<cas-path> | --force)` — move a
+/// ref to a commit, or delete it.
+///
+/// A COMMIT IS GIVEN AS A HASH (`=`) OR AS THE CAS PATH IT IS RECORDED AT
+/// (`:@=`), the spellings `run` and `curry` use. So the commit `put-commit`
+/// just minted and the head `ref-get` just read pass straight through, and a
+/// script need never handle a hash.
 ///
 /// A COMPARE-AND-SWAP BY DEFAULT: `--expected` names the value being replaced
 /// (`absent` for create-only) and the server checks it under the ref's lock.
 /// An unconditional write has to say `--force`, so leaving the expectation out
 /// is an error rather than a silent overwrite. A lost race fails with the
-/// value the ref actually holds. The new value must be a commit already in the
-/// store (`put-commit` mints one).
+/// value the ref actually holds. The new commit must already be in the store.
 pub fn caos_ref_set(t: &dyn Transport, args: &[String]) -> Result<(), String> {
-    let mut positional = Vec::new();
-    let mut expected: Option<&str> = None;
+    let mut name: Option<&str> = None;
+    let mut new: Option<String> = None;
+    let mut expected: Option<String> = None;
     let mut force = false;
     for arg in args {
-        if let Some(value) = arg.strip_prefix("--expected=") {
-            if expected.replace(value).is_some() {
+        let value = if arg == "--delete" {
+            Some(REF_ABSENT.to_string())
+        } else {
+            ref_flag("ref-set", "new", false, arg).transpose()?
+        };
+        if let Some(value) = value {
+            if new.replace(value).is_some() {
+                return Err("`ref-set` takes one --new or --delete".to_string());
+            }
+        } else if let Some(value) = ref_flag("ref-set", "expected", true, arg) {
+            if expected.replace(value?).is_some() {
                 return Err("`ref-set` --expected given twice".to_string());
             }
         } else if arg == "--force" {
             force = true;
-        } else if arg.starts_with("--") {
-            return Err(format!(
-                "`ref-set` takes --expected=<hash|absent> or --force, got {arg}"
-            ));
-        } else {
-            positional.push(arg.as_str());
+        } else if arg.starts_with("--") || name.replace(arg).is_some() {
+            return Err(format!("`ref-set` does not take {arg:?}\n{REF_SET_USAGE}"));
         }
     }
-    let [name, value] = positional[..] else {
-        return Err(
-            "usage: ref-set <ref> <hash|absent> (--expected=<hash|absent> | --force)".to_string(),
-        );
+    let (Some(name), Some(new)) = (name, new) else {
+        return Err(REF_SET_USAGE.to_string());
     };
     check_ref_name("ref-set", name)?;
-    check_ref_value("ref-set", "the new value", value)?;
-    let mut body = serde_json::json!({"name": name, "value": value});
+    let mut body = serde_json::json!({"name": name, "value": new});
     match (expected, force) {
         (Some(_), true) => {
             return Err("`ref-set` takes --expected or --force, not both".to_string())
         }
         (None, false) => {
-            return Err(
-                "`ref-set` needs --expected=<hash|absent> (a compare-and-swap) or --force \
-                 (an unconditional write)"
-                    .to_string(),
-            )
+            return Err(format!(
+                "`ref-set` needs --expected (a compare-and-swap) or --force (an unconditional write)\n{REF_SET_USAGE}"
+            ))
         }
-        (Some(old), false) => {
-            check_ref_value("ref-set", "--expected", old)?;
-            body["expected"] = serde_json::Value::String(old.to_string());
-        }
+        (Some(old), false) => body["expected"] = serde_json::Value::String(old),
         (None, true) => {}
     }
     let body = body.to_string();
