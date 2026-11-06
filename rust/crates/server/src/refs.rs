@@ -427,7 +427,13 @@ mod tests {
         assert_eq!(read(repo.path(), REF).unwrap(), Value::Absent);
         let c = repo.commit("below");
         set(repo.path(), &format!("{REF}y"), &c, &Expected::Any).unwrap();
-        set(repo.path(), "refs/heads/tests/refs/x2/y", &c, &Expected::Any).unwrap();
+        set(
+            repo.path(),
+            "refs/heads/tests/refs/x2/y",
+            &c,
+            &Expected::Any,
+        )
+        .unwrap();
         assert_eq!(read(repo.path(), REF).unwrap(), Value::Absent);
     }
 
