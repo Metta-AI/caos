@@ -1685,37 +1685,10 @@ fn launch_resolved_tool(
     if tool.root {
         return launch_root_tool(cfg, state, turn, &call, &tool, &image, &current.message_id);
     }
+    // A tool without `@root` reads nothing of the session: its arguments are its
+    // whole input (design/tool-contract.md, "Tags").
     let nested = json!({"id": id, "input":
         call.input.get("arguments").cloned().unwrap_or_else(|| json!({}))});
-    // A tool that declares `@scope <param>` runs over, and a writer changes, the
-    // source tree its argument names, not the one its path happens to sit in:
-    // `merge` is reached at `caos-std/merge` and advances `feature/01-change`.
-    let selected = tool
-        .scope
-        .as_deref()
-        .and_then(|param| nested["input"][param].as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let (name, commit, ws, wc) = match selected {
-        None => (name, commit, ws, wc),
-        Some(selected) => match source_tree_target(&state.session()?, Some(selected)) {
-            Ok(Some((scoped, scoped_commit))) => {
-                let (scoped_ws, scoped_wc) = materialize_source_tree(state, &scoped_commit)?;
-                (Some(scoped), scoped_commit, scoped_ws, scoped_wc)
-            }
-            Ok(None) | Err(_) => {
-                let why = source_tree_target(&state.session()?, Some(selected))
-                    .err()
-                    .unwrap_or_else(|| format!("unknown source tree {selected:?}"));
-                site.failed(
-                    state,
-                    &error_block(id, &why),
-                    name.map(|name| (name, commit)),
-                )?;
-                return resume(cfg, state, turn);
-            }
-        },
-    };
     let session = state.session()?.tree().clone();
     let bound = match tools::tree_tool_args(&nested, &tool, Some(session.as_str())) {
         Ok(bound) => bound,
