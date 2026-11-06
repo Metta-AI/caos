@@ -4059,18 +4059,28 @@ pub const REF_MAX_WAIT_SECS: u64 = 24 * 60 * 60;
 /// waiting for may be queued for one — the hold-and-wait design/map-then.md
 /// rules out.
 ///
-/// The new value reaches `--then` as `--result`, a blob holding what `ref-get`
-/// would print (`<oid>` or `absent`, and a newline); with no `--then` that
-/// blob is this request's result. If `--timeout` (default 600s, at most a
-/// day) passes first the wait fails, and `--catch` delivers that failure to
-/// `--then` as `--error` instead. A request that waited on a ref is never
-/// cached: its answer depends on when it ran.
+/// The new commit reaches `--then` as `--result`, a commit entry exactly like
+/// what `ref-get` records, so the callback reads `/cas/args/result` as it
+/// would any commit-valued arg. A ref DELETED while it was waited on (only
+/// possible when `--expected` names a commit) arrives instead as a bare
+/// `--absent` flag and no `--result`. With no `--then`, the commit is this
+/// request's result (an empty blob for a deletion). If `--timeout` (default
+/// 600s, at most a day) passes first the wait fails, and `--catch` delivers
+/// that failure to `--then` as `--error` instead. A request that waited on a
+/// ref is never cached: its answer depends on when it ran.
 pub fn caos_ref_then(t: &dyn Transport, name: &str, kvs: &[String]) -> Result<(), String> {
     check_ref_name("ref-then", name)?;
+    // The continuation records `expected` verbatim, as a hash or `absent`, so
+    // a `--expected:@=<cas path>` is resolved to its commit's hash here.
+    let mut resolved = Vec::with_capacity(kvs.len());
     for kv in kvs {
-        if let Some(value) = kv.strip_prefix("--expected=") {
-            check_ref_value("ref-then", "--expected", value)?;
+        match ref_flag("ref-then", "expected", true, kv).transpose()? {
+            Some(value) => resolved.push(format!("--expected={value}")),
+            None => resolved.push(kv.clone()),
         }
+    }
+    let kvs = &resolved[..];
+    for kv in kvs {
         if let Some(value) = kv.strip_prefix("--timeout=") {
             match value.parse::<u64>() {
                 Ok(seconds) if (1..=REF_MAX_WAIT_SECS).contains(&seconds) => {}
