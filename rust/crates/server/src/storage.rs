@@ -284,37 +284,13 @@ pub(crate) fn store_git_tree(
         }
     }
     let tree = gix::objs::Tree { entries };
-    let id = match repo.write_object(&tree) {
-        Ok(id) => id.detach(),
-        Err(e) => {
-            use gix::objs::WriteTo;
-            let mut data = Vec::new();
-            tree.write_to(&mut data)
-                .map_err(|e| format!("encoding tree: {e}"))?;
-            stored_despite(&repo, gix::objs::Kind::Tree, &data)
-                .ok_or_else(|| format!("writing tree: {e}"))?
-        }
-    };
-    Ok(sync_loose_object(config, id))
-}
-
-/// The content-addressed escape for a failed object write: concurrent requests
-/// writing the SAME object race on the loose-object rename, and gix (except on
-/// Windows) surfaces the losing racer's persist failure even though the winner
-/// stored the content — observed under the suite's cold parallel load. Return
-/// the id iff the object is genuinely in the store now.
-///
-/// Asks by READING the object's header, not `has_object`: gix answers that one
-/// for a loose object by testing whether the path exists, so a zero-length file
-/// left by a crash passes it, and this escape hatch would report a poisoned
-/// object as safely stored (see [`crate::repair`]).
-fn stored_despite(
-    repo: &gix::Repository,
-    kind: gix::objs::Kind,
-    data: &[u8],
-) -> Option<gix::ObjectId> {
-    let id = gix::objs::compute_hash(repo.object_hash(), kind, data).ok()?;
-    repo.find_header(id).is_ok().then_some(id)
+    use gix::objs::WriteTo;
+    let mut data = Vec::new();
+    tree.write_to(&mut data)
+        .map_err(|e| format!("encoding tree: {e}"))?;
+    // Concurrent requests writing the SAME tree both succeed: the loose writer
+    // renames identical content over itself (see `loose::write_durable`).
+    write(config, gix::object::Kind::Tree, &data).map_err(|e| format!("writing tree: {e}"))
 }
 
 /// Fetch and parse a git tree from the in-process object database.
