@@ -3871,9 +3871,49 @@ mod continuation_shape_tests {
             has_run,
             has_request,
             false,
+            false,
             has_then,
             catch,
         )
+    }
+
+    /// The `ref` middle step (`caos ref-then`): exclusive with the others,
+    /// carries no `in`, and a `catch` needs a `then`.
+    fn ref_shape(
+        has_input: bool,
+        has_other_middle: bool,
+        has_then: bool,
+        catch: bool,
+    ) -> Result<(), HttpError> {
+        validate_continuation_shape(
+            "test-continuation",
+            has_input,
+            has_other_middle,
+            false,
+            false,
+            false,
+            true,
+            has_then,
+            catch,
+        )
+    }
+
+    #[test]
+    fn ref_waits_on_a_name_and_obeys_the_middle_step_rules() {
+        ref_shape(false, false, false, false).unwrap();
+        ref_shape(false, false, true, true).unwrap();
+        assert!(ref_shape(true, false, true, false)
+            .unwrap_err()
+            .message()
+            .contains("both 'ref' and 'in'"));
+        assert!(ref_shape(false, true, true, false)
+            .unwrap_err()
+            .message()
+            .contains("mutually exclusive"));
+        assert!(ref_shape(false, false, false, true)
+            .unwrap_err()
+            .message()
+            .contains("without 'then'"));
     }
 
     /// The `eval` middle step obeys the same shape rules as `run`: exclusive
