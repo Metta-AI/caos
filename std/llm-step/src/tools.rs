@@ -95,7 +95,7 @@ const EVAL_PATH_HELP: &str = "Evaluate a path and return the hash of what it pro
 
 /// Build a built-in tool's registry entry from its help text, through the very
 /// same `parse_help` → `tree_tool_declaration` path a discovered caos-tools
-/// tool takes. A std entry that declares `@git` gets the same builder.
+/// tool takes.
 pub(crate) fn builtin_tool(name: &str, help: &str) -> TreeTool {
     TreeTool::new(name, parse_help(&format!("built-in {name}"), help))
 }
@@ -1813,7 +1813,6 @@ mod tests {
                     @param [log] Which inner-stack log.";
         let h = parse_help("t", help);
         assert_eq!(h.doc, "Print one test's record. A second description line.");
-        assert!(!h.git);
         assert!(!h.writer, "a tool is read-only unless it says otherwise");
         assert_eq!(h.args.len(), 2);
         assert_eq!(h.args[0].name, "hash");
@@ -2337,13 +2336,9 @@ mod tests {
                     ty: ArgType::Text,
                 },
             ],
-            git: false,
             writer: false,
-            wants_in: false,
-            call: false,
             request_id: false,
             root: false,
-            scope: None,
             op: None,
         };
         let d = tree_tool_declaration(&tool);
@@ -2361,13 +2356,9 @@ mod tests {
             name: "build".to_string(),
             doc: "Build.".to_string(),
             args: Vec::new(),
-            git: false,
             writer: false,
-            wants_in: false,
-            call: false,
             request_id: false,
             root: false,
-            scope: None,
             op: None,
         };
         let d = tree_tool_declaration(&bare);
@@ -2396,13 +2387,9 @@ mod tests {
                     ty: ArgType::Text,
                 },
             ],
-            git: false,
             writer: false,
-            wants_in: false,
-            call: false,
             request_id: false,
             root: false,
-            scope: None,
             op: None,
         };
         let call = |input: Value| json!({"id": "toolu_01", "name": "echo-arg", "input": input});
