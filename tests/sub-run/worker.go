@@ -188,12 +188,12 @@ func detached() {
 // on the way out of a failure too.
 func cleanup(nonce string) {
 	for _, name := range []string{"go", "alive", "done"} {
-		value, err := exec.Command("caos", "ref-get", ref(nonce, name)).Output()
-		v := strings.TrimSpace(string(value))
-		if err != nil || v == absent {
+		// ref-get exits 2 for a ref that is not there: nothing to delete.
+		path := "/cas/cleanup-" + name
+		if exec.Command("caos", "ref-get", ref(nonce, name), path).Run() != nil {
 			continue
 		}
-		_ = exec.Command("caos", "ref-set", ref(nonce, name), absent, "--expected="+v).Run()
+		_ = exec.Command("caos", "ref-set", ref(nonce, name), "--delete", "--expected:@="+path).Run()
 	}
 }
 
