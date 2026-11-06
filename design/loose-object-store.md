@@ -224,10 +224,11 @@ is less code.
 
 ### 4.2 Durability cost
 
-`sync_loose_object` fsyncs each object and its directory: 8.2 ms an object in
-the test (pessimistic, through a loop device), against 0.29 ms in batch mode.
-This is what the server already pays per object on ext4, so the migration
-does not make it worse. If it shows up, the fix is group commit in
+`loose::write_durable` fsyncs each object and its directory: 8.2 ms an
+object in the test (pessimistic, through a loop device), against 0.29 ms in
+batch mode. That is the same two fsyncs `sync_loose_object` paid per object
+before, so this does not make it worse; the batch paths (push, import,
+locator) flush once per batch with `syncfs`. If it shows up, the fix is group commit in
 `storage.rs`: concurrent writes share one `syncfs` per few milliseconds and
 each request is answered only after its sync.
 
