@@ -989,8 +989,13 @@ mod tests {
     fn server_owned_refs_are_hidden_from_fetch_but_available_for_push_negotiation() {
         let dir = std::env::temp_dir().join(format!("caos-hidden-ref-test-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
+        let env = settings_env(&git_settings(None));
         let git = |args: &[&str]| {
-            let output = Command::new("git").args(args).output().unwrap();
+            let output = Command::new("git")
+                .envs(env.iter().map(|(key, value)| (key, value)))
+                .args(args)
+                .output()
+                .unwrap();
             assert!(
                 output.status.success(),
                 "git {:?}: {}",
@@ -999,63 +1004,32 @@ mod tests {
             );
             String::from_utf8_lossy(&output.stdout).into_owned()
         };
-        git(&["init", "-q", "--bare", dir.to_str().unwrap()]);
-        git(&[
-            "-C",
-            dir.to_str().unwrap(),
-            "config",
-            "--add",
-            "uploadpack.hideRefs",
-            "refs/private/",
-        ]);
-        git(&[
-            "-C",
-            dir.to_str().unwrap(),
-            "config",
-            "--add",
-            "receive.hideRefs",
-            "refs/private-write/",
-        ]);
-        git(&[
-            "-C",
-            dir.to_str().unwrap(),
-            "config",
-            "--add",
-            "receive.hideRefs",
-            "refs/caos/res/",
-        ]);
+        Command::new("git")
+            .args(["init", "-q", "--bare", dir.to_str().unwrap()])
+            .status()
+            .unwrap();
+        // An administrator's own value, in the repo's config, survives beside
+        // the server's, which never touch the file.
+        Command::new("git")
+            .args(["-C", dir.to_str().unwrap(), "config", "--add"])
+            .args(["uploadpack.hideRefs", "refs/private/"])
+            .status()
+            .unwrap();
+        let config = std::fs::read(dir.join("config")).unwrap();
         let blob = git(&["-C", dir.to_str().unwrap(), "hash-object", "-w", "--stdin"]);
         let blob = blob.trim();
         for refname in [
             "refs/caos/req/request",
             "refs/caos/res/result",
             "refs/caos/v2/users/u-1/conversations/active/c-74657374",
-            // A resolved locator's pin→tree memo (`mod locator`). One per pin, so
+            "refs/private/x",
+            // A resolved locator's pin->tree memo (`mod locator`). One per pin, so
             // a server that has resolved a few hundred would advertise a few
             // hundred to every client that dials it.
             &format!("{}{}", crate::locator::TREE_REF_PREFIX, "a".repeat(40)),
         ] {
             git(&["-C", dir.to_str().unwrap(), "update-ref", refname, blob]);
         }
-        configure_ref_advertisements(dir.to_str().unwrap()).unwrap();
-        configure_ref_advertisements(dir.to_str().unwrap()).unwrap();
-        let hidden = git(&[
-            "-C",
-            dir.to_str().unwrap(),
-            "config",
-            "--get-all",
-            "uploadpack.hideRefs",
-        ]);
-        assert_eq!(hidden.lines().count(), 4, "{hidden}");
-        assert!(hidden.lines().any(|value| value == "refs/private/"));
-        let receive_hidden = git(&[
-            "-C",
-            dir.to_str().unwrap(),
-            "config",
-            "--get-all",
-            "receive.hideRefs",
-        ]);
-        assert_eq!(receive_hidden.trim(), "refs/private-write/");
 
         let upload = git(&[
             "upload-pack",
@@ -1066,6 +1040,7 @@ mod tests {
         assert!(!upload.contains("refs/caos/req/"));
         assert!(!upload.contains("refs/caos/res/"));
         assert!(!upload.contains(crate::locator::TREE_REF_PREFIX));
+        assert!(!upload.contains("refs/private/"));
         assert!(upload.contains("refs/caos/v2/users/"));
 
         let receive = git(&[
@@ -1078,154 +1053,46 @@ mod tests {
         assert!(receive.contains("refs/caos/res/"));
         assert!(receive.contains("refs/caos/v2/users/"));
 
+        // The settings reached git without the repository's config changing.
+        assert_eq!(std::fs::read(dir.join("config")).unwrap(), config);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn managed_pre_receive_hooks_are_removed_on_upgrade() {
-        for (index, marker) in MANAGED_HOOK_MARKERS.iter().enumerate() {
-            let dir = std::env::temp_dir().join(format!(
-                "caos-managed-hook-test-{}-{index}",
-                std::process::id()
-            ));
-            std::fs::remove_dir_all(&dir).ok();
-            run_required_git(&["init", "-q", "--bare", dir.to_str().unwrap()]).unwrap();
-            let hooks = dir.join("hooks");
-            let hook = hooks.join("pre-receive");
-            std::fs::write(&hook, format!("#!/bin/sh\n{marker}\nexit 1\n")).unwrap();
-            run_required_git(&[
-                "-C",
-                dir.to_str().unwrap(),
-                "config",
-                "core.hooksPath",
-                hooks.to_str().unwrap(),
-            ])
-            .unwrap();
-
-            remove_managed_pre_receive_hook(dir.to_str().unwrap()).unwrap();
-
-            assert!(!hook.exists());
-            let configured = Command::new("git")
-                .args([
-                    "-C",
-                    dir.to_str().unwrap(),
-                    "config",
-                    "--get",
-                    "core.hooksPath",
-                ])
+    fn a_created_repo_gets_the_settings_and_a_read_only_config() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("caos-init-test-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        initialize_repo(dir.to_str().unwrap()).unwrap();
+        let mode = std::fs::metadata(dir.join("config")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o444);
+        let get = |key: &str| {
+            let output = Command::new("git")
+                .args(["-C", dir.to_str().unwrap(), "config", "--get-all", key])
                 .output()
                 .unwrap();
-            assert_eq!(configured.status.code(), Some(1));
-            std::fs::remove_dir_all(dir).unwrap();
-        }
-    }
-
-    #[test]
-    fn publish_hook_is_installed_and_refuses_a_foreign_one() {
-        let dir =
-            std::env::temp_dir().join(format!("caos-publish-hook-test-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        run_required_git(&["init", "-q", "--bare", dir.to_str().unwrap()]).unwrap();
-        let git_dir = dir.to_str().unwrap();
-        let hook = dir.join("hooks/pre-receive");
-
-        install_publish_hook(git_dir).unwrap();
-        let installed = std::fs::read_to_string(&hook).unwrap();
-        assert!(installed.contains(crate::loose::HOOK_MARKER));
-        assert!(installed.contains(crate::loose::HOOK_ARG));
-        // Idempotent, and a stale managed copy is rewritten.
-        install_publish_hook(git_dir).unwrap();
-        let stale = format!("#!/bin/sh\n{}\nexit 0\n", crate::loose::HOOK_MARKER);
-        std::fs::write(&hook, stale).unwrap();
-        install_publish_hook(git_dir).unwrap();
-        assert_eq!(std::fs::read_to_string(&hook).unwrap(), installed);
-
-        // Without the server's name in its environment, the hook declines.
-        let guard = format!("if [ -z \"${}\" ]", crate::loose::SERVER_EXE_ENV);
-        assert!(installed.contains(&guard), "{installed}");
-
-        // A hook that is not ours stops the server rather than being replaced.
-        std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
-        let error = install_publish_hook(git_dir).unwrap_err();
-        assert!(error.contains("not caos's"), "{error}");
-        std::fs::remove_file(&hook).unwrap();
-
-        // So does a hooks path that sends git elsewhere.
-        run_required_git(&["-C", git_dir, "config", "core.hooksPath", "/elsewhere"]).unwrap();
-        let error = install_publish_hook(git_dir).unwrap_err();
-        assert!(error.contains("core.hooksPath"), "{error}");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        assert_eq!(get("gc.auto").trim(), "0");
+        assert_eq!(get("uploadpack.hideRefs").lines().count(), 3);
+        // A process's own hooks directory is never written into a repo.
+        assert!(get("core.hooksPath").is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn unmanaged_pre_receive_hook_and_path_are_preserved() {
-        let dir =
-            std::env::temp_dir().join(format!("caos-unmanaged-hook-test-{}", std::process::id()));
+    fn the_hook_is_this_binary_under_the_hooks_name() {
+        let dir = std::env::temp_dir().join(format!("caos-hooks-test-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
-        run_required_git(&["init", "-q", "--bare", dir.to_str().unwrap()]).unwrap();
-        let hooks = dir.join("hooks");
-        let hook = hooks.join("pre-receive");
-        let contents = b"#!/bin/sh\necho administrator hook\n";
-        std::fs::write(&hook, contents).unwrap();
-        run_required_git(&[
-            "-C",
-            dir.to_str().unwrap(),
-            "config",
-            "core.hooksPath",
-            hooks.to_str().unwrap(),
-        ])
-        .unwrap();
-
-        remove_managed_pre_receive_hook(dir.to_str().unwrap()).unwrap();
-
-        assert_eq!(std::fs::read(&hook).unwrap(), contents);
-        let configured = Command::new("git")
-            .args([
-                "-C",
-                dir.to_str().unwrap(),
-                "config",
-                "--get",
-                "core.hooksPath",
-            ])
-            .output()
-            .unwrap();
-        assert!(configured.status.success());
-        assert_eq!(
-            String::from_utf8(configured.stdout).unwrap().trim(),
-            hooks.to_str().unwrap()
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn stale_managed_hook_path_is_removed_when_the_hook_is_already_absent() {
-        let dir =
-            std::env::temp_dir().join(format!("caos-stale-hook-path-test-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        run_required_git(&["init", "-q", "--bare", dir.to_str().unwrap()]).unwrap();
-        let hooks = dir.join("hooks");
-        run_required_git(&[
-            "-C",
-            dir.to_str().unwrap(),
-            "config",
-            "core.hooksPath",
-            hooks.to_str().unwrap(),
-        ])
-        .unwrap();
-
-        remove_managed_pre_receive_hook(dir.to_str().unwrap()).unwrap();
-
-        let configured = Command::new("git")
-            .args([
-                "-C",
-                dir.to_str().unwrap(),
-                "config",
-                "--get",
-                "core.hooksPath",
-            ])
-            .output()
-            .unwrap();
-        assert_eq!(configured.status.code(), Some(1));
+        let hooks = crate::loose::install_hooks(&dir).unwrap();
+        // Twice: a restart replaces the link.
+        crate::loose::install_hooks(&dir).unwrap();
+        let target = std::fs::read_link(hooks.join("pre-receive")).unwrap();
+        assert_eq!(target, std::env::current_exe().unwrap());
+        let settings = git_settings(Some(&hooks));
+        assert!(settings
+            .iter()
+            .any(|(key, value)| *key == "core.hooksPath" && value == &hooks.display().to_string()));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
