@@ -22,6 +22,9 @@
 //!   on another stack, so a reader descends into it (`status`).
 //! * `POST /sub-run` — admit an exact detached child under an in-flight job's
 //!   existing server-side run stack and secret store.
+//! * `GET /ref?name=<ref>`, `POST /ref` — read a named mutable ref under
+//!   `refs/heads/`, or move one with a compare-and-swap (see [`mod refs`]).
+//!   `caos ref-then` waits on one, as a continuation.
 //! * `GET /eval?root:<type>=<value>[&path=<p>]` — walk `.caos-expr` from a root
 //!   down to a path and return what falls out as `"<type> <hash>"`. The root is
 //!   a TYPED argument, named by the caller as everything else in caos is:
