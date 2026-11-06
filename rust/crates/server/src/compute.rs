@@ -1676,8 +1676,9 @@ fn resolve_promise(
     } else if let Some(name) = &ref_name {
         // Wait, on THIS request thread, for the ref to leave the value the
         // worker saw. The worker has exited, so no runner slot is held while
-        // the writer it is waiting for runs. The value travels as the blob
-        // `ref-get` would print; a timeout is a failure `catch` can deliver.
+        // the writer it is waiting for runs. The new commit travels as
+        // `result`, a gitlink entry like any commit result; a deletion as a
+        // bare `absent` marker. A timeout is a failure `catch` can deliver.
         crate::refs::validate_name(name)?;
         let from =
             crate::refs::Value::parse(ref_expected.as_deref().unwrap_or(crate::refs::ABSENT))
