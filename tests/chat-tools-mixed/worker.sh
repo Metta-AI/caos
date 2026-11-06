@@ -35,9 +35,9 @@ feature=$(mint_commit /cas/feature "$feature_tree" feature "$base")
 fetch_code "$feature" "fetching the feature commit"
 git push -q caos "$feature:refs/caos/req/$feature" || fail "pushing feature closure"
 
-# THE MERGE IS A TOOL TOO, at the session root like the shell, and it picks
-# the source tree it advances by ARGUMENT (`source-tree`), not by where it sits:
-# `@scope` in its help. `theirs` is a commit hash, the one thing the tool cannot
+# THE MERGE IS A TOOL TOO, at the session root like the shell, and it takes
+# the source tree it advances as its `root` argument, not from where it sits:
+# `@root` in its help. `theirs` is a commit hash, the one thing the tool cannot
 # find for itself.
 MIXED_CALLS='[
  {"id":"tu_tool","input":{"file-path":"tools/sh/.caos-expr","content":"curry --base:hash='"$bash_tool_img"'\n"},"name":"write","type":"tool_use"},
