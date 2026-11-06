@@ -1302,7 +1302,11 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&hook).unwrap(), installed);
 
         // Without the server's name in its environment, the hook declines.
-        let declined = Command::new("sh").arg(&hook).env_remove(crate::loose::SERVER_EXE_ENV).output().unwrap();
+        let declined = Command::new("sh")
+            .arg(&hook)
+            .env_remove(crate::loose::SERVER_EXE_ENV)
+            .output()
+            .unwrap();
         assert!(!declined.status.success());
 
         // A hook that is not ours stops the server rather than being replaced.
