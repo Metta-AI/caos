@@ -449,187 +449,129 @@ fn verify_object_closure(git_dir: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn configure_ref_advertisements(git_dir: &str) -> Result<(), String> {
-    ensure_git_config_value(git_dir, "uploadpack.hideRefs", "refs/caos/req/")?;
-    // A locator's pin→tree memo (`mod locator`). It retains the fetched closure
-    // and survives a restart, but it is not a name anyone fetches BY, and a
-    // server that has resolved many pins would otherwise advertise one ref per
-    // pin to every client that dials it.
-    ensure_git_config_value(git_dir, "uploadpack.hideRefs", locator::TREE_REF_PREFIX)?;
-    ensure_git_config_value(git_dir, "uploadpack.hideRefs", "refs/caos/res/")?;
-    // Undo the setting written by the first exact-ref implementation. Server
-    // repositories survive binary upgrades, so merely ceasing to add it would
-    // leave existing installations unable to negotiate result objects.
-    remove_git_config_value(git_dir, "receive.hideRefs", "refs/caos/res/")
-}
-
-/// Add one multi-valued Git setting once, preserving administrator-supplied
-/// values and avoiding duplicate entries across server restarts.
-fn ensure_git_config_value(git_dir: &str, key: &str, value: &str) -> Result<(), String> {
-    let output = std::process::Command::new("git")
-        .args(["-C", git_dir, "config", "--get-all", key])
-        .output()
-        .map_err(|error| format!("reading git config {key}: {error}"))?;
-    match output.status.code() {
-        Some(0) => {
-            let values = String::from_utf8(output.stdout)
-                .map_err(|error| format!("git config {key} is not UTF-8: {error}"))?;
-            if values.lines().any(|configured| configured == value) {
-                return Ok(());
-            }
-        }
-        Some(1) => {}
-        _ => {
-            return Err(format!(
-                "reading git config {key}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-    }
-    run_required_git(&["-C", git_dir, "config", "--add", key, value])
-}
-
-/// Remove one formerly server-owned multi-valued Git setting without touching
-/// administrator-supplied values alongside it.
-fn remove_git_config_value(git_dir: &str, key: &str, value: &str) -> Result<(), String> {
-    let output = std::process::Command::new("git")
-        .args([
-            "-C",
-            git_dir,
-            "config",
-            "--fixed-value",
-            "--unset-all",
-            key,
-            value,
-        ])
-        .output()
-        .map_err(|error| format!("removing git config {key}: {error}"))?;
-    match output.status.code() {
-        Some(0) | Some(5) => Ok(()), // removed, or no exact value was present
-        _ => Err(format!(
-            "removing git config {key}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )),
-    }
-}
-
-const MANAGED_HOOK_MARKERS: [&str; 2] = [
-    "# managed by caos-server: append-only refs",
-    "# managed by caos-server: append-only session heads",
-];
-
-// TODO: Remove this one-time migration after every supported repository has
-// been started by a server version that no longer installs the hook.
-/// Remove the pre-receive hook installed by older CAOS servers.
-///
-/// The old hook execs this binary with a validator mode that no longer exists,
-/// so merely ceasing to install it would make every push to an upgraded
-/// repository fail. Its marker is the ownership proof: an unmarked hook and its
-/// configured path belong to the administrator and are left untouched.
-fn remove_managed_pre_receive_hook(git_dir: &str) -> Result<(), String> {
-    let hooks = std::path::Path::new(git_dir).join("hooks");
-    let hook = hooks.join("pre-receive");
-    let hooks_value = hooks
-        .to_str()
-        .ok_or_else(|| format!("hooks path is not UTF-8: {}", hooks.display()))?;
-    let contents = match std::fs::read(&hook) {
-        Ok(contents) => contents,
-        // A previous cleanup may have removed the hook without clearing the
-        // absolute path our installer wrote. That exact value is redundant
-        // with Git's default `<git-dir>/hooks`, so clearing it cannot disable a
-        // surviving hook in this directory.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return remove_git_config_value(git_dir, "core.hooksPath", hooks_value);
-        }
-        Err(error) => return Err(format!("reading {}: {error}", hook.display())),
-    };
-    let managed = MANAGED_HOOK_MARKERS.iter().any(|marker| {
-        contents
-            .windows(marker.len())
-            .any(|window| window == marker.as_bytes())
-    });
-    if !managed {
-        return Ok(());
-    }
-
-    std::fs::remove_file(&hook).map_err(|error| format!("removing {}: {error}", hook.display()))?;
-    // The installer always wrote this absolute value. Remove only that exact
-    // value; preserve relative or alternate administrator-selected hook paths.
-    remove_git_config_value(git_dir, "core.hooksPath", hooks_value)
-}
-
 /// `*.unpackLimit` meaning "always unpack": git keeps a transfer as a pack only
 /// when it carries at least this many objects, and this is the largest value it
 /// accepts.
 const UNPACK_ALWAYS: &str = "2147483647";
 
-/// Install the `pre-receive` hook that publishes a push's objects children
-/// first (`loose::publish_quarantine`). Without it git would migrate them in
-/// directory order, so a hook that is someone else's, or a `core.hooksPath`
-/// that sends git elsewhere, stops the server instead of being skipped.
-fn install_publish_hook(git_dir: &str) -> Result<(), String> {
-    use std::path::{Path, PathBuf};
-    let hooks = Path::new(git_dir).join("hooks");
-    let configured = std::process::Command::new("git")
-        .args(["-C", git_dir, "config", "--get", "core.hooksPath"])
-        .output()
-        .map_err(|error| format!("reading core.hooksPath: {error}"))?;
-    if configured.status.success() {
-        let value = String::from_utf8_lossy(&configured.stdout)
-            .trim()
-            .to_string();
-        let path = Path::new(&value);
-        let path: PathBuf = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            Path::new(git_dir).join(path)
-        };
-        let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => a == b,
-        };
-        if !same(&path, &hooks) {
-            return Err(format!(
-                "core.hooksPath is {value:?}: caos needs its own pre-receive hook in {} to \
-                 publish pushed objects in dependency order",
-                hooks.display()
-            ));
-        }
+/// The git settings this server runs with, as `(key, value)` pairs.
+///
+/// They reach git through this process's environment (`settings_env`, applied
+/// with `git_env` to every git this server runs against the store, and from
+/// `http-backend` to receive-pack, upload-pack and the hook), NEVER through the
+/// repository's config: several servers of different builds share one
+/// repository, and a setting written there would apply to all of them. Only a
+/// repository this process creates gets them written in (`initialize_repo`,
+/// with `hooks` = `None`). Environment settings outrank the repo's own.
+///
+/// `hooks` is this process's own hooks directory (`loose::install_hooks`).
+fn git_settings(hooks: Option<&std::path::Path>) -> Vec<(&'static str, String)> {
+    let mut settings = vec![
+        // The server's protocol requirements. A repo can arrive from anywhere
+        // (a test stack seeds one by `git init --bare` plus a fetch, and a
+        // plain `init` sets none of these), and a missing `http.receivepack`
+        // reads as every push coming back `403`, an auth problem in disguise.
+        ("http.receivepack", "true"),
+        ("uploadpack.allowAnySHA1InWant", "true"),
+        // Serve partial-clone (`--filter`) fetches: the std/merge worker
+        // fetches the commit GRAPH only (`--filter=tree:0`) and lazily faults
+        // in just the three trees `git merge-tree` needs.
+        ("uploadpack.allowFilter", "true"),
+        // Request refs are transient negotiation anchors, result refs a
+        // server-written durability index, and a locator's pin-to-tree memo
+        // one ref per pin. None belongs in fetch advertisements. All stay
+        // visible to receive-pack negotiation: a client can form its next
+        // request from a result object that exists only on the server, so
+        // hiding that result makes send-pack try (and fail) to read it.
+        ("uploadpack.hideRefs", "refs/caos/req/"),
+        ("uploadpack.hideRefs", locator::TREE_REF_PREFIX),
+        ("uploadpack.hideRefs", "refs/caos/res/"),
+        // Validate every incoming object in git's quarantine, including
+        // objects outside the updated refs.
+        ("receive.fsckObjects", "true"),
+        ("receive.shallowUpdate", "false"),
+        // The store is loose objects only and is never packed
+        // (design/loose-object-store.md, `mod loose`). Every transfer unpacks
+        // into loose objects, however small or large; a push lands in git's
+        // quarantine and the hook publishes it children first. Objects are
+        // written at zlib level 0: the filesystem compresses.
+        ("receive.unpackLimit", UNPACK_ALWAYS),
+        ("transfer.unpackLimit", UNPACK_ALWAYS),
+        ("fetch.unpackLimit", UNPACK_ALWAYS),
+        ("core.looseCompression", "0"),
+        // Never let git rewrite this repo's object store behind our back.
+        // receive-pack forks a background repack after a push; that rewrites
+        // the store while a concurrent upload-pack streams from it (a client
+        // sees `fetch-pack: invalid index-pack output`), and the gix handle
+        // this server holds asserts when packs move under it, which tiny_http
+        // turns into a body-less 500. THREE settings: `gc.auto 0` gates only
+        // the `gc` task, and git 2.54's `geometric-repack` maintenance task
+        // ignores every gc knob. A cruft repack is data loss, not just a
+        // crash: nearly every object here is unreachable from a ref, so it
+        // would drop whatever has not been touched in two weeks while redis
+        // keeps handing out hashes that point at it.
+        ("gc.auto", "0"),
+        ("receive.autogc", "false"),
+        ("maintenance.geometric-repack.enabled", "false"),
+        // Survive an unclean shutdown. git's default publishes a loose object
+        // or a ref by renaming a temp file into place without fsyncing, so a
+        // crash can leave the right name holding zero bytes, a POISONED object
+        // (see [`mod repair`]). `batch` flushes once per batch of writes.
+        ("core.fsync", "objects,reference"),
+        ("core.fsyncMethod", "batch"),
+        // Keep previous ref values as the recovery path `repair` restores
+        // damaged refs from. Nothing expires them yet: until a retention
+        // policy exists, keep the history rather than invent a window.
+        ("core.logAllRefUpdates", "always"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key, value.to_string()))
+    .collect::<Vec<_>>();
+    if let Some(hooks) = hooks {
+        settings.push(("core.hooksPath", hooks.display().to_string()));
     }
-    std::fs::create_dir_all(&hooks)
-        .map_err(|error| format!("creating {}: {error}", hooks.display()))?;
-    let hook = hooks.join("pre-receive");
-    let script = loose::hook_script();
-    match std::fs::read(&hook) {
-        Ok(existing) if existing == script.as_bytes() => return Ok(()),
-        Ok(existing)
-            if !existing
-                .windows(loose::HOOK_MARKER.len())
-                .any(|window| window == loose::HOOK_MARKER.as_bytes()) =>
-        {
-            return Err(format!(
-                "{} is not caos's: caos needs its own pre-receive hook to publish pushed \
-                 objects in dependency order; move this one aside",
-                hook.display()
-            ));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("reading {}: {error}", hook.display())),
+    settings
+}
+
+/// `settings` as git's environment configuration (`GIT_CONFIG_COUNT` and its
+/// numbered keys and values).
+fn settings_env(settings: &[(&str, String)]) -> Vec<(String, String)> {
+    let mut env = vec![("GIT_CONFIG_COUNT".to_string(), settings.len().to_string())];
+    for (index, (key, value)) in settings.iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{index}"), key.to_string()));
+        env.push((format!("GIT_CONFIG_VALUE_{index}"), value.clone()));
     }
-    // Written aside and renamed, so a push never runs half a hook. Several
-    // servers may share the repo; they all write the same script.
-    let temp = hooks.join(format!("pre-receive.caos-{}", std::process::id()));
-    let written = (|| {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(&temp, &script)?;
-        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o755))?;
-        std::fs::rename(&temp, &hook)
-    })();
-    written.map_err(|error| {
-        let _ = std::fs::remove_file(&temp);
-        format!("installing {}: {error}", hook.display())
-    })
+    env
+}
+
+/// This server's git settings, set once at startup (`main`).
+static GIT_ENV: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+
+/// The environment that carries this server's git settings: apply it
+/// (`Command::envs`) to every git command run against the store.
+pub(crate) fn git_env() -> impl Iterator<Item = (&'static str, &'static str)> {
+    GIT_ENV
+        .get()
+        .into_iter()
+        .flatten()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+}
+
+/// Create the store's repository, with the settings written into its config:
+/// this process is its only user so far, and the written settings also protect
+/// a person who later runs git in it by hand. The config is then left
+/// read-only as a marker that nothing should change it; git rewrites a config
+/// by lock and rename whatever its mode, so the guarantee is that this server
+/// never writes it again.
+fn initialize_repo(git_dir: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    run_required_git(&["init", "-q", "--bare", git_dir])?;
+    for (key, value) in git_settings(None) {
+        run_required_git(&["-C", git_dir, "config", "--add", key, &value])?;
+    }
+    let config = std::path::Path::new(git_dir).join("config");
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o444))
+        .map_err(|error| format!("making {} read-only: {error}", config.display()))
 }
 
 fn env_or(key: &str, default: &str) -> String {
