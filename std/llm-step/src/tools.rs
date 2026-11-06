@@ -423,55 +423,10 @@ pub struct Help {
     /// placeholder.
     pub doc: String,
     pub args: Vec<TreeArg>,
-    /// `@git`: bind the input as a COMMIT (`wc`) and the turn's ref snapshot
-    /// (`refs`), as extra args alongside whatever else the tool asked for.
-    ///
-    /// For a tool that must walk HISTORY rather than read content. `in` is a
-    /// tree, and a tree has no history: it cannot say what its parent was, what
-    /// changed in the last commit, or what `main` points at. A commit answers
-    /// the first two and the ref snapshot the third.
-    ///
-    /// Off by default because `wc` changes on EVERY accepted edit — each
-    /// mutation mints a child commit — while the tree can be byte-identical
-    /// across them. Binding it into a build or test tool would turn every call
-    /// into a cache miss for a commit it never reads. Same argument as
-    /// [`Help::wants_in`], one level up.
-    ///
-    /// IT APPLIES ONLY TO A DISPATCHED READER, and both halves of that are
-    /// load-bearing:
-    /// - DISPATCHED: an in-process built-in gets the session's store
-    ///   directly and ignores this. `log`/`show`/`diff` declared it for exactly
-    ///   that reason and it did nothing for them.
-    /// - READER: a WRITER's input commit is not a caller's to choose. Its
-    ///   proposal must descend from the commit whose pointer is being advanced
-    ///   (`writer_callback`'s ancestry check, and `reconcile`'s own `before`),
-    ///   so it is pinned to the scope. `merge` — the one tool that really needs
-    ///   the input commit — takes it as `ours`, bound by the launch, and its
-    ///   help says why: a model naming it "would be naming the session it
-    ///   is already in".
-    ///
-    /// NO TOOL USES IT TODAY. `merge` predates it and binds `wc` itself under a
-    /// name of its own, which is why the generic form found no users.
-    pub git: bool,
     /// `@writer`: this tool PROPOSES A CHANGE to the tree it is run on, rather
     /// than returning a value. Absent means read-only, which is the default
     /// precisely because it is the safe answer for a tool that forgot to say.
     pub writer: bool,
-    /// `@in`: bind the tree this tool was run on as `in`.
-    ///
-    /// Absent means DO NOT BIND IT, and that is the point: the tree is the
-    /// biggest thing that can land in an ArgTree, and the ArgTree is the cache
-    /// key. `caos-test-result`, whose entire input is a hash, carried the whole
-    /// source tree and so re-keyed on every edit to it — asking twice for the
-    /// same test record could not hit. `grep` has always done this right by
-    /// binding only the scope it searches, which is why a scoped grep is cheap.
-    pub wants_in: bool,
-    /// `@call`: bind this tool call's id as `call`, for a tool whose result
-    /// must not be reused by a later call with the same arguments, such as one
-    /// that talks to an outside service. Results are kept by their arguments,
-    /// and the call id is unique to the call yet the same when a call is
-    /// recovered, so a retry gets the stored result and a new call does not.
-    pub call: bool,
     /// `@request-id`: the tool reads or changes something outside caos, so a
     /// result must never be reused by a later call that merely has the same
     /// arguments. It gets an optional `request-id` parameter, which the harness
@@ -490,20 +445,6 @@ pub struct Help {
     /// Replaces `@in`, `@git` and `@scope`, which a `@root` tool may not also
     /// declare.
     pub root: bool,
-    /// `@scope <param>`: the tool runs over, and a writer changes, the SOURCE
-    /// TREE the argument `<param>` names (the path of a code reference in the
-    /// session, such as `feature/01-change`).
-    ///
-    /// Everything else gets its scope from WHERE THE TOOL SITS: a tool reached
-    /// at `feature/01-change/caos-tools/test` runs over `feature/01-change`, and
-    /// one at `caos-std/…` over the session. That is wrong for a tool that
-    /// is a SHARED one and acts on a tree the caller picks: `merge` is reached at
-    /// `caos-std/merge` and must advance `feature/01-change`. The tag says which
-    /// parameter names the tree; with it the tool gets that tree's commit as
-    /// `wc` (it implies `@git`), a writer's proposal advances THAT source tree,
-    /// and `in` defaults to its code. The parameter must be declared with
-    /// `@param`: a tag that names none is reported, not obeyed.
-    pub scope: Option<String>,
     /// `@op <name>`: the tool is an OPERATION OF THE STEP, not a worker. The entry
     /// that declares it exists to give the operation a path, a help and a place in
     /// `tool_help`/`run_tool`; running it is the step doing the work in process,
