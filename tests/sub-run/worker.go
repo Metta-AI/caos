@@ -243,16 +243,15 @@ func test() {
 		b := arg("detached")
 		if has("error") {
 			why := arg("error")
-			alive := w.Caos("ref-get", ref(nonce, "alive"))
+			alive := w.RefGet(ref(nonce, "alive"), "/cas/alive")
 			cleanup(nonce)
-			w.True(alive != absent, "the detached request %s never ran: it never set %s (%s)",
+			w.True(alive, "the detached request %s never ran: it never set %s (%s)",
 				b, ref(nonce, "alive"), why)
 			w.True(false, "the detached request %s ran but never answered on %s (%s)",
 				b, ref(nonce, "done"), why)
 		}
-		done := arg("result")
-		cleanup(nonce)
-		w.True(done != absent, "ref-then on %s delivered %q", ref(nonce, "done"), done)
+		defer cleanup(nonce)
+		done := delivered(ref(nonce, "done"))
 		fmt.Fprintf(os.Stderr, "  ok: %s saw go only after its caller exited, and answered (%s)\n", b, done)
 		w.Report("sub-run: ALL PASS\n")
 
