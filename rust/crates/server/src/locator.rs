@@ -32,8 +32,8 @@
 //! **Only the TREE closure is published.** A `--depth=1` fetch has a shallow
 //! boundary and an incomplete commit, and the server's startup check refuses a
 //! store containing either (`verify_object_closure`). So the staging repo
-//! keeps the commit and the `shallow` file, and what is packed into the live
-//! object database is the tree and everything under it — complete by
+//! keeps the commit and the `shallow` file, and what is published into the live
+//! object database, as loose objects, is the tree and everything under it — complete by
 //! construction, and byte-identical to what a `:@=` of the same content would
 //! have produced. Nothing anchors the commit, which is correct: a locator wants
 //! a snapshot, not a history.
