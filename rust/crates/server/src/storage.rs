@@ -47,19 +47,20 @@ pub(crate) fn post_object(config: &Config, body: &[u8]) -> Result<Vec<u8>, HttpE
     let repo = config.repo.to_thread_local();
     let (kind, content) = parse_posted_object(body)?;
     let id = match kind {
-        gix::object::Kind::Blob => repo
-            .write_blob(content)
-            .map_err(|err| HttpError::new(500, format!("failed to write blob: {err}")))?
-            .detach(),
+        gix::object::Kind::Blob => write(config, kind, content)
+            .map_err(|err| HttpError::new(500, format!("failed to write blob: {err}")))?,
         gix::object::Kind::Tree => {
             // Validate the canonical tree encoding before writing it as a real
             // tree object (so its hash is a genuine git tree hash).
             let tree = gix::objs::TreeRef::from_bytes(content, repo.object_hash())
                 .map_err(|err| HttpError::new(400, format!("invalid tree: {err}")))?;
             validate_tree_dependencies(&repo, &tree)?;
-            repo.write_object(&tree)
+            use gix::objs::WriteTo;
+            let mut encoded = Vec::with_capacity(content.len());
+            tree.write_to(&mut encoded)
+                .map_err(|err| HttpError::new(500, format!("failed to encode tree: {err}")))?;
+            write(config, kind, &encoded)
                 .map_err(|err| HttpError::new(500, format!("failed to write tree: {err}")))?
-                .detach()
         }
         gix::object::Kind::Commit => {
             // Validate the commit encoding, then store the *raw* bytes (rather
@@ -68,7 +69,7 @@ pub(crate) fn post_object(config: &Config, body: &[u8]) -> Result<Vec<u8>, HttpE
             gix::objs::CommitRef::from_bytes(content, repo.object_hash())
                 .map_err(|err| HttpError::new(400, format!("invalid commit: {err}")))?;
             validate_commit_with_git(config, content)?;
-            gix::objs::Write::write_buf(&repo.objects, gix::object::Kind::Commit, content)
+            write(config, kind, content)
                 .map_err(|err| HttpError::new(500, format!("failed to write commit: {err}")))?
         }
         other => {
@@ -78,7 +79,17 @@ pub(crate) fn post_object(config: &Config, body: &[u8]) -> Result<Vec<u8>, HttpE
             ))
         }
     };
-    Ok(format!("{}\n", sync_loose_object(config, id)).into_bytes())
+    Ok(format!("{id}\n").into_bytes())
+}
+
+/// Store one object, durably, as a level-0 loose object (see [`crate::loose`]).
+/// Its references are the caller's to have checked.
+fn write(
+    config: &Config,
+    kind: gix::object::Kind,
+    data: &[u8],
+) -> std::io::Result<gix::ObjectId> {
+    crate::loose::write_durable(&std::path::Path::new(&config.git_dir).join("objects"), kind, data)
 }
 
 /// Validate only posted commit objects with Git, before publishing their bytes.
