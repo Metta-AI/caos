@@ -229,12 +229,10 @@ The ingress paths:
 | `POST /object`, `store_git_blob`, `store_git_tree` | gix loose write + `sync_loose_object` | one object at a time, closure-checked as before, through the server's own level-0 writer (`loose::write_durable`): temporary file, fsync, rename, fsync the fan-out directory. gix's writer has no compression setting and never fsyncs, which is what `sync_loose_object` patched after the fact; the new writer cannot leave a zero-length object behind. |
 | seed (`stack/serve` copies `CAOS_STACK_SEED_GIT`) | copies packs | unchanged: a seeded test store may keep its packs, which readers handle; the server warns at start whenever `objects/pack` holds anything |
 
-The hook reintroduces a managed `pre-receive` hook, which the server removed
-before for a different reason (an obsolete validator mode). Alternatives, if
-the hook is unwanted: the server's `git.rs` already fronts every
-`/git-receive-pack` request and parses its commands, so it could run
-receive-pack against a staging repo and apply the ref updates itself. The hook
-is less code.
+The server also drops its one-time cleanup of an older managed hook in the
+repository (`remove_managed_pre_receive_hook`): it too modified the shared
+repository, and with `core.hooksPath` in the environment no hook in the
+repository runs for this server's pushes.
 
 ### 4.2 Durability cost
 
