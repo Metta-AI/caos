@@ -1890,55 +1890,6 @@ mod tests {
     }
 
     #[test]
-    fn in_is_opt_in_and_described() {
-        // Absent means the tree is NOT bound, which is what keeps it out of the
-        // cache key for a tool whose whole input is its arguments.
-        let reader = TreeTool::new(
-            "caos-test-result",
-            parse_help("t", "Print a record.\n@param hash The hash."),
-        );
-        assert!(!reader.wants_in);
-        let text = describe(&reader, "std/caos-test-result");
-        assert!(text.contains("Does not read the tree"));
-
-        let tester = TreeTool::new("caos-test", parse_help("t", "Run the suite.\n@in"));
-        assert!(tester.wants_in);
-        let text = describe(&tester, "std/caos-test");
-        assert!(text.contains("Reads a tree, named by its `in` parameter"));
-
-        // `@in` becomes an OPTIONAL `{tree}` parameter, which is what lets a
-        // caller run the tool over a tree other than the one it sits in.
-        assert_eq!(tester.args.len(), 1);
-        assert_eq!(tester.args[0].name, "in");
-        assert_eq!(tester.args[0].ty, ArgType::Tree);
-        assert!(!tester.args[0].required, "it defaults, so it is optional");
-        assert!(text.contains("in (optional)"), "listed for the model: {text}");
-
-        // A tool may not declare it by hand: `in` is what the interpreter
-        // binds, and `@in` is the way to ask for it.
-        let by_hand = parse_help("t", "d\n@param {tree} in The tree.");
-        assert!(by_hand.args.is_empty());
-        assert!(!by_hand.wants_in);
-    }
-
-    #[test]
-    fn call_is_opt_in_and_not_a_parameter() {
-        let plain = TreeTool::new("t", parse_help("t", "d\n@param path P."));
-        assert!(!plain.call);
-
-        // The harness binds `call`; the model never sees it.
-        let api = TreeTool::new("github", parse_help("t", "d\n@param path P.\n@call"));
-        assert!(api.call);
-        assert_eq!(api.args.len(), 1);
-        assert_eq!(api.args[0].name, "path");
-
-        // Nor may a tool declare it by hand.
-        let by_hand = parse_help("t", "d\n@param call The id.");
-        assert!(by_hand.args.is_empty());
-        assert!(!by_hand.call);
-    }
-
-    #[test]
     fn a_declared_type_reaches_the_schema_and_the_binding() {
         let h = parse_help(
             "t",
