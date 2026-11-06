@@ -569,7 +569,11 @@ mod tests {
         for content in [&b""[..], b"hello\n", &large] {
             let id = write_durable(&objects, Kind::Blob, content).unwrap();
             let shown = git(&dir, &["cat-file", "blob", &id.to_string()]);
-            assert!(shown.status.success(), "{}", String::from_utf8_lossy(&shown.stderr));
+            assert!(
+                shown.status.success(),
+                "{}",
+                String::from_utf8_lossy(&shown.stderr)
+            );
             assert_eq!(shown.stdout, content);
             let (_, path) = object_path(&objects, &id);
             let size = fs::metadata(&path).unwrap().len() as usize;
