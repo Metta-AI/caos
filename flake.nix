@@ -1716,7 +1716,7 @@ sandbox = false''
             src = ./.;
             modRoot = "prod/watchdog";
             meta.mainProgram = "caos-watchdog";
-            vendorHash = "sha256-s2FzA1yZouJkP5K3ANG+5++YzB5zLM2jfGRLCzl6rts=";
+            vendorHash = "sha256-hpilWVREkwmhu9LczVyfYMPZuaZRtm1iNJk62n+aRO4=";
           };
 
           # `nix build` (no attr) yields the PINNED host tools: caos-cli,
