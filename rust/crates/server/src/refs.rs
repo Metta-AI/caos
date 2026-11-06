@@ -368,10 +368,8 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let dir = std::env::temp_dir().join(format!(
-                "caos-refs-{tag}-{}-{nanos}",
-                std::process::id()
-            ));
+            let dir = std::env::temp_dir()
+                .join(format!("caos-refs-{tag}-{}-{nanos}", std::process::id()));
             let status = Command::new("git")
                 .args(["init", "-q", "--bare"])
                 .arg(&dir)
