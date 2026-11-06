@@ -241,11 +241,7 @@ func main() {
 		m2b := "Test the feature, reworded (" + salt + ")\n\nA republish: only this message changed."
 		squash := use("tu_squash", "run_tool", map[string]any{"path": "tools/squash", "arguments": map[string]any{"root": ".", "plan": "mystack.plan"}})
 		squash2 := use("tu_squash2", "run_tool", map[string]any{"path": "tools/squash", "arguments": map[string]any{"root": ".", "plan": "mystack.plan"}})
-		publish := func(id, source string) map[string]any {
-			return use(id, "publish_source", map[string]any{"source_tree": source,
-				"repository": "https://caos-squash-publish.invalid/repo.git", "branch": "feature", "force": true})
-		}
-		// The same publication reached BY PATH: std/publish-source is an ordinary
+		// The publication, reached BY PATH: std/publish-source is an ordinary
 		// worker (design/tool-contract.md), run with run_tool like any tool, with
 		// the source tree as `root`. Without force it reads the branch first, which
 		// is where a `.invalid` host stops it.
@@ -266,8 +262,7 @@ func main() {
 		// The republish: reword one message and squash again over the
 		// publish/mystack the first call wrote.
 		respond(4, write("tu_plan2", "mystack.plan", plan(m1, m2b)), squash2)
-		respond(5, publish("tu_pub", "publish/mystack/01-feature"), publish("tu_dir", "publish/mystack"),
-			publishByPath("tu_pub2", "publish/mystack/01-feature"), publishByPath("tu_dir2", "publish/mystack"))
+		respond(5, publishByPath("tu_pub2", "publish/mystack/01-feature"), publishByPath("tu_dir2", "publish/mystack"))
 		respond(6, map[string]any{"type": "text", "text": "published"})
 
 		w.Step("the turn")
@@ -314,17 +309,8 @@ func main() {
 		w.True(body == m2b, "C2's message is not the plan's, verbatim: [%s]", body)
 		note("ok: publish/mystack = {01-feature: %s, 02-tests: %s}, each a layer tree on the one below", c1, c2b)
 
-		child, dir := seen(6, "tu_pub"), seen(6, "tu_dir")
-		note("publish_source publish/mystack/01-feature: %s", child)
-		note("publish_source publish/mystack:            %s", dir)
-		w.True(strings.Contains(dir, "requires an existing source gitlink"), "the control call on a plain folder was not refused as one: %s", dir)
-		// read_branch's error: the call found the source gitlink and went on to
-		// read the remote.
-		w.True(strings.Contains(child, "remote branch lookup failed"), "publish_source on the squashed layer failed somewhere unexpected: %s", child)
-		note("ok: publish_source took the squashed layer and stopped only at the remote")
-
-		// By path, the operation answers the same way: it found the source gitlink and
-		// went on to read the remote, and it refuses a plain folder as before.
+		// The publication found the source gitlink and went on to read the remote,
+		// and it refuses a plain folder.
 		childByPath, dirByPath := seen(6, "tu_pub2"), seen(6, "tu_dir2")
 		note("publish-source by path, publish/mystack/01-feature: %s", childByPath)
 		w.True(strings.Contains(dirByPath, "not a source tree"), "the control call by path on a plain folder was not refused as one: %s", dirByPath)
