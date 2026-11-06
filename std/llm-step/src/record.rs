@@ -229,6 +229,16 @@ fn content_commit(store: &GitStore, locator: &str) -> Result<Oid, String> {
     Ok(commit)
 }
 
+/// The mounted GitHub token, offered only to a github.com URL: it is a GitHub
+/// credential, not one for every HTTPS repository a locator can name.
+fn github_token_file(url: &str) -> Option<&'static str> {
+    const TOKEN: &str = "/secret/github-token";
+    let github = git_locator::import::remote(url).is_ok_and(|(host, _)| {
+        host.eq_ignore_ascii_case("github.com") || host.eq_ignore_ascii_case("github.com:443")
+    });
+    (github && std::path::Path::new(TOKEN).exists()).then_some(TOKEN)
+}
+
 /// The tree a session's content was seeded from: its root's tree, found by
 /// following first parents from `head`, without the session's own .caos/.
 fn seed_tree(store: &mut GitStore, head: &Oid) -> Result<Oid, String> {
