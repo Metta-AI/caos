@@ -19,8 +19,7 @@ caos ref-set <ref> (--new=<hash> | --new:@=<cas-path> | --delete)
   `commit` exactly as `put-commit` records one, and exits 0. From there it is
   an ordinary CAS value: `caos hash` gives its id, and `--name:@=` passes it
   on. **A missing ref exits 2 and writes nothing**; a real failure exits 1, so
-  absent and broken stay apart (AGENTS.md). Go workers use `w.RefGet`, which
-  answers false for 2. It never waits.
+  absent and broken stay apart (AGENTS.md). It never waits.
 - `ref-set` moves the ref to a commit, or deletes it with `--delete`. **A
   commit is given either way**: as a hash with `=`, or as the CAS path it is
   recorded at with `:@=`, the spellings `run` and `curry` use. So the commit
