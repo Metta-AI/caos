@@ -534,8 +534,8 @@ mod tests {
                 set(&path, REF, &a, &Expected::Is(Value::Absent)).unwrap();
             })
         };
-        let seen = wait_for_change(repo.path(), REF, &Value::Absent, Duration::from_secs(30))
-            .unwrap();
+        let seen =
+            wait_for_change(repo.path(), REF, &Value::Absent, Duration::from_secs(30)).unwrap();
         writer.join().unwrap();
         assert_eq!(seen, a);
         // Woken by the write, not by the once-a-second recheck.
