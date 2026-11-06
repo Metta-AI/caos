@@ -4156,6 +4156,12 @@ fn record_continuation(
                 oid,
             }
         }
+        // `ref` is the NAME of the ref to wait on: a string, not an object.
+        ContinuationSubject::Ref(name) => Entry {
+            mode: EntryKind::Blob.into(),
+            filename: b"ref".to_vec().into(),
+            oid: post_object(t, "blob", name.as_bytes())?,
+        },
     };
     let mut entries = vec![subject];
 
