@@ -505,7 +505,9 @@ pub(crate) fn publish_quarantine() -> i32 {
     }
 }
 
-fn publish_quarantined(quarantine: &Path, objects: &Path) -> io::Result<usize> {
+/// Publish the loose objects in `quarantine` into `objects`, reading them
+/// through `read` (a `git cat-file --batch` that sees the quarantine).
+fn publish_quarantined(quarantine: &Path, objects: &Path, read: Command) -> io::Result<usize> {
     let packs = quarantine.join("pack");
     if let Ok(entries) = fs::read_dir(&packs) {
         for entry in entries.filter_map(Result::ok) {
