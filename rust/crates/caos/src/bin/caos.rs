@@ -13,7 +13,7 @@
 //! CLI surface plus the privileged runner.
 //!
 //! Subcommands: `get-hash`, `get`, `put`, `put-commit`, `hash`, `forward`, `map-then`,
-//! `run-then`, `run-request-then`, `sub-run`, `ref-get`, `ref-set`,
+//! `run-then`, `run-request-then`, `sub-run`, `ref-get`, `ref-set`, `ref-then`,
 //! `prepare-request`, `curry`, `next` and `runner`. (Image import and ref resolution are user-facing only — see
 //! `caos-cli`.)
 
