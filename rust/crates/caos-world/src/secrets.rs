@@ -235,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_what_it_cannot_honour() {
+    fn refuses_what_it_cannot_honor() {
         assert!(parse_spec("f", "reader:@=a/b\n").is_err());
         assert!(parse_spec("f", "reader:@@=git+https://x/y since=main\n").is_err());
         assert!(parse_spec("f", "reader:@@=git+https://x/y until=x\n").is_err());

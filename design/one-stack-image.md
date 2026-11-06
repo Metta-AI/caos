@@ -3,7 +3,7 @@
 **Status:** PROPOSED. Supersedes the compose half of the host deploy and the
 hand-written bring-up in `devbox/worker`. Depends on the image/worker
 contract in `flake-images.md`; `test-stack-image.md` is the direct ancestor —
-this note generalises its "the stack is an image" claim from the test path to
+this note generalizes its "the stack is an image" claim from the test path to
 *every* path.
 
 ## Problem
@@ -348,7 +348,7 @@ tags. What is unresolved is whether the delta emit belongs in
 ## Sequence
 
 1. **`caosd serve`** — extract `devbox/worker`'s daemon section into it;
-   `devbox/worker` calls it. No behaviour change, and the suite proves it.
+   `devbox/worker` calls it. No behavior change, and the suite proves it.
 2. **skopeo conversion** — `build-builtins.sh`'s streamed path off `docker
    build`. Verifiable through the existing `caosd up` path alone.
 3. **`caosd up` runs the image** — compose and both daemon images delete;

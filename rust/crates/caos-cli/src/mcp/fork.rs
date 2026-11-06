@@ -10,7 +10,7 @@
 //!                                    history is <hash>'s, then diverges
 //! ```
 //!
-//! It is recognised by the `UserPromptSubmit` hook on a session's first prompt,
+//! It is recognized by the `UserPromptSubmit` hook on a session's first prompt,
 //! so the session exists -- and holds the earlier history and workspace --
 //! before the model takes its first turn. What the MODEL sees of that history is
 //! the slash command's own text (see `cloud/install.go`); this file is the record
@@ -84,7 +84,7 @@ mod tests {
     const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
 
     #[test]
-    fn the_slash_form_is_recognised_on_the_first_line() {
+    fn the_slash_form_is_recognized_on_the_first_line() {
         let want = Some(commit(Some(HASH)).unwrap());
         assert_eq!(
             parse_command(&format!("  /{FORK_COMMAND}   {HASH}\nmore text")).unwrap(),
@@ -93,7 +93,7 @@ mod tests {
     }
 
     #[test]
-    fn the_expanded_marker_is_recognised_anywhere() {
+    fn the_expanded_marker_is_recognized_anywhere() {
         let prompt = format!("Some preamble.\n{MARKER} fork {HASH}\nmore.");
         assert_eq!(
             parse_command(&prompt).unwrap(),

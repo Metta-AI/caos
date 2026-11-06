@@ -1213,7 +1213,7 @@ func workerArg(name string) (string, error) {
 }
 
 // workerVerbs maps `verb` to the flags `run` already dispatches on. The worker
-// surface is deliberately the same surface, so there is one set of behaviours
+// surface is deliberately the same surface, so there is one set of behaviors
 // to reason about and one set to document.
 var workerVerbs = map[string]string{
 	"start": "", "send": "", "probe": "--probe", "list": "--list", "info": "--info", "conv": "--conv",

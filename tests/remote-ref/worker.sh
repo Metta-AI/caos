@@ -23,7 +23,7 @@
 # for its stub LLM, reachable from the stack because a job's containers sit in
 # the stack's netns. This used to be a `git+file://` URL, which no longer proves
 # anything: the server is a different container, so a path here is not a path
-# there, and that asymmetry IS the behaviour under test. The one thing a real
+# there, and that asymmetry IS the behavior under test. The one thing a real
 # host adds is `uploadpack.allowReachableSHA1InWant` — GitHub sets it, which is
 # exactly why a locator pins a COMMIT and selects within it with `dir=` rather
 # than naming a subtree hash — so the fixtures set it too.

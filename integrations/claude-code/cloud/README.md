@@ -198,7 +198,7 @@ Egress here is a TLS-intercepting proxy, so the relay presents the proxy's
 certificate, which chains to a CA only the system knows about — a build using
 iroh's compiled-in Mozilla roots reaches NO relay while curl and git on the same
 host are fine. `caos_iroh::endpoint_builder` asks for the system store and
-honours `HTTPS_PROXY`, and the release checks the built helper for the markers
+honors `HTTPS_PROXY`, and the release checks the built helper for the markers
 that prove it.
 
 ## Dev mode: the whole install package from your own caosd
@@ -292,7 +292,7 @@ Measured end to end, a fresh session on a correctly-ticketed environment:
 - **hooks fire** — `SessionStart` reports which caos this is;
   `UserPromptSubmit`/`Stop`/`PreToolUse` record the session.
 - **the MCP tool server is picked up** — the declaration in `/root/.claude.json`
-  is honoured, `caos mcp serve` is spawned, and the model can call it.
+  is honored, `caos mcp serve` is spawned, and the model can call it.
 - **the five fixed tools answer** — `help`, `run`, `start`, `result` and
   `eval-path` (`../../rust/crates/caos-cli/MCP.md`); `caos-std/read` runs by path.
 

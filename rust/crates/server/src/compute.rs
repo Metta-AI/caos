@@ -836,7 +836,7 @@ fn run_dispatch_inner(
 /// Admit an exact detached child request while the parent job is still in
 /// flight. Ownership crosses the thread boundary here: the server clones the
 /// current unhashed context, while the worker sends only the child hash and its
-/// job-scoped nonce. Validation happens before acknowledgement so a missing or
+/// job-scoped nonce. Validation happens before acknowledgment so a missing or
 /// malformed request is not reported as queued.
 fn start_sub_run(
     config: &Config,
