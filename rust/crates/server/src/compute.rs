@@ -1697,14 +1697,18 @@ fn resolve_promise(
                 }
             },
         };
-        let waited =
-            crate::refs::wait_for_change(&config.git_dir, name, &from, Duration::from_secs(seconds))
-                .map_err(|e| HttpError::new(500, e))
-                .and_then(|value| {
-                    store_git_blob(config, format!("{}\n", value.text()).as_bytes())
-                        .map(|oid| format!("blob {oid}"))
-                        .map_err(|e| HttpError::new(500, format!("storing ref value blob: {e}")))
-                });
+        let waited = crate::refs::wait_for_change(
+            &config.git_dir,
+            name,
+            &from,
+            Duration::from_secs(seconds),
+        )
+        .map_err(|e| HttpError::new(500, e))
+        .and_then(|value| {
+            store_git_blob(config, format!("{}\n", value.text()).as_bytes())
+                .map(|oid| format!("blob {oid}"))
+                .map_err(|e| HttpError::new(500, format!("storing ref value blob: {e}")))
+        });
         Some(continuation_result(config, cont, waited, catch)?)
     } else {
         None
