@@ -1285,10 +1285,8 @@ mod tests {
 
     #[test]
     fn publish_hook_is_installed_and_refuses_a_foreign_one() {
-        let dir = std::env::temp_dir().join(format!(
-            "caos-publish-hook-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("caos-publish-hook-test-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         run_required_git(&["init", "-q", "--bare", dir.to_str().unwrap()]).unwrap();
         let git_dir = dir.to_str().unwrap();
