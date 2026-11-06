@@ -898,6 +898,10 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
             request.as_reader().read_to_end(&mut body)?;
             compute::submit(config, &body, &secrets, token.as_deref())
         }
+        // Named mutable refs under refs/heads/ (`caos ref-get` / `ref-set`):
+        // read one here, move one with a compare-and-swap below. See
+        // [`mod refs`]. Ahead of the catch-all GET, which serves /object/.
+        Method::Get if path == "/ref" => refs::get_endpoint(config, &query),
         Method::Get => match path.strip_prefix("/object/") {
             Some(hash) if !hash.is_empty() => storage::get_object(config, hash),
             _ => Err(HttpError::new(404, "not found")),
