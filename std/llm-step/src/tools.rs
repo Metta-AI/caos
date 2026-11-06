@@ -223,13 +223,9 @@ impl TreeTool {
             name: name.to_string(),
             doc: help.doc,
             args,
-            git: help.git,
             writer: help.writer,
-            wants_in: help.wants_in,
-            call: help.call,
             request_id: help.request_id,
             root: help.root,
-            scope: help.scope,
             op: help.op,
         }
     }
