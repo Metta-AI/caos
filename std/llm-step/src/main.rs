@@ -1828,9 +1828,6 @@ fn launch_root_tool(
         caos(["get-hash", oid.as_str(), &materialized])?;
         args.push((tools::ROOT, Arg::Path(&materialized)));
     }
-    if tool.call {
-        args.push(("call", Arg::Lit(id)));
-    }
     if tool.request_id && !args.iter().any(|(name, _)| *name == tools::REQUEST_ID) {
         args.push((tools::REQUEST_ID, Arg::Lit(id)));
     }
