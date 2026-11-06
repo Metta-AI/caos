@@ -3929,7 +3929,9 @@ fn ref_flag(verb: &str, flag: &str, absent: bool, arg: &str) -> Option<Result<St
         return Some(Err(e));
     }
     if value == REF_ABSENT && !absent {
-        return Some(Err(format!("`{verb}` --{flag} takes a commit, not {REF_ABSENT:?}")));
+        return Some(Err(format!(
+            "`{verb}` --{flag} takes a commit, not {REF_ABSENT:?}"
+        )));
     }
     Some(Ok(value.to_string()))
 }
