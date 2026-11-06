@@ -262,13 +262,7 @@ fn parse_posted_object(body: &[u8]) -> Result<(gix::object::Kind, &[u8]), HttpEr
 /// shape matches what a client would POST, so the hashes — and therefore the
 /// cache keys — are identical no matter who builds the request.
 pub(crate) fn store_git_blob(config: &Config, content: &[u8]) -> Result<gix::ObjectId, String> {
-    let repo = config.repo.to_thread_local();
-    let id = match repo.write_blob(content) {
-        Ok(id) => id.detach(),
-        Err(e) => stored_despite(&repo, gix::objs::Kind::Blob, content)
-            .ok_or_else(|| format!("writing blob: {e}"))?,
-    };
-    Ok(sync_loose_object(config, id))
+    write(config, gix::object::Kind::Blob, content).map_err(|e| format!("writing blob: {e}"))
 }
 
 /// Encode `entries` as a git tree (sorted into git's required order) and store
