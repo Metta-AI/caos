@@ -321,8 +321,8 @@ declares no `@root` either has no input beyond its own expression.
 ## Invocation
 
 - The job is `curry(<tool arg tree>, <declared args>)`, where
-  `<tool arg tree>` is what evaluating the tool's path yields — run over the
-  tree as `--in` only if the tool declared `@in`
+  `<tool arg tree>` is what evaluating the tool's path yields, and the
+  declared args include the object at `root` for a tool that declared `@root`
 - Evaluation happens where blocking is legal. A worker may not block, so the
   agent's harness tail-calls `eval-path-then` and curries in the callback
   (design/map-then.md); `caos-cli run-tool` evaluates directly. Both land on
