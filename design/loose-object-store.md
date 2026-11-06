@@ -132,15 +132,27 @@ returned the right commits.
   at other levels can sit beside them.
 - **Never packed.** `objects/pack` stays empty. Nothing deletes or rewrites an
   object except a future collector, by unlink.
-- **Volume**: a dedicated EBS volume, btrfs, mounted at
-  `/data/caos/stack/git` (`$CAOS_STACK_STATE/git`), so no path in the stack
-  changes.
-  - `mkfs.btrfs -L caos-git` with default profiles (DUP metadata).
-  - Mount options `noatime,compress-force=zstd:3`. `compress-force`, not
-    `compress`: the plain option stops compressing a file whose first chunk
-    does not compress. Default `max_inline`.
-  - Size it for growth, not today's 6.8 GiB; provision IOPS for cold reads,
-    which cost one I/O per object.
+- **Volume**: all of `/data` becomes btrfs, so every piece of state (the
+  repo, the registry, redis, docker's data root) stays in one place and no
+  path in the stack changes. `prod/caosd/configuration.nix` already finds the
+  data disk by label; what changes is the filesystem and these:
+  - `mkfs.btrfs` with default profiles (DUP metadata).
+  - Mount options `noatime,compress=zstd:3`. The measurements used
+    `compress-force`; with the whole disk on one filesystem, plain `compress`
+    spares the CPU on registry blobs and image layers that are already
+    gzipped. It gives up on a file whose first chunk does not compress, which
+    never happens to a level-0 object; the migration rehearsal confirms the
+    store still comes out near 6.8 GiB. Default `max_inline`.
+  - Docker's storage driver pinned to `overlay2` (`daemon.settings`), so
+    dockerd does not switch to its btrfs driver on a btrfs data root.
+  - The redis directory (`/data/caos/stack/redis`) marked no-copy-on-write
+    (`chattr +C` while empty): its append-only file is rewritten and synced
+    constantly, which fragments under copy-on-write. That also turns off
+    compression and checksums there, which is fine for a cache.
+  - `autoResize` grows only ext filesystems: a small unit runs
+    `btrfs filesystem resize max /data` at boot instead.
+  - Size and IOPS: the disk is 1 TB with 202 GB used today; provision IOPS
+    for cold reads, which cost one I/O per object.
 - **Dev stacks** keep whatever filesystem they have. Loose objects work on
   ext4 too, with more waste per small object; at dev's size that does not
   matter. btrfs is a prod setting.
