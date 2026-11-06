@@ -239,7 +239,11 @@ each request is answered only after its sync.
 - The pack-count fatal and warning at startup become a warning if
   `objects/pack` holds anything at all, since nothing should write a pack any
   more.
-- `sync_loose_object`'s "already packed" branch.
+- `sync_loose_object` and `stored_despite` in `storage.rs`: the server's own
+  writer fsyncs before it renames, and tolerates a racing writer of the same
+  object.
+- The import's pack hard-link (`Incoming::publish`) and the locator's
+  `index-pack` into the live store.
 - The watchdog runbook's pack-count step (`prod/watchdog/runbook/CLAUDE.md`)
   becomes "any pack is a bug".
 
