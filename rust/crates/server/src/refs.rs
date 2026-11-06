@@ -19,13 +19,6 @@
 //! the value it expects to replace (`absent` for create-only), and git checks
 //! that under the ref's lock. A stale expectation is a 409 naming the value
 //! the ref actually has, so a caller that lost a race knows what it lost to.
-//!
-//! A WAIT HOLDS A SERVER THREAD, NOT A RUNNER SLOT. `ref-then` is a
-//! continuation: the worker records it and exits, and the server's promise
-//! interpreter blocks here until the ref moves away from the value the worker
-//! saw. A write through `POST /ref` wakes waiters at once; a write that went
-//! round this module (a `git push` to the same repository) is noticed by the
-//! once-a-second recheck.
 
 use std::process::Command;
 use std::sync::{Condvar, Mutex};
