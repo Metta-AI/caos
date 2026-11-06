@@ -165,8 +165,9 @@ pub(crate) fn endpoint(
 }
 
 /// A private repository with read-only access to previously stored objects.
-/// Fetch is forced to keep its one received pack, including tiny transfers:
-/// publishing loose objects one at a time could expose a child before a parent.
+/// Fetch is forced to keep its one received pack, including tiny transfers, so
+/// there is one pack to check. Its objects then reach the store as loose
+/// objects, published children first (`loose::Staging`).
 struct Incoming {
     path: PathBuf,
 }
