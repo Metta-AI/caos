@@ -524,11 +524,7 @@ fn publish_quarantined(quarantine: &Path, objects: &Path, read: Command) -> io::
         dir: quarantine.to_path_buf(),
         children: HashMap::with_capacity(ids.len()),
     };
-    // The hook's environment points git at the quarantine, with the store as
-    // its alternate, so this reads exactly the pushed objects.
-    let mut command = Command::new("git");
-    command.args(["cat-file", "--batch"]);
-    read_objects(command, Some(&ids), |id, kind, data| {
+    read_objects(read, Some(&ids), |id, kind, data| {
         staging.children.insert(id, references(kind, &data)?);
         Ok(())
     })?;
