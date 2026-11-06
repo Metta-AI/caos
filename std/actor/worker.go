@@ -130,7 +130,7 @@ func main() {
 }
 
 func start(stateRef string) {
-	head := readRef(stateRef)
+	head := readRef(stateRef, "/cas/head")
 	statePath, stateOid := "", ""
 	if head != "" {
 		stateOid = stateOf(head)
