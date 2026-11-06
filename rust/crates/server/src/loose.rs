@@ -348,8 +348,7 @@ impl Staging {
         let order = publication_order(&self.children);
         let mut made = HashSet::new();
         for id in &order {
-            let (staged_dir, staged) = object_path(&self.dir, id);
-            let _ = staged_dir;
+            let (_, staged) = object_path(&self.dir, id);
             let (dir, path) = object_path(objects, id);
             if made.insert(dir.clone()) {
                 fs::create_dir_all(&dir)?;
