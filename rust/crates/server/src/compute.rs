@@ -1704,13 +1704,24 @@ fn resolve_promise(
             &from,
             Duration::from_secs(seconds),
         )
-        .map_err(|e| HttpError::new(500, e))
-        .and_then(|value| {
-            store_git_blob(config, format!("{}\n", value.text()).as_bytes())
-                .map(|oid| format!("blob {oid}"))
-                .map_err(|e| HttpError::new(500, format!("storing ref value blob: {e}")))
-        });
-        Some(continuation_result(config, cont, waited, catch)?)
+        .map_err(|e| HttpError::new(500, e));
+        match waited {
+            Ok(crate::refs::Value::Absent) => {
+                // Presence is the whole signal, as for `catch`. Without a
+                // `then` the empty blob is the request's result.
+                let oid = store_git_blob(config, b"")
+                    .map_err(|e| HttpError::new(500, format!("storing absent marker: {e}")))?;
+                Some((
+                    named_entry("absent", gix::objs::tree::EntryKind::Blob.into(), oid),
+                    format!("blob {oid}"),
+                    false,
+                ))
+            }
+            waited => {
+                let waited = waited.map(|value| format!("commit {}", value.text()));
+                Some(continuation_result(config, cont, waited, catch)?)
+            }
+        }
     } else {
         None
     };
