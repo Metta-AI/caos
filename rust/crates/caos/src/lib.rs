@@ -3900,73 +3900,131 @@ fn check_ref_value(verb: &str, what: &str, value: &str) -> Result<(), String> {
     }
 }
 
-/// `ref-get <ref>` — print the ref's value: the commit it names, or
-/// [`REF_ABSENT`]. Reading never waits; `ref-then` is how a worker waits for a
+/// The commit recorded at a CAS path (a `put-commit` or `ref-get` result, a
+/// commit-valued arg), as a hash. How `ref-set` and `ref-then` read a
+/// `--<flag>:@=<cas path>`; a path holding anything but a commit is refused.
+fn cas_commit(verb: &str, flag: &str, path: &str) -> Result<String, String> {
+    let target = validate_descendant(&cas_dir(), path)
+        .map_err(|e| format!("`{verb}` --{flag}:@={path}: {e}"))?;
+    let kind = result_kind(&target)?;
+    if kind != "commit" {
+        return Err(format!(
+            "`{verb}` --{flag}:@={path} is a {kind}, but a ref names a commit (`put-commit` mints one, `ref-get` reads one)"
+        ));
+    }
+    read_hash(&target)
+}
+
+/// One of a ref verb's commit-valued flags, `--<flag>=<hash>` or
+/// `--<flag>:@=<cas path>` (the spellings `run` and `curry` use), as the value
+/// the server takes. `--<flag>=absent` is accepted only where `absent` says.
+/// `None` if `arg` is some other flag.
+fn ref_flag(verb: &str, flag: &str, absent: bool, arg: &str) -> Option<Result<String, String>> {
+    let rest = arg.strip_prefix("--")?.strip_prefix(flag)?;
+    if let Some(path) = rest.strip_prefix(":@=") {
+        return Some(cas_commit(verb, flag, path));
+    }
+    let value = rest.strip_prefix('=')?;
+    if let Err(e) = check_ref_value(verb, &format!("--{flag}"), value) {
+        return Some(Err(e));
+    }
+    if value == REF_ABSENT && !absent {
+        return Some(Err(format!("`{verb}` --{flag} takes a commit, not {REF_ABSENT:?}")));
+    }
+    Some(Ok(value.to_string()))
+}
+
+/// The exit status of `ref-get` on a ref that does not exist: not 0 (nothing
+/// was written) and not 1 (nothing broke).
+pub const REF_ABSENT_EXIT: u8 = 2;
+
+/// `ref-get <ref> <cas-path>` — record the commit the ref names at
+/// `<cas-path>`, a direct child of the CAS, kind-tagged `commit` the way
+/// `put-commit` records one: `hash` gives its id, `--name:@=` passes it on.
+///
+/// A MISSING REF IS NOT AN ERROR AND NOT A SUCCESS: nothing is written and the
+/// answer is `Ok(false)`, which the binary turns into exit status
+/// [`REF_ABSENT_EXIT`], so ABSENT and BROKEN (status 1) stay apart
+/// (AGENTS.md). Reading never waits; `ref-then` is how a worker waits for a
 /// ref to change, without holding its runner slot.
-pub fn caos_ref_get(t: &dyn Transport, args: &[String]) -> Result<(), String> {
-    let [name] = args else {
-        return Err("usage: ref-get <ref>".to_string());
+pub fn caos_ref_get(t: &dyn Transport, args: &[String]) -> Result<bool, String> {
+    let [name, path] = args else {
+        return Err("usage: ref-get <ref> <cas-path>".to_string());
     };
     check_ref_name("ref-get", name)?;
+    let cas = cas_dir();
+    let target = validate_target(&cas, path)?;
+    probe_xattr(&cas)?;
     let body = server_get(
         &t.server_url()?,
         &format!("/ref?name={}", percent_encode(name)),
     )?;
-    println!("{}", String::from_utf8_lossy(&body).trim());
-    Ok(())
+    let value = String::from_utf8_lossy(&body).trim().to_string();
+    if value == REF_ABSENT {
+        return Ok(false);
+    }
+    check_ref_value("ref-get", "the server's answer", &value)?;
+    write_placeholder(&target, "commit", &value)?;
+    Ok(true)
 }
 
-/// `ref-set <ref> <hash|absent> (--expected=<hash|absent> | --force)` — move a
-/// ref, or delete it with `absent`.
+const REF_SET_USAGE: &str = "usage: ref-set <ref> (--new=<hash> | --new:@=<cas-path> | --delete)
+         (--expected=<hash|absent> | --expected:@=<cas-path> | --force)";
+
+/// `ref-set <ref> (--new=<hash> | --new:@=<cas-path> | --delete)
+/// (--expected=<hash|absent> | --expected:@=<cas-path> | --force)` — move a
+/// ref to a commit, or delete it.
+///
+/// A COMMIT IS GIVEN AS A HASH (`=`) OR AS THE CAS PATH IT IS RECORDED AT
+/// (`:@=`), the spellings `run` and `curry` use. So the commit `put-commit`
+/// just minted and the head `ref-get` just read pass straight through, and a
+/// script need never handle a hash.
 ///
 /// A COMPARE-AND-SWAP BY DEFAULT: `--expected` names the value being replaced
 /// (`absent` for create-only) and the server checks it under the ref's lock.
 /// An unconditional write has to say `--force`, so leaving the expectation out
 /// is an error rather than a silent overwrite. A lost race fails with the
-/// value the ref actually holds. The new value must be a commit already in the
-/// store (`put-commit` mints one).
+/// value the ref actually holds. The new commit must already be in the store.
 pub fn caos_ref_set(t: &dyn Transport, args: &[String]) -> Result<(), String> {
-    let mut positional = Vec::new();
-    let mut expected: Option<&str> = None;
+    let mut name: Option<&str> = None;
+    let mut new: Option<String> = None;
+    let mut expected: Option<String> = None;
     let mut force = false;
     for arg in args {
-        if let Some(value) = arg.strip_prefix("--expected=") {
-            if expected.replace(value).is_some() {
+        let value = if arg == "--delete" {
+            Some(REF_ABSENT.to_string())
+        } else {
+            ref_flag("ref-set", "new", false, arg).transpose()?
+        };
+        if let Some(value) = value {
+            if new.replace(value).is_some() {
+                return Err("`ref-set` takes one --new or --delete".to_string());
+            }
+        } else if let Some(value) = ref_flag("ref-set", "expected", true, arg) {
+            if expected.replace(value?).is_some() {
                 return Err("`ref-set` --expected given twice".to_string());
             }
         } else if arg == "--force" {
             force = true;
-        } else if arg.starts_with("--") {
-            return Err(format!(
-                "`ref-set` takes --expected=<hash|absent> or --force, got {arg}"
-            ));
-        } else {
-            positional.push(arg.as_str());
+        } else if arg.starts_with("--") || name.replace(arg.as_str()).is_some() {
+            return Err(format!("`ref-set` does not take {arg:?}\n{REF_SET_USAGE}"));
         }
     }
-    let [name, value] = positional[..] else {
-        return Err(
-            "usage: ref-set <ref> <hash|absent> (--expected=<hash|absent> | --force)".to_string(),
-        );
+    let (Some(name), Some(new)) = (name, new) else {
+        return Err(REF_SET_USAGE.to_string());
     };
     check_ref_name("ref-set", name)?;
-    check_ref_value("ref-set", "the new value", value)?;
-    let mut body = serde_json::json!({"name": name, "value": value});
+    let mut body = serde_json::json!({"name": name, "value": new});
     match (expected, force) {
         (Some(_), true) => {
             return Err("`ref-set` takes --expected or --force, not both".to_string())
         }
         (None, false) => {
-            return Err(
-                "`ref-set` needs --expected=<hash|absent> (a compare-and-swap) or --force \
-                 (an unconditional write)"
-                    .to_string(),
-            )
+            return Err(format!(
+                "`ref-set` needs --expected (a compare-and-swap) or --force (an unconditional write)\n{REF_SET_USAGE}"
+            ))
         }
-        (Some(old), false) => {
-            check_ref_value("ref-set", "--expected", old)?;
-            body["expected"] = serde_json::Value::String(old.to_string());
-        }
+        (Some(old), false) => body["expected"] = serde_json::Value::String(old),
         (None, true) => {}
     }
     let body = body.to_string();
@@ -3986,10 +4044,13 @@ pub fn caos_ref_set(t: &dyn Transport, args: &[String]) -> Result<(), String> {
 /// The longest `ref-then --timeout` the server accepts (its `refs::MAX_WAIT_SECS`).
 pub const REF_MAX_WAIT_SECS: u64 = 24 * 60 * 60;
 
-/// `ref-then <ref> [--expected=<hash|absent>] [--timeout=<secs>]
-/// [--then:<type>=<image>] [--catch]` — record a continuation that waits for
-/// `<ref>` to hold something other than `--expected` (default `absent`: wait
-/// for it to be set), then delivers the new value.
+/// `ref-then <ref> [--expected=<hash|absent> | --expected:@=<cas-path>]
+/// [--timeout=<secs>] [--then:<type>=<image>] [--catch]` — record a
+/// continuation that waits for `<ref>` to hold something other than
+/// `--expected` (default `absent`: wait for it to be set), then delivers the
+/// new value. `--expected:@=` names the commit by the CAS path it is recorded
+/// at, like `ref-set`'s: a `ref-get` result, or the `--result` an earlier
+/// `ref-then` delivered, to wait for the change after that one.
 ///
 /// THE WAITING IS THE SERVER'S. Like every continuation this is the worker's
 /// final act: it exits, its runner slot is free, and the server's promise
@@ -3998,18 +4059,28 @@ pub const REF_MAX_WAIT_SECS: u64 = 24 * 60 * 60;
 /// waiting for may be queued for one — the hold-and-wait design/map-then.md
 /// rules out.
 ///
-/// The new value reaches `--then` as `--result`, a blob holding what `ref-get`
-/// would print (`<oid>` or `absent`, and a newline); with no `--then` that
-/// blob is this request's result. If `--timeout` (default 600s, at most a
-/// day) passes first the wait fails, and `--catch` delivers that failure to
-/// `--then` as `--error` instead. A request that waited on a ref is never
-/// cached: its answer depends on when it ran.
+/// The new commit reaches `--then` as `--result`, a commit entry exactly like
+/// what `ref-get` records, so the callback reads `/cas/args/result` as it
+/// would any commit-valued arg. A ref DELETED while it was waited on (only
+/// possible when `--expected` names a commit) arrives instead as a bare
+/// `--absent` flag and no `--result`. With no `--then`, the commit is this
+/// request's result (an empty blob for a deletion). If `--timeout` (default
+/// 600s, at most a day) passes first the wait fails, and `--catch` delivers
+/// that failure to `--then` as `--error` instead. A request that waited on a
+/// ref is never cached: its answer depends on when it ran.
 pub fn caos_ref_then(t: &dyn Transport, name: &str, kvs: &[String]) -> Result<(), String> {
     check_ref_name("ref-then", name)?;
+    // The continuation records `expected` verbatim, as a hash or `absent`, so
+    // a `--expected:@=<cas path>` is resolved to its commit's hash here.
+    let mut resolved = Vec::with_capacity(kvs.len());
     for kv in kvs {
-        if let Some(value) = kv.strip_prefix("--expected=") {
-            check_ref_value("ref-then", "--expected", value)?;
+        match ref_flag("ref-then", "expected", true, kv).transpose()? {
+            Some(value) => resolved.push(format!("--expected={value}")),
+            None => resolved.push(kv.clone()),
         }
+    }
+    let kvs = &resolved[..];
+    for kv in kvs {
         if let Some(value) = kv.strip_prefix("--timeout=") {
             match value.parse::<u64>() {
                 Ok(seconds) if (1..=REF_MAX_WAIT_SECS).contains(&seconds) => {}

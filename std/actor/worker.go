@@ -76,9 +76,10 @@ func serverURL() string {
 }
 
 // readRef is the branch's head on the server, or "" if the branch is absent.
-func readRef(ref string) string {
-	if head := caos("ref-get", ref); head != absent {
-		return head
+// `caos ref-get` records the head at the CAS path `at`, a fresh one per read.
+func readRef(ref, at string) string {
+	if w.RefGet(ref, at) {
+		return caos("hash", at)
 	}
 	return ""
 }
@@ -129,7 +130,7 @@ func main() {
 }
 
 func start(stateRef string) {
-	head := readRef(stateRef)
+	head := readRef(stateRef, "/cas/head")
 	statePath, stateOid := "", ""
 	if head != "" {
 		stateOid = stateOf(head)
@@ -193,12 +194,12 @@ func publish(stateRef, head, newState string) {
 	if old == "" {
 		old = absent
 	}
-	complaint, err := setRef(stateRef, old, candidate)
+	complaint, err := setRef(stateRef, old, "/cas/new-commit")
 	if err == nil {
 		return
 	}
 	// Ambiguous or refused: re-read the ref to learn what actually happened.
-	switch observed := readRef(stateRef); {
+	switch observed := readRef(stateRef, "/cas/observed-head"); {
 	case observed == candidate:
 		return
 	case observed == head:
@@ -208,11 +209,12 @@ func publish(stateRef, head, newState string) {
 	}
 }
 
-// setRef moves ref from old to new with a compare-and-swap, returning the
-// server's complaint rather than failing: a refusal (a stale old value) and an
-// ambiguous outcome (the reply lost) are told apart by re-reading the ref.
-func setRef(ref, old, new string) (string, error) {
-	cmd := exec.Command("caos", "ref-set", ref, new, "--expected="+old)
+// setRef moves ref from old to the commit recorded at the CAS path newPath
+// with a compare-and-swap, returning the server's complaint rather than
+// failing: a refusal (a stale old value) and an ambiguous outcome (the reply
+// lost) are told apart by re-reading the ref.
+func setRef(ref, old, newPath string) (string, error) {
+	cmd := exec.Command("caos", "ref-set", ref, "--new:@="+newPath, "--expected="+old)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	err := cmd.Run()
