@@ -1951,19 +1951,19 @@ mod tests {
     }
 
     #[test]
-    fn writer_is_opt_in_and_independent_of_git() {
+    fn writer_is_opt_in_and_independent_of_root() {
         let h = parse_help("t", "Merges a branch in.\n@writer");
         assert!(h.writer);
-        assert!(!h.git);
+        assert!(!h.root);
         assert_eq!(h.doc, "Merges a branch in.");
 
         // Both tags, in either order, and the description still stops at the
         // first one.
-        let h = parse_help("t", "Walks history and edits.\n@writer\n@git");
-        assert!(h.writer && h.git);
+        let h = parse_help("t", "Walks history and edits.\n@writer\n@root");
+        assert!(h.writer && h.root);
         assert_eq!(h.doc, "Walks history and edits.");
-        let h = parse_help("t", "d\n@git\n@writer");
-        assert!(h.writer && h.git);
+        let h = parse_help("t", "d\n@root\n@writer");
+        assert!(h.writer && h.root);
     }
 
     #[test]
