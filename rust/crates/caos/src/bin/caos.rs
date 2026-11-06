@@ -196,6 +196,7 @@ fn usage(args: &[String]) -> String {
          {prog} sub-run <arg-tree-hash>\n  \
          {prog} ref-get <ref>\n  \
          {prog} ref-set <ref> <hash|absent> (--expected=<hash|absent> | --force)\n  \
+         {prog} ref-then <ref> [--expected=<hash|absent>] [--timeout=<secs>]\n      [--then:<type>=<image>] [--catch]\n  \
          {prog} trace-child <name> <arg-tree-hash>\n  \
          {prog} prepare-request --base:<type>=<image-or-arg tree> [--name=value | --name:@=path ...]\n  \
          {prog} resolve-image <hex hash | docker://<ref>>\n  \
