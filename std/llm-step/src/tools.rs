@@ -167,12 +167,6 @@ pub struct TreeTool {
     pub name: String,
     pub doc: String,
     pub args: Vec<TreeArg>,
-    /// The tool declared `@git`: bind the input as a commit (`wc`) and the
-    /// turn's ref snapshot (`refs`), so it can walk history rather than read
-    /// content. See [`Help::git`] — including why it is opt-in, why it reaches
-    /// only DISPATCHED READERS, and why a writer's input commit can never be
-    /// one of these.
-    pub git: bool,
     /// The tool declared `@writer`: its result is a PROPOSED CHANGE to the tree
     /// it was run on, not a value. Nothing reads this yet — the harness still
     /// decides writer-ness by tool name (`callback_result`); this carries the
