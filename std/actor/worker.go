@@ -76,9 +76,10 @@ func serverURL() string {
 }
 
 // readRef is the branch's head on the server, or "" if the branch is absent.
-func readRef(ref string) string {
-	if head := caos("ref-get", ref); head != absent {
-		return head
+// `caos ref-get` records the head at the CAS path `at`, a fresh one per read.
+func readRef(ref, at string) string {
+	if w.RefGet(ref, at) {
+		return caos("hash", at)
 	}
 	return ""
 }
