@@ -29,7 +29,7 @@
 
 use std::process::Command;
 use std::sync::{Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::{Config, HttpError};
 
