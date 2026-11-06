@@ -3917,28 +3917,21 @@ fn cas_commit(verb: &str, flag: &str, path: &str) -> Result<String, String> {
 
 /// One of a ref verb's commit-valued flags, `--<flag>=<hash>` or
 /// `--<flag>:@=<cas path>` (the spellings `run` and `curry` use), as the value
-/// the server takes. `--<flag>=absent` is accepted only where `absent_ok`.
+/// the server takes. `--<flag>=absent` is accepted only where `absent` says.
 /// `None` if `arg` is some other flag.
-fn ref_flag(
-    verb: &str,
-    flag: &str,
-    absent_ok: bool,
-    arg: &str,
-) -> Option<Result<String, String>> {
+fn ref_flag(verb: &str, flag: &str, absent: bool, arg: &str) -> Option<Result<String, String>> {
     let rest = arg.strip_prefix("--")?.strip_prefix(flag)?;
     if let Some(path) = rest.strip_prefix(":@=") {
         return Some(cas_commit(verb, flag, path));
     }
     let value = rest.strip_prefix('=')?;
-    Some(
-        check_ref_value(verb, &format!("--{flag}"), value).and_then(|()| {
-            if value == REF_ABSENT && !absent_ok {
-                Err(format!("`{verb}` --{flag} takes a commit, not {REF_ABSENT:?}"))
-            } else {
-                Ok(value.to_string())
-            }
-        }),
-    )
+    if let Err(e) = check_ref_value(verb, &format!("--{flag}"), value) {
+        return Some(Err(e));
+    }
+    if value == REF_ABSENT && !absent {
+        return Some(Err(format!("`{verb}` --{flag} takes a commit, not {REF_ABSENT:?}")));
+    }
+    Some(Ok(value.to_string()))
 }
 
 /// The exit status of `ref-get` on a ref that does not exist: not 0 (nothing
