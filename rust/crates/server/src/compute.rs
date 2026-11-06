@@ -1679,8 +1679,9 @@ fn resolve_promise(
         // the writer it is waiting for runs. The value travels as the blob
         // `ref-get` would print; a timeout is a failure `catch` can deliver.
         crate::refs::validate_name(name)?;
-        let from = crate::refs::Value::parse(ref_expected.as_deref().unwrap_or(crate::refs::ABSENT))
-            .map_err(|e| HttpError::new(400, format!("continuation {cont}: expected: {e}")))?;
+        let from =
+            crate::refs::Value::parse(ref_expected.as_deref().unwrap_or(crate::refs::ABSENT))
+                .map_err(|e| HttpError::new(400, format!("continuation {cont}: expected: {e}")))?;
         let seconds = match ref_timeout.as_deref() {
             None => REF_WAIT_DEFAULT_SECS,
             Some(text) => match text.parse::<u64>() {
