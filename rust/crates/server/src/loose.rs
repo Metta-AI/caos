@@ -492,7 +492,11 @@ pub(crate) fn publish_quarantine() -> i32 {
         return 0;
     };
     let git_dir = std::env::var_os("GIT_DIR").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    match publish_quarantined(Path::new(&quarantine), &git_dir.join("objects")) {
+    // The hook's environment points git at the quarantine, with the store as
+    // its alternate, so this reads exactly the pushed objects.
+    let mut read = Command::new("git");
+    read.args(["cat-file", "--batch"]);
+    match publish_quarantined(Path::new(&quarantine), &git_dir.join("objects"), read) {
         Ok(_) => 0,
         Err(error) => {
             eprintln!("caos: cannot publish the pushed objects: {error}");
