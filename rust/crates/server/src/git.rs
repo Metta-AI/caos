@@ -104,7 +104,15 @@ pub(crate) fn serve(config: &Config, mut request: Request) -> std::io::Result<()
     // service suffix (`/info/refs`, …), the repo path before it is empty, so
     // http-backend resolves the repo to GIT_PROJECT_ROOT directly.
     // GIT_HTTP_EXPORT_ALL exports it without a `git-daemon-export-ok` marker.
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    // The managed `pre-receive` hook runs this binary to publish a push's
+    // objects children first (`loose::publish_quarantine`); this is how it
+    // finds it. Each server names itself, so servers sharing one repo each
+    // publish with their own build.
+    if let Ok(exe) = std::env::current_exe() {
+        command.env(crate::loose::SERVER_EXE_ENV, exe);
+    }
+    let mut child = command
         .arg("http-backend")
         .env("GIT_PROJECT_ROOT", &config.git_dir)
         .env("GIT_HTTP_EXPORT_ALL", "1")
