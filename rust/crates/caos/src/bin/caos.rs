@@ -199,8 +199,8 @@ fn usage(args: &[String]) -> String {
          {prog} eval-path-then <in-cas-path> --eval=<path> [--then:<type>=<image>] [--catch]\n  \
          {prog} run-request-then <arg-tree-hash|cas-path> [--then:<type>=<image>] [--catch]\n  \
          {prog} sub-run <arg-tree-hash>\n  \
-         {prog} ref-get <ref>\n  \
-         {prog} ref-set <ref> <hash|absent> (--expected=<hash|absent> | --force)\n  \
+         {prog} ref-get <ref> <cas-path>   (exit 2: no such ref)\n  \
+         {prog} ref-set <ref> (--new=<hash> | --new:@=<cas-path> | --delete)\n      (--expected=<hash|absent> | --expected:@=<cas-path> | --force)\n  \
          {prog} trace-child <name> <arg-tree-hash>\n  \
          {prog} prepare-request --base:<type>=<image-or-arg tree> [--name=value | --name:@=path ...]\n  \
          {prog} resolve-image <hex hash | docker://<ref>>\n  \
