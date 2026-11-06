@@ -331,7 +331,8 @@ impl Staging {
     }
 
     /// How many objects are staged.
-    pub(crate) fn len(&self) -> usize {
+    #[cfg(test)]
+    fn len(&self) -> usize {
         self.children.len()
     }
 
