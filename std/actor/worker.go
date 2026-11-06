@@ -191,10 +191,10 @@ func publish(stateRef, head, newState string) {
 
 	old := head
 	if old == "" {
-		old = zeros
+		old = absent
 	}
-	status, err := setRef(serverURL(), stateRef, old, candidate)
-	if err == nil && status == "" {
+	complaint, err := setRef(stateRef, old, candidate)
+	if err == nil {
 		return
 	}
 	// Ambiguous or refused: re-read the ref to learn what actually happened.
@@ -202,10 +202,21 @@ func publish(stateRef, head, newState string) {
 	case observed == candidate:
 		return
 	case observed == head:
-		w.True(false, "moving %s: %s %v", stateRef, status, err)
+		w.True(false, "moving %s: %v: %s", stateRef, err, complaint)
 	default:
-		w.True(false, "lost the race for %s: %s %v", stateRef, status, err)
+		w.True(false, "lost the race for %s: %v: %s", stateRef, err, complaint)
 	}
+}
+
+// setRef moves ref from old to new with a compare-and-swap, returning the
+// server's complaint rather than failing: a refusal (a stale old value) and an
+// ambiguous outcome (the reply lost) are told apart by re-reading the ref.
+func setRef(ref, old, new string) (string, error) {
+	cmd := exec.Command("caos", "ref-set", ref, new, "--expected="+old)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	return strings.TrimSpace(stderr.String()), err
 }
 
 func pkt(s string) string { return fmt.Sprintf("%04x%s", len(s)+4, s) }
