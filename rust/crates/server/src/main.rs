@@ -911,6 +911,14 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
             request.as_reader().read_to_end(&mut body)?;
             storage::post_object(config, &body)
         }
+        // Named mutable refs under refs/heads/ (`caos ref-get` / `ref-set`):
+        // read one, or move one with a compare-and-swap. See [`mod refs`].
+        Method::Get if path == "/ref" => refs::get_endpoint(config, &query),
+        Method::Post if path == "/ref" => {
+            let mut body = String::new();
+            request.as_reader().read_to_string(&mut body)?;
+            refs::set_endpoint(config, &body)
+        }
         Method::Post if path == "/git/import" => import::endpoint(config, request),
         Method::Post if path == "/git/push" => push::endpoint(config, request),
         Method::Post if path == "/secrets/push" => secret_store::push_endpoint(config, request),
