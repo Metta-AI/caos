@@ -460,7 +460,7 @@ func main() {
 			w.Must(os.Symlink(fmt.Sprintf("/cas/c%d", i), filepath.Join(squashed, l.name)))
 			fmt.Fprintf(&report, "  %s/%s  %s\n", into, l.name, commits[i])
 		}
-		report.WriteString("Next: publish_source each, bottom to top, with force=true.\n")
+		report.WriteString("Next: caos-std/publish-source each, bottom to top, with force=true and expected.\n")
 		run("caos", "put", squashed, "/cas/squashed")
 
 		rebuild(in, "/tmp/squash-root", strings.Split(into, "/"), "/cas/squashed")
