@@ -340,6 +340,14 @@ declares no `@root` either has no input beyond its own expression.
   then bytes in a file
 - An `{array}` parameter arrives as one blob of NEWLINE-SEPARATED elements
 
+**Only a `@root` tool receives anything of the session, and only the object
+at its root.** A tree is the biggest thing that can enter an ArgTree, and the
+ArgTree is the cache key, so binding one a tool never reads makes it re-key on
+every edit to a tree it ignores: `caos-test-result`, whose entire input is a
+hash, could not hit the memo twice in a row. For the same reason a `@root`
+tool's key is its root object and its arguments, so `edit` re-keys only when
+its own file changes. The registered `grep` binds only the scope it searches,
+by its own dispatch.
 
 ## Returning a result
 
