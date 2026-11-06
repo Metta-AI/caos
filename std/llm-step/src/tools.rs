@@ -433,7 +433,7 @@ pub struct Help {
     /// fills with the tool call's id when the caller leaves it out
     /// (design/tool-contract.md, "`@request-id`"). The call id rather than a
     /// random value because it is just as unique and it is in the transcript.
-    /// Replaces `@call`.
+    /// It replaced `@call`.
     pub request_id: bool,
     /// `@root`: the tool takes a REQUIRED `root` parameter, a path relative to
     /// the session root, and is given the object there as `/cas/args/root` (a
@@ -442,14 +442,13 @@ pub struct Help {
     /// result is `{stdout, failed?}`, and a writer's adds `root` or `deleted`,
     /// and `commit-message`; the harness puts a writer's new object back and
     /// rewrites everything above it (design/tool-contract.md, "`root`").
-    /// Replaces `@in`, `@git` and `@scope`, which a `@root` tool may not also
-    /// declare.
+    /// It replaced `@in`, `@git` and `@scope`.
     pub root: bool,
     /// `@op <name>`: the tool is an OPERATION OF THE STEP, not a worker. The entry
     /// that declares it exists to give the operation a path, a help and a place in
     /// `tool_help`/`run_tool`; running it is the step doing the work in process,
-    /// because the operation writes the session's own records (a source tree
-    /// imported, a publication, a subagent) and owns its call's lifecycle.
+    /// because the operation writes the session's own records (a child
+    /// session, an async task) and owns its call's lifecycle.
     pub op: Option<String>,
 }
 
