@@ -249,7 +249,10 @@ pub(crate) fn set(
     }
     Err(HttpError::new(
         500,
-        format!("moving {name} to {}: git update-ref failed: {stderr}", new.text()),
+        format!(
+            "moving {name} to {}: git update-ref failed: {stderr}",
+            new.text()
+        ),
     ))
 }
 
