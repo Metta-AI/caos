@@ -356,7 +356,8 @@ detection.
      not move, and the right `<old>` is accepted. The result is an ordinary
      branch that git can fetch. This resolves the history cost of this
      question for the write path, and needs no server change. `std/actor`
-     should use it;
+     used it until `caos ref-set` (design/refs.md) gave workers the same
+     compare-and-swap as one command;
    - squash periodically (question 2), which bounds the chain;
    - add a small server-side push-by-oid endpoint, which breaks "no server
      change".
