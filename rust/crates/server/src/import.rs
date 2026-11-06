@@ -208,29 +208,6 @@ impl Incoming {
         }
         Ok(indexes)
     }
-
-    fn publish(&self, git_dir: &str) -> Result<(), HttpError> {
-        let destination = Path::new(git_dir).join("objects/pack");
-        fs::create_dir_all(&destination)?;
-        for index in self.indexes()? {
-            let pack = index.with_extension("pack");
-            File::open(&pack)?.sync_all()?;
-            File::open(&index)?.sync_all()?;
-            // Readers discover packs through their index. Publish and sync the
-            // complete pack before making its index visible. Hard links also
-            // preserve a concurrent import of the identical pack.
-            for source in [&pack, &index] {
-                let target = destination.join(source.file_name().unwrap());
-                match fs::hard_link(source, target) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(e) => return Err(e.into()),
-                }
-                File::open(&destination)?.sync_all()?;
-            }
-        }
-        Ok(())
-    }
 }
 
 impl Drop for Incoming {
