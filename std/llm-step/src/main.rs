@@ -1560,36 +1560,6 @@ fn prepare_grep(cfg: &Config, call: &Value, ws: &str) -> Result<Prepared, String
 /// there is one only when the tool asked for it — the tree is the biggest thing
 /// that can enter an ArgTree, and the ArgTree is the cache key
 /// (SPEC, "CaosTools" — Receiving args).
-/// Split the bound arguments into the ones that ride on the TOOL'S CURRY and
-/// the tree bound as the REQUEST's `in`.
-///
-/// `in` is bound in exactly ONE place whichever side supplied it — the
-/// request — because `caos curry` refuses a rebind, and binding the caller's
-/// tree in the curry while the request bound the default would be exactly
-/// that. So the caller's `in` is lifted out of the curry args here.
-///
-/// With no `in` supplied, the default is the tree the tool's own path selected,
-/// and only for a tool that declared `@in`.
-type Bindings<'a> = Vec<(&'a str, Arg<'a>)>;
-
-fn split_input<'a>(
-    ready: &'a [(String, tools::ReadyArg)],
-    wants_in: bool,
-    ws: &'a str,
-) -> (Bindings<'a>, Bindings<'a>) {
-    let args = ready
-        .iter()
-        .filter(|(name, _)| name != "in")
-        .map(|(name, value)| (name.as_str(), value.arg()))
-        .collect();
-    let input = match ready.iter().find(|(name, _)| name == "in") {
-        Some((_, supplied)) => vec![("in", supplied.arg())],
-        None if wants_in => vec![("in", Arg::Path(ws))],
-        None => Vec::new(),
-    };
-    (args, input)
-}
-
 fn prepared_request(
     image: &str,
     args: &[(&str, Arg<'_>)],
