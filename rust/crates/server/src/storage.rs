@@ -84,12 +84,12 @@ pub(crate) fn post_object(config: &Config, body: &[u8]) -> Result<Vec<u8>, HttpE
 
 /// Store one object, durably, as a level-0 loose object (see [`crate::loose`]).
 /// Its references are the caller's to have checked.
-fn write(
-    config: &Config,
-    kind: gix::object::Kind,
-    data: &[u8],
-) -> std::io::Result<gix::ObjectId> {
-    crate::loose::write_durable(&std::path::Path::new(&config.git_dir).join("objects"), kind, data)
+fn write(config: &Config, kind: gix::object::Kind, data: &[u8]) -> std::io::Result<gix::ObjectId> {
+    crate::loose::write_durable(
+        &std::path::Path::new(&config.git_dir).join("objects"),
+        kind,
+        data,
+    )
 }
 
 /// Validate only posted commit objects with Git, before publishing their bytes.
