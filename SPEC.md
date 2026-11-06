@@ -795,18 +795,15 @@ commit to /git/import and prints its hash. It optionally reads a token file
 specified by --github-token-file=PATH and forwards it in a sensitive header.
 Ref resolution, provenance, and session attachment belong to callers.
 
-The inline `import_source(source, revision?, into)` tool resolves a remote
-revision in the agent container. Before importing objects it records the
-commit and provenance as an import.json payload in tool.start. Inline starts
-may omit a compute task; ordinary dispatched starts still name their task.
-A resumed call uses the saved hash, and concurrent attempts accept the first
-persisted observation. A new tool call observes the remote again.
-
-After import, the tool atomically adds the gitlink, sibling .source.json
-provenance and completed tool result. It rejects occupied destinations.
-The tool is available in an empty session. Local paths use /import.
-Only github.com on the default HTTPS port receives the mounted GitHub token
-automatically.
+`caos-std/import-source` (`root`, `source`, `revision?`, `into`) is an
+ordinary writer (design/tool-contract.md). It resolves the revision and
+imports the commit through `std/github`'s `import` operation, the one image
+the GitHub token is granted to, and returns its root directory holding the new
+gitlink and its sibling `.source.json` provenance; the harness applies that as
+one change. Nothing is recorded before the import, and every call observes the
+remote again. It rejects occupied destinations, works in an empty session, and
+takes HTTPS repositories only; local paths use /import. Only github.com on the
+default HTTPS port receives the GitHub token.
 
 ## Remote Git imports
 
