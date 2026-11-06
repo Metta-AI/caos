@@ -257,8 +257,14 @@ These bare tags are flags:
   fills with the tool call's id when the caller leaves it out. A caller may
   pass its own value to share one result between calls on purpose
   (design/tool-contract.md, "`@request-id`")
-- `@call` — bind the tool call's id as `call`. Superseded by `@request-id`,
-  and removed once nothing declares it
+- `@op <name>` — the tool is an OPERATION OF THE STEP, run in process because
+  it writes the session's own records: the subagent and async entries
+  (`agent-spawn`, `agent-wait`, `agent-harvest`, `run-async`)
+
+`@in`, `@git`, `@scope` and `@call` were removed (design/tool-contract.md,
+"Tags"): `@root` replaced the first three and `@request-id` the last. A help
+that still declares one is reported with what replaced it, and the tag is
+ignored.
 
 The tags live in the help rather than as their own args so that `tool_help` can
 report it WITHOUT EVALUATING: "will this change my tree?" is the second most
