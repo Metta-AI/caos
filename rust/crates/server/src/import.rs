@@ -120,6 +120,10 @@ pub(crate) fn endpoint(
                 .into_sync(),
             ..config.clone()
         };
+        // Each received object is exploded into a level-0 loose object as it is
+        // checked, and published children first once all are (`mod loose`):
+        // the store is never packed.
+        let mut loose = crate::loose::Staging::new(incoming.path.join("loose"))?;
         for index in incoming.indexes()? {
             let pack = index.with_extension("pack");
             run(
@@ -139,14 +143,17 @@ pub(crate) fn endpoint(
                     .nth(1)
                     .filter(|oid| git_locator::import::commit(oid))
                     .ok_or_else(|| failure("invalid imported pack index"))?;
-                crate::storage::get_object(&staged, oid)
+                let (kind, data) = crate::storage::fetch_object(&staged, oid)
                     .map_err(|_| failure("imported object not readable in staging"))?;
+                let kind = gix::object::Kind::from_bytes(kind.as_bytes())
+                    .map_err(|_| failure("imported object has an unknown type"))?;
+                loose.add(kind, &data)?;
             }
         }
         crate::storage::get_object(&staged, &input.commit)
             .map_err(|_| failure("imported commit not readable in staging"))?;
-        incoming.publish(&config.git_dir)?;
-        // Exercise the live handle after pack publication, before certifying H.
+        loose.publish(&Path::new(&config.git_dir).join("objects"))?;
+        // Exercise the live handle after publication, before certifying H.
         crate::storage::get_object(config, &input.commit)
             .map_err(|_| failure("imported commit not visible through object storage"))?;
         // GC is disabled on the server. This records verified closure, not a
@@ -158,8 +165,9 @@ pub(crate) fn endpoint(
 }
 
 /// A private repository with read-only access to previously stored objects.
-/// Fetch is forced to keep its one received pack, including tiny transfers:
-/// publishing loose objects one at a time could expose a child before a parent.
+/// Fetch is forced to keep its one received pack, including tiny transfers, so
+/// there is one pack to check. Its objects then reach the store as loose
+/// objects, published children first (`loose::Staging`).
 struct Incoming {
     path: PathBuf,
 }
@@ -199,29 +207,6 @@ impl Incoming {
             return Err(failure("import produced more than one pack"));
         }
         Ok(indexes)
-    }
-
-    fn publish(&self, git_dir: &str) -> Result<(), HttpError> {
-        let destination = Path::new(git_dir).join("objects/pack");
-        fs::create_dir_all(&destination)?;
-        for index in self.indexes()? {
-            let pack = index.with_extension("pack");
-            File::open(&pack)?.sync_all()?;
-            File::open(&index)?.sync_all()?;
-            // Readers discover packs through their index. Publish and sync the
-            // complete pack before making its index visible. Hard links also
-            // preserve a concurrent import of the identical pack.
-            for source in [&pack, &index] {
-                let target = destination.join(source.file_name().unwrap());
-                match fs::hard_link(source, target) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(e) => return Err(e.into()),
-                }
-                File::open(&destination)?.sync_all()?;
-            }
-        }
-        Ok(())
     }
 }
 

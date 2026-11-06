@@ -60,6 +60,7 @@ mod git;
 mod grant_history;
 mod import;
 mod locator;
+mod loose;
 mod mcp;
 mod push;
 mod remote_git;
@@ -160,138 +161,57 @@ fn install_termination_handlers() {
 }
 
 fn main() {
+    // Run as the repository's `pre-receive` hook (see `loose::publish_quarantine`).
+    if loose::is_hook_invocation() {
+        std::process::exit(loose::publish_quarantine());
+    }
     install_termination_handlers();
 
     let addr = std::env::var("SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
     let git_dir = env_or("CAOS_GIT_DIR", DEFAULT_GIT_DIR);
 
-    // Self-bootstrap the bare repo on first run (e.g. a fresh fly Volume), the
-    // same setup `caosd up` does by hand: `http.receivepack` lets clients
-    // `git push`, `allowAnySHA1InWant` lets them fetch a result by bare hash.
-    // `git init --bare` is idempotent, so this is a no-op once seeded.
-    let git = |args: &[&str]| {
-        run_required_git(args).unwrap_or_else(|error| {
+    // This server's git settings live in ITS OWN ENVIRONMENT, never in the
+    // repository's config (see `git_settings`). Several servers, of different
+    // builds, share one repository (every test stack shares its host stack's),
+    // so a setting written into the repo would apply to all of them. The one
+    // exception is a repository this process creates (e.g. a fresh fly
+    // Volume): nobody else uses it yet, and the protective settings written
+    // into it also protect a person who runs git there by hand.
+    if gix::open(&git_dir).is_err() {
+        initialize_repo(&git_dir).unwrap_or_else(|error| {
             eprintln!("fatal: {error}");
             std::process::exit(1);
         });
-    };
-    if gix::open(&git_dir).is_err() {
-        git(&["init", "-q", "--bare", &git_dir]);
     }
-    // UNCONDITIONALLY, not just on a repo this process created. These two are
-    // the server's own protocol requirements, so it owns them wherever the repo
-    // came from — and a repo can arrive from anywhere: a test stack seeds one by
-    // `git init --bare` plus a fetch of the deps it was handed
-    // (devbox/worker), and a plain `init` sets neither. That cost a suite
-    // where every push came back `403` from the inner server, which reads as an
-    // auth problem and is really a missing config.
-    git(&["-C", &git_dir, "config", "http.receivepack", "true"]);
-    // Validate every incoming object in Git's quarantine, including objects
-    // outside the updated refs. Keep even small pushes packed so migration
-    // exposes a complete pack at once, not unordered loose commits.
-    git(&["-C", &git_dir, "config", "receive.fsckObjects", "true"]);
-    git(&["-C", &git_dir, "config", "receive.shallowUpdate", "false"]);
-    git(&["-C", &git_dir, "config", "receive.unpackLimit", "1"]);
-    git(&[
-        "-C",
-        &git_dir,
-        "config",
-        "uploadpack.allowAnySHA1InWant",
-        "true",
-    ]);
-    // Request refs are transient negotiation anchors and result refs are a
-    // server-written durability index. Neither belongs in repository-wide fetch
-    // advertisements. Both remain visible to receive-pack negotiation: a client
-    // can form its next request from a result object that exists only on the
-    // server, so hiding that result makes send-pack try (and fail) to read it
-    // locally.
-    configure_ref_advertisements(&git_dir).unwrap_or_else(|error| {
-        eprintln!("fatal: {error}");
+    let hooks = std::env::temp_dir().join(format!("caos-server-hooks-{}", std::process::id()));
+    let hooks = loose::install_hooks(&hooks).unwrap_or_else(|error| {
+        eprintln!("fatal: installing this server's git hooks: {error}");
         std::process::exit(1);
     });
-    remove_managed_pre_receive_hook(&git_dir).unwrap_or_else(|error| {
-        eprintln!("fatal: {error}");
-        std::process::exit(1);
-    });
-    // Serve partial-clone (`--filter`) fetches: the std/merge worker fetches
-    // the commit GRAPH only (`--filter=tree:0`) and lazily faults in just the
-    // three trees `git merge-tree` needs, rather than the whole history's
-    // trees and blobs. Same class of flag as the two above — a protocol
-    // capability the server owns.
-    git(&["-C", &git_dir, "config", "uploadpack.allowFilter", "true"]);
-    // Never let git rewrite this repo's object store behind our back.
-    // `git-receive-pack` (which http-backend spawns on every push) forks a
-    // background repack; that rewrites the object store while a concurrent
-    // `git-upload-pack` is streaming a fetch from it, which can truncate the
-    // pack and surface on the client as the intermittent `fetch-pack: invalid
-    // index-pack output`. Worse, we hold the same repo open as a
-    // `gix::ThreadSafeRepository`: when its object database re-consolidates
-    // against packs that moved under it, gix asserts ("if the generation
-    // changed, the slot index must have changed for sure") and the panic
-    // unwinds that request's thread. tiny_http then answers a bare 500 from
-    // `Drop`, so the caller sees a body-less `500 Internal Server Error` and
-    // nothing at all appears in this log.
-    //
-    // THREE settings, because one is no longer enough. `gc.auto 0` gates only
-    // the `gc` task; git 2.54 added a `geometric-repack` maintenance task that
-    // ignores every gc knob (`gc.auto`, `gc.autoPackLimit`,
-    // `maintenance.gc.enabled` — all measured, all repack anyway). So also
-    // refuse the auto-maintenance hook outright, and disable the task by name
-    // for any path that reaches it another way.
-    //
-    // `--cruft` is why this is data loss and not just a crash: nearly every
-    // object here is unreachable from a ref (results and trees are addressed
-    // by hash), so a cruft repack sorts the CAS into a cruft pack and drops
-    // whatever has not been touched in two weeks — while redis keeps handing
-    // out result hashes that point at it.
-    //
-    // Unconditional, so an already-seeded repo is healed on the next restart
-    // and not just a fresh one.
-    git(&["-C", &git_dir, "config", "gc.auto", "0"]);
-    git(&["-C", &git_dir, "config", "receive.autogc", "false"]);
-    git(&[
-        "-C",
-        &git_dir,
-        "config",
-        "maintenance.geometric-repack.enabled",
-        "false",
-    ]);
-    // Survive an unclean shutdown. git's DEFAULT is to publish a loose object or
-    // a ref by renaming a temp file into place and never fsyncing it, so ext4
-    // can journal the rename before the data lands and a crash leaves the right
-    // filename holding zero bytes — which is not a lost object but a POISONED
-    // one, because receive-pack validates every advertised ref and one
-    // unreadable blob then rejects every push (see [`mod repair`]). `objects`
-    // covers loose objects and packs, `reference` the ref files.
-    //
-    // `fsyncMethod=batch` is what makes this affordable on the loose-object side
-    // — one hardware flush for a whole batch of writes rather than one each,
-    // which matters when a single `caos put` lands thousands of objects. This is
-    // git's own side only; the in-process gix writes are `storage`'s to sync.
-    git(&["-C", &git_dir, "config", "core.fsync", "objects,reference"]);
-    git(&["-C", &git_dir, "config", "core.fsyncMethod", "batch"]);
-    // Keep previous values as a generic recovery path if a ref tip is damaged
-    // despite the fsync policy above. `always` includes refs outside
-    // refs/heads. Automatic GC is disabled above, so these logs do not expire
-    // by themselves; design/chat.md lists retention as a known shortcoming. Until that policy exists, retain recovery history rather
-    // than inventing an expiry window that can silently remove the only sound
-    // value for a damaged ref.
-    git(&["-C", &git_dir, "config", "core.logAllRefUpdates", "always"]);
+    // Still single-threaded and with no child yet, so every git this process
+    // runs against the store sees the settings from the start.
+    let _ = GIT_ENV.set(settings_env(&git_settings(Some(&hooks))));
 
     // Clear what a previous crash left behind BEFORE opening the repo: gix
     // answers "is this object stored?" for a loose object with a path-exists
     // check, so an empty file has to be gone from disk before anything asks.
     let swept = repair::sweep_empty_loose_objects(&git_dir);
+    let temporaries = loose::sweep_temporaries(&std::path::Path::new(&git_dir).join("objects"));
+    if temporaries > 0 {
+        eprintln!(
+            "repair: {git_dir} had {temporaries} temporary object file(s) from a crash; removed"
+        );
+    }
 
     // Open the object database once as a thread-safe handle; each request thread
     // takes a cheap local handle from it (see `handle`).
-    // Packed uploads accumulate while automatic repacking is disabled. gix
+    // Nothing writes packs any more (every transfer unpacks; see `mod loose`),
+    // but a store from before that, or a seeded one, can still hold them. gix
     // fixes its slot capacity at open time; its client default (at least 32)
-    // cannot accommodate a running server. Reserve its supported maximum.
-    // This is headroom, not pack maintenance: 32,767 is still a hard limit.
-    // TODO: consolidate packs during coordinated downtime, preserving ALL CAS
-    // objects (including unreferenced ones), before this capacity is exhausted.
-    // Do not enable live gc/repack: see the shared-reader constraints above.
+    // cannot accommodate many packs, so reserve its supported maximum. A store
+    // that is still packed is migrated offline by exploding its packs into
+    // loose objects (design/loose-object-store.md), never by a live repack:
+    // see the shared-reader constraints above.
     // Given skips gix's initial scan, so diagnose an already-full store here.
     let packs = std::fs::read_dir(std::path::Path::new(&git_dir).join("objects/pack"))
         .map(|entries| {
@@ -302,11 +222,11 @@ fn main() {
         })
         .unwrap_or(0);
     if packs >= (1 << 15) - 1 {
-        eprintln!("fatal: object store has {packs} packs; consolidate packs offline, preserving unreferenced CAS objects, before restarting");
+        eprintln!("fatal: object store has {packs} packs; explode them into loose objects offline, preserving unreferenced CAS objects, before restarting (design/loose-object-store.md)");
         std::process::exit(1);
     }
-    if packs >= 30_000 {
-        eprintln!("warning: object store has {packs} packs, approaching the 32767-pack limit; schedule offline consolidation");
+    if packs > 0 {
+        eprintln!("warning: object store has {packs} pack(s); nothing should write packs any more, so these predate the loose-object store; explode them offline (design/loose-object-store.md)");
     }
     let options = gix::open::Options::default()
         .object_store_slots(gix::odb::store::init::Slots::Given((1 << 15) - 1));
@@ -327,24 +247,12 @@ fn main() {
         );
     }
 
-    // Both steps below read every object in the store, which on a long-lived
+    // The check below reads every object in the store, which on a long-lived
     // repo takes minutes: far too long to pay on every start, and a test stack
     // has nothing to check. `caosd` opts in (CAOS_STACK_STORE_CHECK); no other
-    // placement does.
+    // placement does. There is no repack here any more: the store is never
+    // packed (design/loose-object-store.md).
     if env_or("CAOS_STORE_CHECK", "no") == "yes" {
-        // This is the coordinated downtime the pack-count TODO above asks for:
-        // every push leaves a pack, and every object read costs more with each
-        // one. `--geometric=2` merges the small recent packs and keeps ALL CAS
-        // objects, including unreferenced ones (it works from the packs, never
-        // from refs; plain `-a -d` without `--keep-unreachable` would drop
-        // them). Unlike `-a`, it leaves an already-consolidated store alone, so
-        // a restart costs a fraction of a second instead of rewriting it.
-        run_required_git(&["-C", &git_dir, "repack", "--geometric=2", "-d", "-q"]).unwrap_or_else(
-            |error| {
-                eprintln!("fatal: repacking the object store: {error}");
-                std::process::exit(1);
-            },
-        );
         // Older servers accepted individual commits without their
         // dependencies. Check all objects, including unreferenced ones, before
         // trusting existence as proof of closure. Never delete history to make
@@ -541,113 +449,129 @@ fn verify_object_closure(git_dir: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn configure_ref_advertisements(git_dir: &str) -> Result<(), String> {
-    ensure_git_config_value(git_dir, "uploadpack.hideRefs", "refs/caos/req/")?;
-    // A locator's pin→tree memo (`mod locator`). It retains the fetched closure
-    // and survives a restart, but it is not a name anyone fetches BY, and a
-    // server that has resolved many pins would otherwise advertise one ref per
-    // pin to every client that dials it.
-    ensure_git_config_value(git_dir, "uploadpack.hideRefs", locator::TREE_REF_PREFIX)?;
-    ensure_git_config_value(git_dir, "uploadpack.hideRefs", "refs/caos/res/")?;
-    // Undo the setting written by the first exact-ref implementation. Server
-    // repositories survive binary upgrades, so merely ceasing to add it would
-    // leave existing installations unable to negotiate result objects.
-    remove_git_config_value(git_dir, "receive.hideRefs", "refs/caos/res/")
-}
+/// `*.unpackLimit` meaning "always unpack": git keeps a transfer as a pack only
+/// when it carries at least this many objects, and this is the largest value it
+/// accepts.
+const UNPACK_ALWAYS: &str = "2147483647";
 
-/// Add one multi-valued Git setting once, preserving administrator-supplied
-/// values and avoiding duplicate entries across server restarts.
-fn ensure_git_config_value(git_dir: &str, key: &str, value: &str) -> Result<(), String> {
-    let output = std::process::Command::new("git")
-        .args(["-C", git_dir, "config", "--get-all", key])
-        .output()
-        .map_err(|error| format!("reading git config {key}: {error}"))?;
-    match output.status.code() {
-        Some(0) => {
-            let values = String::from_utf8(output.stdout)
-                .map_err(|error| format!("git config {key} is not UTF-8: {error}"))?;
-            if values.lines().any(|configured| configured == value) {
-                return Ok(());
-            }
-        }
-        Some(1) => {}
-        _ => {
-            return Err(format!(
-                "reading git config {key}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-    }
-    run_required_git(&["-C", git_dir, "config", "--add", key, value])
-}
-
-/// Remove one formerly server-owned multi-valued Git setting without touching
-/// administrator-supplied values alongside it.
-fn remove_git_config_value(git_dir: &str, key: &str, value: &str) -> Result<(), String> {
-    let output = std::process::Command::new("git")
-        .args([
-            "-C",
-            git_dir,
-            "config",
-            "--fixed-value",
-            "--unset-all",
-            key,
-            value,
-        ])
-        .output()
-        .map_err(|error| format!("removing git config {key}: {error}"))?;
-    match output.status.code() {
-        Some(0) | Some(5) => Ok(()), // removed, or no exact value was present
-        _ => Err(format!(
-            "removing git config {key}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )),
-    }
-}
-
-const MANAGED_HOOK_MARKERS: [&str; 2] = [
-    "# managed by caos-server: append-only refs",
-    "# managed by caos-server: append-only session heads",
-];
-
-// TODO: Remove this one-time migration after every supported repository has
-// been started by a server version that no longer installs the hook.
-/// Remove the pre-receive hook installed by older CAOS servers.
+/// The git settings this server runs with, as `(key, value)` pairs.
 ///
-/// The old hook execs this binary with a validator mode that no longer exists,
-/// so merely ceasing to install it would make every push to an upgraded
-/// repository fail. Its marker is the ownership proof: an unmarked hook and its
-/// configured path belong to the administrator and are left untouched.
-fn remove_managed_pre_receive_hook(git_dir: &str) -> Result<(), String> {
-    let hooks = std::path::Path::new(git_dir).join("hooks");
-    let hook = hooks.join("pre-receive");
-    let hooks_value = hooks
-        .to_str()
-        .ok_or_else(|| format!("hooks path is not UTF-8: {}", hooks.display()))?;
-    let contents = match std::fs::read(&hook) {
-        Ok(contents) => contents,
-        // A previous cleanup may have removed the hook without clearing the
-        // absolute path our installer wrote. That exact value is redundant
-        // with Git's default `<git-dir>/hooks`, so clearing it cannot disable a
-        // surviving hook in this directory.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return remove_git_config_value(git_dir, "core.hooksPath", hooks_value);
-        }
-        Err(error) => return Err(format!("reading {}: {error}", hook.display())),
-    };
-    let managed = MANAGED_HOOK_MARKERS.iter().any(|marker| {
-        contents
-            .windows(marker.len())
-            .any(|window| window == marker.as_bytes())
-    });
-    if !managed {
-        return Ok(());
+/// They reach git through this process's environment (`settings_env`, applied
+/// with `git_env` to every git this server runs against the store, and from
+/// `http-backend` to receive-pack, upload-pack and the hook), NEVER through the
+/// repository's config: several servers of different builds share one
+/// repository, and a setting written there would apply to all of them. Only a
+/// repository this process creates gets them written in (`initialize_repo`,
+/// with `hooks` = `None`). Environment settings outrank the repo's own.
+///
+/// `hooks` is this process's own hooks directory (`loose::install_hooks`).
+fn git_settings(hooks: Option<&std::path::Path>) -> Vec<(&'static str, String)> {
+    let mut settings = vec![
+        // The server's protocol requirements. A repo can arrive from anywhere
+        // (a test stack seeds one by `git init --bare` plus a fetch, and a
+        // plain `init` sets none of these), and a missing `http.receivepack`
+        // reads as every push coming back `403`, an auth problem in disguise.
+        ("http.receivepack", "true"),
+        ("uploadpack.allowAnySHA1InWant", "true"),
+        // Serve partial-clone (`--filter`) fetches: the std/merge worker
+        // fetches the commit GRAPH only (`--filter=tree:0`) and lazily faults
+        // in just the three trees `git merge-tree` needs.
+        ("uploadpack.allowFilter", "true"),
+        // Request refs are transient negotiation anchors, result refs a
+        // server-written durability index, and a locator's pin-to-tree memo
+        // one ref per pin. None belongs in fetch advertisements. All stay
+        // visible to receive-pack negotiation: a client can form its next
+        // request from a result object that exists only on the server, so
+        // hiding that result makes send-pack try (and fail) to read it.
+        ("uploadpack.hideRefs", "refs/caos/req/"),
+        ("uploadpack.hideRefs", locator::TREE_REF_PREFIX),
+        ("uploadpack.hideRefs", "refs/caos/res/"),
+        // Validate every incoming object in git's quarantine, including
+        // objects outside the updated refs.
+        ("receive.fsckObjects", "true"),
+        ("receive.shallowUpdate", "false"),
+        // The store is loose objects only and is never packed
+        // (design/loose-object-store.md, `mod loose`). Every transfer unpacks
+        // into loose objects, however small or large; a push lands in git's
+        // quarantine and the hook publishes it children first. Objects are
+        // written at zlib level 0: the filesystem compresses.
+        ("receive.unpackLimit", UNPACK_ALWAYS),
+        ("transfer.unpackLimit", UNPACK_ALWAYS),
+        ("fetch.unpackLimit", UNPACK_ALWAYS),
+        ("core.looseCompression", "0"),
+        // Never let git rewrite this repo's object store behind our back.
+        // receive-pack forks a background repack after a push; that rewrites
+        // the store while a concurrent upload-pack streams from it (a client
+        // sees `fetch-pack: invalid index-pack output`), and the gix handle
+        // this server holds asserts when packs move under it, which tiny_http
+        // turns into a body-less 500. THREE settings: `gc.auto 0` gates only
+        // the `gc` task, and git 2.54's `geometric-repack` maintenance task
+        // ignores every gc knob. A cruft repack is data loss, not just a
+        // crash: nearly every object here is unreachable from a ref, so it
+        // would drop whatever has not been touched in two weeks while redis
+        // keeps handing out hashes that point at it.
+        ("gc.auto", "0"),
+        ("receive.autogc", "false"),
+        ("maintenance.geometric-repack.enabled", "false"),
+        // Survive an unclean shutdown. git's default publishes a loose object
+        // or a ref by renaming a temp file into place without fsyncing, so a
+        // crash can leave the right name holding zero bytes, a POISONED object
+        // (see [`mod repair`]). `batch` flushes once per batch of writes.
+        ("core.fsync", "objects,reference"),
+        ("core.fsyncMethod", "batch"),
+        // Keep previous ref values as the recovery path `repair` restores
+        // damaged refs from. Nothing expires them yet: until a retention
+        // policy exists, keep the history rather than invent a window.
+        ("core.logAllRefUpdates", "always"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key, value.to_string()))
+    .collect::<Vec<_>>();
+    if let Some(hooks) = hooks {
+        settings.push(("core.hooksPath", hooks.display().to_string()));
     }
+    settings
+}
 
-    std::fs::remove_file(&hook).map_err(|error| format!("removing {}: {error}", hook.display()))?;
-    // The installer always wrote this absolute value. Remove only that exact
-    // value; preserve relative or alternate administrator-selected hook paths.
-    remove_git_config_value(git_dir, "core.hooksPath", hooks_value)
+/// `settings` as git's environment configuration (`GIT_CONFIG_COUNT` and its
+/// numbered keys and values).
+fn settings_env(settings: &[(&str, String)]) -> Vec<(String, String)> {
+    let mut env = vec![("GIT_CONFIG_COUNT".to_string(), settings.len().to_string())];
+    for (index, (key, value)) in settings.iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{index}"), key.to_string()));
+        env.push((format!("GIT_CONFIG_VALUE_{index}"), value.clone()));
+    }
+    env
+}
+
+/// This server's git settings, set once at startup (`main`).
+static GIT_ENV: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+
+/// The environment that carries this server's git settings: apply it
+/// (`Command::envs`) to every git command run against the store.
+pub(crate) fn git_env() -> impl Iterator<Item = (&'static str, &'static str)> {
+    GIT_ENV
+        .get()
+        .into_iter()
+        .flatten()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+}
+
+/// Create the store's repository, with the settings written into its config:
+/// this process is its only user so far, and the written settings also protect
+/// a person who later runs git in it by hand. The config is then left
+/// read-only as a marker that nothing should change it; git rewrites a config
+/// by lock and rename whatever its mode, so the guarantee is that this server
+/// never writes it again.
+fn initialize_repo(git_dir: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    run_required_git(&["init", "-q", "--bare", git_dir])?;
+    for (key, value) in git_settings(None) {
+        run_required_git(&["-C", git_dir, "config", "--add", key, &value])?;
+    }
+    let config = std::path::Path::new(git_dir).join("config");
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o444))
+        .map_err(|error| format!("making {} read-only: {error}", config.display()))
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -999,6 +923,7 @@ fn spawn_request_ref_pruner(git_dir: String) {
         // Through git rather than by unlinking: it takes the same locks the
         // push path does, and it copes with a ref that has been packed since.
         let mut child = match std::process::Command::new("git")
+            .envs(git_env())
             .args(["-C", &git_dir, "update-ref", "--stdin"])
             .stdin(std::process::Stdio::piped())
             .spawn()
@@ -1035,10 +960,7 @@ mod tests {
         assert_eq!(join_params("", ""), "");
     }
 
-    use super::{
-        configure_ref_advertisements, remove_managed_pre_receive_hook, run_required_git,
-        MANAGED_HOOK_MARKERS,
-    };
+    use super::{git_settings, initialize_repo, run_required_git, settings_env};
     use std::process::Command;
 
     #[test]
@@ -1064,8 +986,13 @@ mod tests {
     fn server_owned_refs_are_hidden_from_fetch_but_available_for_push_negotiation() {
         let dir = std::env::temp_dir().join(format!("caos-hidden-ref-test-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
+        let env = settings_env(&git_settings(None));
         let git = |args: &[&str]| {
-            let output = Command::new("git").args(args).output().unwrap();
+            let output = Command::new("git")
+                .envs(env.iter().map(|(key, value)| (key, value)))
+                .args(args)
+                .output()
+                .unwrap();
             assert!(
                 output.status.success(),
                 "git {:?}: {}",
@@ -1074,63 +1001,32 @@ mod tests {
             );
             String::from_utf8_lossy(&output.stdout).into_owned()
         };
-        git(&["init", "-q", "--bare", dir.to_str().unwrap()]);
-        git(&[
-            "-C",
-            dir.to_str().unwrap(),
-            "config",
-            "--add",
-            "uploadpack.hideRefs",
-            "refs/private/",
-        ]);
-        git(&[
-            "-C",
-            dir.to_str().unwrap(),
-            "config",
-            "--add",
-            "receive.hideRefs",
-            "refs/private-write/",
-        ]);
-        git(&[
-            "-C",
-            dir.to_str().unwrap(),
-            "config",
-            "--add",
-            "receive.hideRefs",
-            "refs/caos/res/",
-        ]);
+        Command::new("git")
+            .args(["init", "-q", "--bare", dir.to_str().unwrap()])
+            .status()
+            .unwrap();
+        // An administrator's own value, in the repo's config, survives beside
+        // the server's, which never touch the file.
+        Command::new("git")
+            .args(["-C", dir.to_str().unwrap(), "config", "--add"])
+            .args(["uploadpack.hideRefs", "refs/private/"])
+            .status()
+            .unwrap();
+        let config = std::fs::read(dir.join("config")).unwrap();
         let blob = git(&["-C", dir.to_str().unwrap(), "hash-object", "-w", "--stdin"]);
         let blob = blob.trim();
         for refname in [
             "refs/caos/req/request",
             "refs/caos/res/result",
             "refs/caos/v2/users/u-1/conversations/active/c-74657374",
-            // A resolved locator's pin→tree memo (`mod locator`). One per pin, so
+            "refs/private/x",
+            // A resolved locator's pin->tree memo (`mod locator`). One per pin, so
             // a server that has resolved a few hundred would advertise a few
             // hundred to every client that dials it.
             &format!("{}{}", crate::locator::TREE_REF_PREFIX, "a".repeat(40)),
         ] {
             git(&["-C", dir.to_str().unwrap(), "update-ref", refname, blob]);
         }
-        configure_ref_advertisements(dir.to_str().unwrap()).unwrap();
-        configure_ref_advertisements(dir.to_str().unwrap()).unwrap();
-        let hidden = git(&[
-            "-C",
-            dir.to_str().unwrap(),
-            "config",
-            "--get-all",
-            "uploadpack.hideRefs",
-        ]);
-        assert_eq!(hidden.lines().count(), 4, "{hidden}");
-        assert!(hidden.lines().any(|value| value == "refs/private/"));
-        let receive_hidden = git(&[
-            "-C",
-            dir.to_str().unwrap(),
-            "config",
-            "--get-all",
-            "receive.hideRefs",
-        ]);
-        assert_eq!(receive_hidden.trim(), "refs/private-write/");
 
         let upload = git(&[
             "upload-pack",
@@ -1141,6 +1037,7 @@ mod tests {
         assert!(!upload.contains("refs/caos/req/"));
         assert!(!upload.contains("refs/caos/res/"));
         assert!(!upload.contains(crate::locator::TREE_REF_PREFIX));
+        assert!(!upload.contains("refs/private/"));
         assert!(upload.contains("refs/caos/v2/users/"));
 
         let receive = git(&[
@@ -1153,117 +1050,49 @@ mod tests {
         assert!(receive.contains("refs/caos/res/"));
         assert!(receive.contains("refs/caos/v2/users/"));
 
+        // The settings reached git without the repository's config changing.
+        assert_eq!(std::fs::read(dir.join("config")).unwrap(), config);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn managed_pre_receive_hooks_are_removed_on_upgrade() {
-        for (index, marker) in MANAGED_HOOK_MARKERS.iter().enumerate() {
-            let dir = std::env::temp_dir().join(format!(
-                "caos-managed-hook-test-{}-{index}",
-                std::process::id()
-            ));
-            std::fs::remove_dir_all(&dir).ok();
-            run_required_git(&["init", "-q", "--bare", dir.to_str().unwrap()]).unwrap();
-            let hooks = dir.join("hooks");
-            let hook = hooks.join("pre-receive");
-            std::fs::write(&hook, format!("#!/bin/sh\n{marker}\nexit 1\n")).unwrap();
-            run_required_git(&[
-                "-C",
-                dir.to_str().unwrap(),
-                "config",
-                "core.hooksPath",
-                hooks.to_str().unwrap(),
-            ])
-            .unwrap();
-
-            remove_managed_pre_receive_hook(dir.to_str().unwrap()).unwrap();
-
-            assert!(!hook.exists());
-            let configured = Command::new("git")
-                .args([
-                    "-C",
-                    dir.to_str().unwrap(),
-                    "config",
-                    "--get",
-                    "core.hooksPath",
-                ])
+    fn a_created_repo_gets_the_settings_and_a_read_only_config() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("caos-init-test-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        initialize_repo(dir.to_str().unwrap()).unwrap();
+        let mode = std::fs::metadata(dir.join("config"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o444);
+        let get = |key: &str| {
+            let output = Command::new("git")
+                .args(["-C", dir.to_str().unwrap(), "config", "--get-all", key])
                 .output()
                 .unwrap();
-            assert_eq!(configured.status.code(), Some(1));
-            std::fs::remove_dir_all(dir).unwrap();
-        }
-    }
-
-    #[test]
-    fn unmanaged_pre_receive_hook_and_path_are_preserved() {
-        let dir =
-            std::env::temp_dir().join(format!("caos-unmanaged-hook-test-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        run_required_git(&["init", "-q", "--bare", dir.to_str().unwrap()]).unwrap();
-        let hooks = dir.join("hooks");
-        let hook = hooks.join("pre-receive");
-        let contents = b"#!/bin/sh\necho administrator hook\n";
-        std::fs::write(&hook, contents).unwrap();
-        run_required_git(&[
-            "-C",
-            dir.to_str().unwrap(),
-            "config",
-            "core.hooksPath",
-            hooks.to_str().unwrap(),
-        ])
-        .unwrap();
-
-        remove_managed_pre_receive_hook(dir.to_str().unwrap()).unwrap();
-
-        assert_eq!(std::fs::read(&hook).unwrap(), contents);
-        let configured = Command::new("git")
-            .args([
-                "-C",
-                dir.to_str().unwrap(),
-                "config",
-                "--get",
-                "core.hooksPath",
-            ])
-            .output()
-            .unwrap();
-        assert!(configured.status.success());
-        assert_eq!(
-            String::from_utf8(configured.stdout).unwrap().trim(),
-            hooks.to_str().unwrap()
-        );
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        assert_eq!(get("gc.auto").trim(), "0");
+        assert_eq!(get("uploadpack.hideRefs").lines().count(), 3);
+        // A process's own hooks directory is never written into a repo.
+        assert!(get("core.hooksPath").is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn stale_managed_hook_path_is_removed_when_the_hook_is_already_absent() {
-        let dir =
-            std::env::temp_dir().join(format!("caos-stale-hook-path-test-{}", std::process::id()));
+    fn the_hook_is_this_binary_under_the_hooks_name() {
+        let dir = std::env::temp_dir().join(format!("caos-hooks-test-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
-        run_required_git(&["init", "-q", "--bare", dir.to_str().unwrap()]).unwrap();
-        let hooks = dir.join("hooks");
-        run_required_git(&[
-            "-C",
-            dir.to_str().unwrap(),
-            "config",
-            "core.hooksPath",
-            hooks.to_str().unwrap(),
-        ])
-        .unwrap();
-
-        remove_managed_pre_receive_hook(dir.to_str().unwrap()).unwrap();
-
-        let configured = Command::new("git")
-            .args([
-                "-C",
-                dir.to_str().unwrap(),
-                "config",
-                "--get",
-                "core.hooksPath",
-            ])
-            .output()
-            .unwrap();
-        assert_eq!(configured.status.code(), Some(1));
+        let hooks = crate::loose::install_hooks(&dir).unwrap();
+        // Twice: a restart replaces the link.
+        crate::loose::install_hooks(&dir).unwrap();
+        let target = std::fs::read_link(hooks.join("pre-receive")).unwrap();
+        assert_eq!(target, std::env::current_exe().unwrap());
+        let settings = git_settings(Some(&hooks));
+        assert!(settings
+            .iter()
+            .any(|(key, value)| *key == "core.hooksPath" && value == &hooks.display().to_string()));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

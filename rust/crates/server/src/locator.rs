@@ -32,8 +32,8 @@
 //! **Only the TREE closure is published.** A `--depth=1` fetch has a shallow
 //! boundary and an incomplete commit, and the server's startup check refuses a
 //! store containing either (`verify_object_closure`). So the staging repo
-//! keeps the commit and the `shallow` file, and what is packed into the live
-//! object database is the tree and everything under it — complete by
+//! keeps the commit and the `shallow` file, and what is published into the live
+//! object database, as loose objects, is the tree and everything under it — complete by
 //! construction, and byte-identical to what a `:@=` of the same content would
 //! have produced. Nothing anchors the commit, which is correct: a locator wants
 //! a snapshot, not a history.
@@ -52,7 +52,7 @@ use git_locator::GitRef;
 use crate::Config;
 
 /// Where a resolved pin is recorded. Hidden from ref advertisement
-/// (`configure_ref_advertisements`): it is a memo, not something a client
+/// (`git_settings` in main): it is a memo, not something a client
 /// fetches by name.
 pub(crate) const TREE_REF_PREFIX: &str = "refs/caos/locator-trees/";
 
@@ -216,21 +216,46 @@ fn fetch_tree(
     if !packed.status.success() {
         return Err(format!("could not pack {rev}'s tree from {url}"));
     }
-    // `--strict` in the LIVE store: every link the pack makes must resolve,
-    // the same guarantee `POST /object/` enforces for a pushed tree. A
+    // `--strict` in a repository of its own, with nothing else in it: every
+    // link the pack makes must resolve inside the pack, which is a stronger
+    // form of the guarantee `POST /object/` enforces for a pushed tree. A
     // locator's tree closure stands alone, so it passes on its own.
-    let indexed = git(&config.git_dir)
+    let check = staging.path.join("check");
+    let initialized = git(&check)
+        .args(["init", "--bare", "--quiet"])
+        .output()
+        .map_err(|e| format!("creating the locator check repository: {e}"))?;
+    if !initialized.status.success() {
+        return Err(format!(
+            "could not create the locator check repository: {}",
+            String::from_utf8_lossy(&initialized.stderr).trim()
+        ));
+    }
+    let indexed = git(&check)
         .args(["index-pack", "--strict", "--threads=1", "--stdin"])
         .stdin(File::open(&pack).map_err(|e| format!("reading {pack:?}: {e}"))?)
         .stdout(Stdio::null())
         .output()
-        .map_err(|e| format!("storing the locator tree: {e}"))?;
+        .map_err(|e| format!("checking the locator tree: {e}"))?;
     if !indexed.status.success() {
         return Err(format!(
             "the tree fetched for {rev} from {url} is incomplete: {}",
             String::from_utf8_lossy(&indexed.stderr).trim()
         ));
     }
+    // Then into the store as loose objects, children first (`mod loose`): the
+    // store is never packed. The check repository holds exactly the pack.
+    let mut loose = crate::loose::Staging::new(staging.path.join("loose"))
+        .map_err(|e| format!("staging the locator tree: {e}"))?;
+    let mut read = git(&check);
+    read.args(["cat-file", "--batch", "--batch-all-objects"]);
+    crate::loose::read_objects(read, None, |_, kind, data| {
+        loose.add(kind, &data).map(|_| ())
+    })
+    .map_err(|e| format!("staging the locator tree: {e}"))?;
+    loose
+        .publish(&Path::new(&config.git_dir).join("objects"))
+        .map_err(|e| format!("storing the locator tree: {e}"))?;
     Ok(oid)
 }
 

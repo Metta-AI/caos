@@ -105,6 +105,10 @@ pub(crate) fn serve(config: &Config, mut request: Request) -> std::io::Result<()
     // http-backend resolves the repo to GIT_PROJECT_ROOT directly.
     // GIT_HTTP_EXPORT_ALL exports it without a `git-daemon-export-ok` marker.
     let mut child = Command::new("git")
+        // This server's git settings, its hooks among them, travel in the
+        // environment to receive-pack and upload-pack: never in the shared
+        // repository's config (`git_settings`).
+        .envs(crate::git_env())
         .arg("http-backend")
         .env("GIT_PROJECT_ROOT", &config.git_dir)
         .env("GIT_HTTP_EXPORT_ALL", "1")

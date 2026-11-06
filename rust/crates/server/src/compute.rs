@@ -2171,6 +2171,7 @@ fn pin_result_in(git_dir: &str, refname: &str, hash: &str) -> Result<(), HttpErr
     let mut last_error = String::new();
     for attempt in 0..ATTEMPTS {
         match Command::new("git")
+            .envs(crate::git_env())
             .args(["-C", git_dir, "update-ref", refname, hash])
             .output()
         {

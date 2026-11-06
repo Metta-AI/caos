@@ -269,7 +269,10 @@ def main():
             run("git", "init", "-q", str(consumer))
             run("git", "-C", str(consumer), "fetch", "-q", base, second[0])
             assert run("git", "-C", str(consumer), "rev-parse", "FETCH_HEAD") == second[0]
-            assert list((odb / "objects/pack").glob("*.pack"))
+            # The store is loose objects only (design/loose-object-store.md): the
+            # import published its objects loose, and left no pack behind.
+            assert not list((odb / "objects/pack").glob("*.pack"))
+            assert (odb / "objects" / second[0][:2] / second[0][2:]).is_file()
             before = len(observations)
             commands = git_commands.read_text()
             assert call(payload(second[0])) == {"commit": second[0]}
@@ -702,17 +705,20 @@ def main():
                 for extra in [[], ["--expected=main"], ["--expected=absent", "--expected=absent"]]:
                     invalid = subprocess.run([cli, "push-git", destination, second[0], "cli", *extra], env=cli_env, capture_output=True)
                     assert invalid.returncode != 0
-            # Small uploads now stay packed too. The live reader must discover
-            # more packs than gix's default capacity of 32 without a restart.
+            # Every push lands as loose objects, published by the server's own
+            # pre-receive hook, so the store gains no packs however many pushes
+            # arrive, and the live reader sees each push at once.
             for index in range(40):
                 packed = advance()
                 run("git", "--git-dir", str(origin), "push", "-q", base,
                     packed[0] + f":refs/heads/pack-growth-{index}")
                 for oid in packed:
                     object_request(oid)
-            assert len(list((odb / "objects/pack").glob("*.pack"))) > 32
-            # Commit staging must also work once its live-store alternate
-            # contains more than 32 packs.
+            assert not list((odb / "objects/pack").glob("*.pack"))
+            # The hook lives with the server process, never in the repository,
+            # which other servers may share.
+            assert not (odb / "hooks/pre-receive").exists()
+            # Commit staging must also work after many pushes.
             staged_tip = advance(packed[0])
             for kind, oid in [("blob", staged_tip[2]), ("tree", staged_tip[1]), ("commit", staged_tip[0])]:
                 post_from_origin(kind, oid)

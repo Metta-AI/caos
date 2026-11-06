@@ -1,7 +1,8 @@
 # caos: a loose-object store on btrfs
 
-Status: decided, not yet built. Measured on a copy of the caosd-prod object
-store on 2026-11-05. Replaces the pack-maintenance part of
+Status: decided; the server change is built (this section's PR), the
+filesystem and the migration are not. Measured on a copy of the caosd-prod
+object store on 2026-11-05. Replaces the pack-maintenance part of
 `design/caos-store-and-gc.md`; retention (the collector) is still open there.
 
 ## Summary
@@ -132,20 +133,45 @@ returned the right commits.
   at other levels can sit beside them.
 - **Never packed.** `objects/pack` stays empty. Nothing deletes or rewrites an
   object except a future collector, by unlink.
-- **Volume**: a dedicated EBS volume, btrfs, mounted at
-  `/data/caos/stack/git` (`$CAOS_STACK_STATE/git`), so no path in the stack
-  changes.
-  - `mkfs.btrfs -L caos-git` with default profiles (DUP metadata).
-  - Mount options `noatime,compress-force=zstd:3`. `compress-force`, not
-    `compress`: the plain option stops compressing a file whose first chunk
-    does not compress. Default `max_inline`.
-  - Size it for growth, not today's 6.8 GiB; provision IOPS for cold reads,
-    which cost one I/O per object.
+- **Volume**: all of `/data` becomes btrfs, so every piece of state (the
+  repo, the registry, redis, docker's data root) stays in one place and no
+  path in the stack changes. `prod/caosd/configuration.nix` already finds the
+  data disk by label; what changes is the filesystem and these:
+  - `mkfs.btrfs` with default profiles (DUP metadata).
+  - Mount options `noatime,compress=zstd:3`. The measurements used
+    `compress-force`; with the whole disk on one filesystem, plain `compress`
+    spares the CPU on registry blobs and image layers that are already
+    gzipped. It gives up on a file whose first chunk does not compress, which
+    never happens to a level-0 object; the migration rehearsal confirms the
+    store still comes out near 6.8 GiB. Default `max_inline`.
+  - Docker's storage driver pinned to `overlay2` (`daemon.settings`), so
+    dockerd does not switch to its btrfs driver on a btrfs data root.
+  - The redis directory (`/data/caos/stack/redis`) marked no-copy-on-write
+    (`chattr +C` while empty): its append-only file is rewritten and synced
+    constantly, which fragments under copy-on-write. That also turns off
+    compression and checksums there, which is fine for a cache.
+  - `autoResize` grows only ext filesystems: a small unit runs
+    `btrfs filesystem resize max /data` at boot instead.
+  - Size and IOPS: the disk is 1 TB with 202 GB used today; provision IOPS
+    for cold reads, which cost one I/O per object.
 - **Dev stacks** keep whatever filesystem they have. Loose objects work on
   ext4 too, with more waste per small object; at dev's size that does not
   matter. btrfs is a prod setting.
 
-Server config, set unconditionally at start (`main.rs`) like the rest:
+Server settings. All of them, these and the ones the server already had, are
+passed to git in the server's own environment (`GIT_CONFIG_COUNT`, from
+`main::git_settings`) on `http-backend` and the server's other git commands
+against the store, and are NEVER written into the repository's config.
+Several servers of different builds share one repository (every test stack
+shares its host stack's), so a setting or hook written into the repo would
+apply to all of them; an earlier draft of this change did exactly that and
+broke pushes on the host. A repository the server creates itself gets the
+settings written in once, and its config left read-only (0444) as a marker.
+The mode does not stop git, which rewrites a config by lock and rename
+whatever its mode; `chattr +i` would, but servers before this change rewrite
+the config at every start and fail when they cannot, so that is a step for
+the host once every server sharing it runs this build.
+
 
 | setting | value | why |
 | --- | --- | --- |
@@ -197,25 +223,24 @@ The ingress paths:
 
 | path | today | after |
 | --- | --- | --- |
-| `git push` (receive-pack) | pack, `receive.unpackLimit 1` | `unpack-objects --strict` writes loose objects into git's quarantine (`objects/incoming-*`, same filesystem). A `pre-receive` hook (this server binary in a hook mode, with a new ownership marker beside the ones `remove_managed_pre_receive_hook` knows) runs `publish_loose` over `$GIT_QUARANTINE_PATH`. git then finds nothing left to migrate and updates the refs. A push whose ref update then fails leaves closure-complete objects behind, which is harmless. |
+| `git push` (receive-pack) | pack, `receive.unpackLimit 1` | `unpack-objects --strict` writes loose objects into git's quarantine (`objects/incoming-*`, same filesystem). A managed `pre-receive` hook runs `publish_loose` over `$GIT_QUARANTINE_PATH`; git then finds nothing left to migrate and updates the refs. A push whose ref update then fails leaves closure-complete objects behind, which is harmless. The hook is not in the repository: each server makes its own hooks directory (a `pre-receive` symlink to its own binary, which knows it was run as the hook by its invocation name) and hands git `core.hooksPath` in the `http-backend` environment. Only pushes through that server run it; servers of other builds sharing the repo see nothing. Every push in the tree goes through a server over HTTP. |
 | `POST /git/import` | verified pack hard-linked into `objects/pack` | verify in the staging repo as now, explode the pack into the staging repo's loose objects, `publish_loose` |
 | locator | `index-pack --strict` of the tree closure straight into the live store | index into the staging repo (alternates to the live store), explode, `publish_loose` |
-| `POST /object`, `store_git_blob`, `store_git_tree` | gix loose write + `sync_loose_object` | unchanged in shape: one object at a time, closure-checked. gix must write level 0 (check whether gix-odb exposes the level; if not, a level-0 writer is a few lines) |
-| seed (`stack/serve` copies `CAOS_STACK_SEED_GIT`) | copies packs | explode at seed time; the server is not running yet, so order does not matter |
+| `POST /object`, `store_git_blob`, `store_git_tree` | gix loose write + `sync_loose_object` | one object at a time, closure-checked as before, through the server's own level-0 writer (`loose::write_durable`): temporary file, fsync, rename, fsync the fan-out directory. gix's writer has no compression setting and never fsyncs, which is what `sync_loose_object` patched after the fact; the new writer cannot leave a zero-length object behind. |
+| seed (`stack/serve` copies `CAOS_STACK_SEED_GIT`) | copies packs | unchanged: a seeded test store may keep its packs, which readers handle; the server warns at start whenever `objects/pack` holds anything |
 
-The hook reintroduces a managed `pre-receive` hook, which the server removed
-before for a different reason (an obsolete validator mode). Alternatives, if
-the hook is unwanted: the server's `git.rs` already fronts every
-`/git-receive-pack` request and parses its commands, so it could run
-receive-pack against a staging repo and apply the ref updates itself. The hook
-is less code.
+The server also drops its one-time cleanup of an older managed hook in the
+repository (`remove_managed_pre_receive_hook`): it too modified the shared
+repository, and with `core.hooksPath` in the environment no hook in the
+repository runs for this server's pushes.
 
 ### 4.2 Durability cost
 
-`sync_loose_object` fsyncs each object and its directory: 8.2 ms an object in
-the test (pessimistic, through a loop device), against 0.29 ms in batch mode.
-This is what the server already pays per object on ext4, so the migration
-does not make it worse. If it shows up, the fix is group commit in
+`loose::write_durable` fsyncs each object and its directory: 8.2 ms an
+object in the test (pessimistic, through a loop device), against 0.29 ms in
+batch mode. That is the same two fsyncs `sync_loose_object` paid per object
+before, so this does not make it worse; the batch paths (push, import,
+locator) flush once per batch with `syncfs`. If it shows up, the fix is group commit in
 `storage.rs`: concurrent writes share one `syncfs` per few milliseconds and
 each request is answered only after its sync.
 
@@ -226,7 +251,11 @@ each request is answered only after its sync.
 - The pack-count fatal and warning at startup become a warning if
   `objects/pack` holds anything at all, since nothing should write a pack any
   more.
-- `sync_loose_object`'s "already packed" branch.
+- `sync_loose_object` and `stored_despite` in `storage.rs`: the server's own
+  writer fsyncs before it renames, and tolerates a racing writer of the same
+  object.
+- The import's pack hard-link (`Incoming::publish`) and the locator's
+  `index-pack` into the live store.
 - The watchdog runbook's pack-count step (`prod/watchdog/runbook/CLAUDE.md`)
   becomes "any pack is a bug".
 
@@ -246,22 +275,37 @@ each request is answered only after its sync.
 | btrfs reorders renames across a crash | power-cut test before prod; closure check at every start |
 | a path still writes a pack | startup warning; watchdog alert on any file in `objects/pack` |
 | btrfs metadata ENOSPC on a full volume | size generously; alert at 70% used, from `btrfs filesystem usage` |
-| the bind mount does not show the submount inside the container | check during migration: docker bind mounts are recursive by default, but confirm the container sees btrfs at `$CAOS_STACK_STATE/git` |
-| backups miss the new volume | add it to whatever snapshots `/data` |
+| dockerd picks its btrfs storage driver on the new data root | `storage-driver = "overlay2"` pinned in `daemon.settings` |
+| redis's append-only file fragments under copy-on-write | its directory is `chattr +C` |
+| backups or snapshots of `/data` assume ext4 | check whatever snapshots the data disk before the swap |
 | large fetches cost more CPU | accepted; a pack cache for immutable roots is the fix if it ever matters |
 
 ## 6. Migration
 
-One downtime of roughly 10 minutes, rehearsed first on a copy as in section 2.
+All of `/data` moves to a new btrfs volume; the old ext4 volume stays
+attached read-only, then detached, as the rollback. What is on it
+(2026-11-06, 202 GB used of 1 TB):
 
-1. Attach and format the volume (`prod/caosd/configuration.nix`:
-   `fileSystems."/data/caos/stack/git"`, btrfs by label, the options above,
-   `nofail`). Mount it first at a temporary path, e.g. `/data/caos-git-new`.
-2. Stop `caosd`.
-3. Copy everything except `objects/` from the old repo: config, `HEAD`,
-   `refs/`, `packed-refs`, `logs/` (repair restores refs from reflogs),
-   `hooks/`, `caos-imports/`, `caos-commit-checks/`, `caos-locators/`,
-   `secrets.git` if it lives there.
+| path | size | in the move |
+| --- | --- | --- |
+| `/data/caos` (repo, registry, redis, iroh state) | 21 GB | copied; the repo's objects exploded (step 4) |
+| `/data/docker` (containerd image snapshots) | 183 GB | not copied if its images can be pulled or rebuilt; the rehearsal confirms which |
+| `/data/exp`, `/data/caos-store-test` | 2.4 GB | copied or dropped |
+
+One downtime, rehearsed first on a copy as in section 2. The copy of
+`/data/caos` and the explode (2 min 16 s measured) set its length, well under
+an hour if `/data/docker` is rebuilt rather than copied.
+
+1. Attach a new volume, format it btrfs with the data disk's label
+   (`prod/caosd/configuration.nix` finds the disk by label), mount it at a
+   temporary path, `chattr +C` an empty `caos/stack/redis` on it.
+2. Stop `caosd` and dockerd.
+3. Copy everything under `/data` but `caos/stack/git/objects` (and
+   `/data/docker` if it is to be rebuilt) with `rsync -aHAX --numeric-ids`.
+   In the repo that includes config, `HEAD`, `refs/`, `packed-refs`, `logs/`
+   (repair restores refs from reflogs), `hooks/`, `caos-imports/`,
+   `caos-commit-checks/`, `caos-locators/`, and `secrets.git` if it lives
+   there.
 4. Explode every object into the new `objects/`:
    `git cat-file --batch-all-objects --batch-check='%(objectname)'` in the old
    repo, piped as names to `pack-objects --stdout --window=0`, piped to
@@ -269,11 +313,12 @@ One downtime of roughly 10 minutes, rehearsed first on a copy as in section 2.
    not matter: the server is down, and a failure means start again.
 5. Verify: the object count matches, 2,000 sampled objects are
    byte-identical through `cat-file --batch`, and the closure check passes.
-6. Move the old repo aside (`git.pre-loose`), mount the volume at
-   `/data/caos/stack/git`, start the new server version.
-7. Keep `git.pre-loose` for two weeks. Rollback: stop, copy the new volume's
-   loose objects into the old repo's `objects/` (old servers read loose
-   objects fine), swap back, start the old version.
+6. Deploy the configuration with the new volume as `/data` and a server
+   with this change; start.
+7. Keep the old volume for two weeks. Rollback: stop, copy the new repo's
+   loose objects into the old volume's `objects/` (old servers read loose
+   objects fine), swap the volumes back, deploy the old configuration and
+   server.
 
 The side repos' `objects/info/alternates` hold the canonical path of the
 server's `objects/`, which is the same after the swap.
@@ -288,6 +333,24 @@ server's `objects/`, which is the same after the swap.
 3. Power-cut test of `publish_loose` on btrfs.
 4. `prod/caosd/configuration.nix`: the volume; the watchdog alert.
 5. Rehearse the migration on a copy, then run it.
+6. **TODO, once every server sharing a repository runs this build (prod,
+   the host stack and every dev stack on it): harden the server against
+   changes to the repository's git config.** This build stops writing the
+   config; nothing yet stops anyone else from writing it, and a setting there
+   (a `core.hooksPath`, an `unpackLimit`, a `gc.auto`) reaches every git that
+   does not carry the server's environment. Do then:
+   - make the repository's `config` immutable on the host and prod
+     (`chattr +i`, root): file mode alone does not stop git, which rewrites a
+     config by lock and rename. It cannot happen earlier, because servers
+     before this build rewrite the config at every start and stop when they
+     cannot;
+   - have the server check at start that `config` is unchanged from what it
+     expects (no `core.hooksPath`, no maintenance or unpack settings that
+     contradict `git_settings`) and refuse to start, naming the setting,
+     rather than run with it;
+   - a test that a server started on an existing repository leaves its
+     `config` and `hooks/` byte-identical (the unit test covers the settings
+     path; this covers the whole start-up).
 
 ## 8. Open questions
 

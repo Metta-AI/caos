@@ -47,19 +47,20 @@ pub(crate) fn post_object(config: &Config, body: &[u8]) -> Result<Vec<u8>, HttpE
     let repo = config.repo.to_thread_local();
     let (kind, content) = parse_posted_object(body)?;
     let id = match kind {
-        gix::object::Kind::Blob => repo
-            .write_blob(content)
-            .map_err(|err| HttpError::new(500, format!("failed to write blob: {err}")))?
-            .detach(),
+        gix::object::Kind::Blob => write(config, kind, content)
+            .map_err(|err| HttpError::new(500, format!("failed to write blob: {err}")))?,
         gix::object::Kind::Tree => {
             // Validate the canonical tree encoding before writing it as a real
             // tree object (so its hash is a genuine git tree hash).
             let tree = gix::objs::TreeRef::from_bytes(content, repo.object_hash())
                 .map_err(|err| HttpError::new(400, format!("invalid tree: {err}")))?;
             validate_tree_dependencies(&repo, &tree)?;
-            repo.write_object(&tree)
+            use gix::objs::WriteTo;
+            let mut encoded = Vec::with_capacity(content.len());
+            tree.write_to(&mut encoded)
+                .map_err(|err| HttpError::new(500, format!("failed to encode tree: {err}")))?;
+            write(config, kind, &encoded)
                 .map_err(|err| HttpError::new(500, format!("failed to write tree: {err}")))?
-                .detach()
         }
         gix::object::Kind::Commit => {
             // Validate the commit encoding, then store the *raw* bytes (rather
@@ -68,7 +69,7 @@ pub(crate) fn post_object(config: &Config, body: &[u8]) -> Result<Vec<u8>, HttpE
             gix::objs::CommitRef::from_bytes(content, repo.object_hash())
                 .map_err(|err| HttpError::new(400, format!("invalid commit: {err}")))?;
             validate_commit_with_git(config, content)?;
-            gix::objs::Write::write_buf(&repo.objects, gix::object::Kind::Commit, content)
+            write(config, kind, content)
                 .map_err(|err| HttpError::new(500, format!("failed to write commit: {err}")))?
         }
         other => {
@@ -78,7 +79,17 @@ pub(crate) fn post_object(config: &Config, body: &[u8]) -> Result<Vec<u8>, HttpE
             ))
         }
     };
-    Ok(format!("{}\n", sync_loose_object(config, id)).into_bytes())
+    Ok(format!("{id}\n").into_bytes())
+}
+
+/// Store one object, durably, as a level-0 loose object (see [`crate::loose`]).
+/// Its references are the caller's to have checked.
+fn write(config: &Config, kind: gix::object::Kind, data: &[u8]) -> std::io::Result<gix::ObjectId> {
+    crate::loose::write_durable(
+        &std::path::Path::new(&config.git_dir).join("objects"),
+        kind,
+        data,
+    )
 }
 
 /// Validate only posted commit objects with Git, before publishing their bytes.
@@ -219,47 +230,6 @@ fn validate_tree_dependencies(
     Ok(())
 }
 
-/// Force a just-written loose object to disk, returning the id unchanged.
-///
-/// gix publishes a loose object by `rename()`ing a temp file into place and
-/// never fsyncs it (`gix-odb`'s loose store calls `persist` and stops there; it
-/// honours no `core.fsync`, so the repo config `main` sets covers git's writes
-/// and not these). That is the pattern that hands ext4 a zero-length file after
-/// an unclean shutdown, which is worse than a lost object — see [`crate::repair`].
-///
-/// The rename has already happened by the time we are called, so this cannot
-/// make the publish atomic; a crash in the microseconds between the two still
-/// leaves an empty file. What it does is shrink the exposure from ext4's ~30s
-/// writeback delay to that gap, and `repair` sweeps whatever still slips through.
-/// Fixing it properly means writing loose objects ourselves — temp file, fsync,
-/// rename, fsync the directory — rather than borrowing gix's writer.
-///
-/// Best-effort: a failed fsync is a durability problem, not a correctness one
-/// (the object is stored and readable right now), so it warns rather than
-/// failing a request that otherwise succeeded.
-fn sync_loose_object(config: &Config, id: gix::ObjectId) -> gix::ObjectId {
-    let hex = id.to_string();
-    let dir = std::path::Path::new(&config.git_dir)
-        .join("objects")
-        .join(&hex[..2]);
-    let path = dir.join(&hex[2..]);
-    // No loose file means the object was already packed, and a pack is the
-    // business of whoever wrote it.
-    if !path.exists() {
-        return id;
-    }
-    // Through a read-only handle: loose objects are mode 0444, so there is no
-    // writable one to be had, and fsync(2) flushes the file whatever the open
-    // mode. The directory too — otherwise the data is durable but the name that
-    // reaches it is not.
-    for target in [path.as_path(), dir.as_path()] {
-        if let Err(err) = std::fs::File::open(target).and_then(|file| file.sync_all()) {
-            eprintln!("warning: cannot fsync {}: {err}", target.display());
-        }
-    }
-    id
-}
-
 /// Split a posted serialized object into its type and content, validating the
 /// header (`<type> <size>\0`).
 fn parse_posted_object(body: &[u8]) -> Result<(gix::object::Kind, &[u8]), HttpError> {
@@ -292,13 +262,7 @@ fn parse_posted_object(body: &[u8]) -> Result<(gix::object::Kind, &[u8]), HttpEr
 /// shape matches what a client would POST, so the hashes — and therefore the
 /// cache keys — are identical no matter who builds the request.
 pub(crate) fn store_git_blob(config: &Config, content: &[u8]) -> Result<gix::ObjectId, String> {
-    let repo = config.repo.to_thread_local();
-    let id = match repo.write_blob(content) {
-        Ok(id) => id.detach(),
-        Err(e) => stored_despite(&repo, gix::objs::Kind::Blob, content)
-            .ok_or_else(|| format!("writing blob: {e}"))?,
-    };
-    Ok(sync_loose_object(config, id))
+    write(config, gix::object::Kind::Blob, content).map_err(|e| format!("writing blob: {e}"))
 }
 
 /// Encode `entries` as a git tree (sorted into git's required order) and store
@@ -320,37 +284,13 @@ pub(crate) fn store_git_tree(
         }
     }
     let tree = gix::objs::Tree { entries };
-    let id = match repo.write_object(&tree) {
-        Ok(id) => id.detach(),
-        Err(e) => {
-            use gix::objs::WriteTo;
-            let mut data = Vec::new();
-            tree.write_to(&mut data)
-                .map_err(|e| format!("encoding tree: {e}"))?;
-            stored_despite(&repo, gix::objs::Kind::Tree, &data)
-                .ok_or_else(|| format!("writing tree: {e}"))?
-        }
-    };
-    Ok(sync_loose_object(config, id))
-}
-
-/// The content-addressed escape for a failed object write: concurrent requests
-/// writing the SAME object race on the loose-object rename, and gix (except on
-/// Windows) surfaces the losing racer's persist failure even though the winner
-/// stored the content — observed under the suite's cold parallel load. Return
-/// the id iff the object is genuinely in the store now.
-///
-/// Asks by READING the object's header, not `has_object`: gix answers that one
-/// for a loose object by testing whether the path exists, so a zero-length file
-/// left by a crash passes it, and this escape hatch would report a poisoned
-/// object as safely stored (see [`crate::repair`]).
-fn stored_despite(
-    repo: &gix::Repository,
-    kind: gix::objs::Kind,
-    data: &[u8],
-) -> Option<gix::ObjectId> {
-    let id = gix::objs::compute_hash(repo.object_hash(), kind, data).ok()?;
-    repo.find_header(id).is_ok().then_some(id)
+    use gix::objs::WriteTo;
+    let mut data = Vec::new();
+    tree.write_to(&mut data)
+        .map_err(|e| format!("encoding tree: {e}"))?;
+    // Concurrent requests writing the SAME tree both succeed: the loose writer
+    // renames identical content over itself (see `loose::write_durable`).
+    write(config, gix::object::Kind::Tree, &data).map_err(|e| format!("writing tree: {e}"))
 }
 
 /// Fetch and parse a git tree from the in-process object database.
