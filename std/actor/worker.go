@@ -194,12 +194,12 @@ func publish(stateRef, head, newState string) {
 	if old == "" {
 		old = absent
 	}
-	complaint, err := setRef(stateRef, old, candidate)
+	complaint, err := setRef(stateRef, old, "/cas/new-commit")
 	if err == nil {
 		return
 	}
 	// Ambiguous or refused: re-read the ref to learn what actually happened.
-	switch observed := readRef(stateRef); {
+	switch observed := readRef(stateRef, "/cas/observed-head"); {
 	case observed == candidate:
 		return
 	case observed == head:
