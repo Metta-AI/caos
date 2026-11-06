@@ -3887,7 +3887,10 @@ fn check_ref_name(verb: &str, name: &str) -> Result<(), String> {
 /// [`REF_ABSENT`].
 fn check_ref_value(verb: &str, what: &str, value: &str) -> Result<(), String> {
     if value == REF_ABSENT
-        || (value.len() == 40 && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        || (value.len() == 40
+            && value
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
     {
         Ok(())
     } else {
