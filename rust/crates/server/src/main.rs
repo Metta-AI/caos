@@ -351,24 +351,12 @@ fn main() {
         );
     }
 
-    // Both steps below read every object in the store, which on a long-lived
+    // The check below reads every object in the store, which on a long-lived
     // repo takes minutes: far too long to pay on every start, and a test stack
     // has nothing to check. `caosd` opts in (CAOS_STACK_STORE_CHECK); no other
-    // placement does.
+    // placement does. There is no repack here any more: the store is never
+    // packed (design/loose-object-store.md).
     if env_or("CAOS_STORE_CHECK", "no") == "yes" {
-        // This is the coordinated downtime the pack-count TODO above asks for:
-        // every push leaves a pack, and every object read costs more with each
-        // one. `--geometric=2` merges the small recent packs and keeps ALL CAS
-        // objects, including unreferenced ones (it works from the packs, never
-        // from refs; plain `-a -d` without `--keep-unreachable` would drop
-        // them). Unlike `-a`, it leaves an already-consolidated store alone, so
-        // a restart costs a fraction of a second instead of rewriting it.
-        run_required_git(&["-C", &git_dir, "repack", "--geometric=2", "-d", "-q"]).unwrap_or_else(
-            |error| {
-                eprintln!("fatal: repacking the object store: {error}");
-                std::process::exit(1);
-            },
-        );
         // Older servers accepted individual commits without their
         // dependencies. Check all objects, including unreferenced ones, before
         // trusting existence as proof of closure. Never delete history to make
