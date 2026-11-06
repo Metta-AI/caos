@@ -209,11 +209,12 @@ func publish(stateRef, head, newState string) {
 	}
 }
 
-// setRef moves ref from old to new with a compare-and-swap, returning the
-// server's complaint rather than failing: a refusal (a stale old value) and an
-// ambiguous outcome (the reply lost) are told apart by re-reading the ref.
-func setRef(ref, old, new string) (string, error) {
-	cmd := exec.Command("caos", "ref-set", ref, new, "--expected="+old)
+// setRef moves ref from old to the commit recorded at the CAS path newPath
+// with a compare-and-swap, returning the server's complaint rather than
+// failing: a refusal (a stale old value) and an ambiguous outcome (the reply
+// lost) are told apart by re-reading the ref.
+func setRef(ref, old, newPath string) (string, error) {
+	cmd := exec.Command("caos", "ref-set", ref, "--new:@="+newPath, "--expected="+old)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	err := cmd.Run()
