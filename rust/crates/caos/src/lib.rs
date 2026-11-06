@@ -3978,6 +3978,64 @@ pub fn caos_ref_set(t: &dyn Transport, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The longest `ref-then --timeout` the server accepts (its `refs::MAX_WAIT_SECS`).
+pub const REF_MAX_WAIT_SECS: u64 = 24 * 60 * 60;
+
+/// `ref-then <ref> [--expected=<hash|absent>] [--timeout=<secs>]
+/// [--then:<type>=<image>] [--catch]` — record a continuation that waits for
+/// `<ref>` to hold something other than `--expected` (default `absent`: wait
+/// for it to be set), then delivers the new value.
+///
+/// THE WAITING IS THE SERVER'S. Like every continuation this is the worker's
+/// final act: it exits, its runner slot is free, and the server's promise
+/// interpreter blocks a request thread on the ref instead. A worker that
+/// polled with `ref-get` in a loop would hold its slot while the writer it is
+/// waiting for may be queued for one — the hold-and-wait design/map-then.md
+/// rules out.
+///
+/// The new value reaches `--then` as `--result`, a blob holding what `ref-get`
+/// would print (`<oid>` or `absent`, and a newline); with no `--then` that
+/// blob is this request's result. If `--timeout` (default 600s, at most a
+/// day) passes first the wait fails, and `--catch` delivers that failure to
+/// `--then` as `--error` instead. A request that waited on a ref is never
+/// cached: its answer depends on when it ran.
+pub fn caos_ref_then(t: &dyn Transport, name: &str, kvs: &[String]) -> Result<(), String> {
+    check_ref_name("ref-then", name)?;
+    for kv in kvs {
+        if let Some(value) = kv.strip_prefix("--expected=") {
+            check_ref_value("ref-then", "--expected", value)?;
+        }
+        if let Some(value) = kv.strip_prefix("--timeout=") {
+            match value.parse::<u64>() {
+                Ok(seconds) if (1..=REF_MAX_WAIT_SECS).contains(&seconds) => {}
+                _ => {
+                    return Err(format!(
+                        "`ref-then --timeout` wants whole seconds from 1 to {REF_MAX_WAIT_SECS}, got {value:?}"
+                    ))
+                }
+            }
+        }
+    }
+    record_continuation(
+        t,
+        "ref-then",
+        ContinuationSubject::Ref(name),
+        kvs,
+        &["then"],
+        &["expected", "timeout"],
+        &["catch"],
+        |given| {
+            if given.contains(&"catch") && !given.contains(&"then") {
+                return Err(
+                    "`ref-then --catch` needs --then: the error has to be delivered somewhere"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        },
+    )
+}
+
 /// `trace-child <name> <arg-tree>` — record, under THIS job's trace record, that
 /// it started `arg-tree` under `name`.
 ///
