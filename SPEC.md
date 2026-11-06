@@ -371,8 +371,13 @@ TOOL taking a hash (`caos-test` and `caos-test-result`), not as richer printing.
 
 ## Writers
 
-A tool that declares `@writer` PROPOSES A CHANGE to the tree it was run on
-instead of returning a value. Its result is `{prop, out, message?, failed?}`:
+A tool that declares `@writer` PROPOSES A CHANGE instead of returning a value.
+With `@root`, which every std writer declares, its result is a tree of
+`stdout`, `failed`, `root` or `deleted`, and `commit-message`; the harness puts
+the new object at the root path and rewrites everything above it
+(design/tool-contract.md, "The result" and "Applying a writer's result"). A
+writer without `@root` still returns the older `{prop, out, message?,
+failed?}`, applied to the tree its path selected:
 
 - `prop` — the proposal. A TREE, and the harness mints the commit, which is
   what lets almost every writer never handle a commit at all; or a COMMIT, for
