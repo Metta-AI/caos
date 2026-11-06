@@ -655,6 +655,7 @@ fn env_or(key: &str, default: &str) -> String {
 }
 
 /// An error that maps cleanly onto an HTTP status code + body.
+#[derive(Debug)]
 pub(crate) struct HttpError {
     status: u16,
     message: String,
