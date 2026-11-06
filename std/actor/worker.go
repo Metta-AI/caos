@@ -4,7 +4,7 @@
 //
 // `Q = actor { state-ref, inner, request-id, message }` has two positions:
 //
-//   - start reads the branch head (`git ls-remote`, then a depth-1 `tree:0`
+//   - start reads the branch head (`caos ref-get`, then a depth-1 `tree:0`
 //     fetch of that one commit), takes the `state/` subtree oid from the head,
 //     builds the inner request and tail-calls it with Q (plus the observed head
 //     and the input state) as the callback;
