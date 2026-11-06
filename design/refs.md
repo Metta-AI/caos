@@ -60,8 +60,8 @@ caos ref-set <ref> (--new=<hash> | --new:@=<cas-path> | --delete)
 ## Waiting: `ref-then`
 
 ```text
-caos ref-then <ref> [--expected=<hash|absent>] [--timeout=<secs>]
-              [--then:<type>=<image>] [--catch]
+caos ref-then <ref> [--expected=<hash|absent> | --expected:@=<cas-path>]
+              [--timeout=<secs>] [--then:<type>=<image>] [--catch]
 ```
 
 A worker that needs to wait for another job to move a ref must not poll for
