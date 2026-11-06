@@ -277,8 +277,8 @@ proposal is discarded as a value, so the edit simply does not happen, with no
 error anywhere. `@params x` is likewise not `@param` with `s x` after it; it
 once minted an arg named `s` and lost the real one.
 
-Arg names are `[a-z][a-z0-9-]*`. `in`, `worker1`, `base`, `salt`, `wc`, `refs`
-and `help` are refused: the interpreter, or the tool's own expression, binds
+Arg names are `[a-z][a-z0-9-]*`. `worker1`, `base`, `salt` and `help` are
+refused: the interpreter, or the tool's own expression, binds
 those itself and currying SHALL fail on a rebind. A malformed `@param` tag is
 skipped with a message, never silently turned into an arg the model cannot use.
 
