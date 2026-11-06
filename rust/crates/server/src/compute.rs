@@ -1679,8 +1679,9 @@ fn resolve_promise(
         // the writer it is waiting for runs. The value travels as the blob
         // `ref-get` would print; a timeout is a failure `catch` can deliver.
         crate::refs::validate_name(name)?;
-        let from = crate::refs::Value::parse(ref_expected.as_deref().unwrap_or(crate::refs::ABSENT))
-            .map_err(|e| HttpError::new(400, format!("continuation {cont}: expected: {e}")))?;
+        let from =
+            crate::refs::Value::parse(ref_expected.as_deref().unwrap_or(crate::refs::ABSENT))
+                .map_err(|e| HttpError::new(400, format!("continuation {cont}: expected: {e}")))?;
         let seconds = match ref_timeout.as_deref() {
             None => REF_WAIT_DEFAULT_SECS,
             Some(text) => match text.parse::<u64>() {
@@ -1696,14 +1697,18 @@ fn resolve_promise(
                 }
             },
         };
-        let waited =
-            crate::refs::wait_for_change(&config.git_dir, name, &from, Duration::from_secs(seconds))
-                .map_err(|e| HttpError::new(500, e))
-                .and_then(|value| {
-                    store_git_blob(config, format!("{}\n", value.text()).as_bytes())
-                        .map(|oid| format!("blob {oid}"))
-                        .map_err(|e| HttpError::new(500, format!("storing ref value blob: {e}")))
-                });
+        let waited = crate::refs::wait_for_change(
+            &config.git_dir,
+            name,
+            &from,
+            Duration::from_secs(seconds),
+        )
+        .map_err(|e| HttpError::new(500, e))
+        .and_then(|value| {
+            store_git_blob(config, format!("{}\n", value.text()).as_bytes())
+                .map(|oid| format!("blob {oid}"))
+                .map_err(|e| HttpError::new(500, format!("storing ref value blob: {e}")))
+        });
         Some(continuation_result(config, cont, waited, catch)?)
     } else {
         None

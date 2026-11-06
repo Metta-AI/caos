@@ -249,7 +249,10 @@ pub(crate) fn set(
     }
     Err(HttpError::new(
         500,
-        format!("moving {name} to {}: git update-ref failed: {stderr}", new.text()),
+        format!(
+            "moving {name} to {}: git update-ref failed: {stderr}",
+            new.text()
+        ),
     ))
 }
 
@@ -365,10 +368,8 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let dir = std::env::temp_dir().join(format!(
-                "caos-refs-{tag}-{}-{nanos}",
-                std::process::id()
-            ));
+            let dir = std::env::temp_dir()
+                .join(format!("caos-refs-{tag}-{}-{nanos}", std::process::id()));
             let status = Command::new("git")
                 .args(["init", "-q", "--bare"])
                 .arg(&dir)
@@ -395,7 +396,12 @@ mod tests {
                 .stdout(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
-            child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(stdin.as_bytes())
+                .unwrap();
             let output = child.wait_with_output().unwrap();
             assert!(output.status.success(), "git {args:?}");
             String::from_utf8(output.stdout).unwrap().trim().to_string()
@@ -421,7 +427,13 @@ mod tests {
         assert_eq!(read(repo.path(), REF).unwrap(), Value::Absent);
         let c = repo.commit("below");
         set(repo.path(), &format!("{REF}y"), &c, &Expected::Any).unwrap();
-        set(repo.path(), "refs/heads/tests/refs/x2/y", &c, &Expected::Any).unwrap();
+        set(
+            repo.path(),
+            "refs/heads/tests/refs/x2/y",
+            &c,
+            &Expected::Any,
+        )
+        .unwrap();
         assert_eq!(read(repo.path(), REF).unwrap(), Value::Absent);
     }
 
@@ -471,11 +483,17 @@ mod tests {
         let tree = repo.git(&["mktree"], "");
         let not_commit = set(repo.path(), REF, &Value::Oid(tree), &Expected::Any).unwrap_err();
         assert_eq!(not_commit.status, 400);
-        assert!(not_commit.message().contains("is a tree"), "{}", not_commit.message());
+        assert!(
+            not_commit.message().contains("is a tree"),
+            "{}",
+            not_commit.message()
+        );
 
         let missing = Value::Oid("1".repeat(40));
         assert_eq!(
-            set(repo.path(), REF, &missing, &Expected::Any).unwrap_err().status,
+            set(repo.path(), REF, &missing, &Expected::Any)
+                .unwrap_err()
+                .status,
             400
         );
     }
@@ -516,12 +534,16 @@ mod tests {
                 set(&path, REF, &a, &Expected::Is(Value::Absent)).unwrap();
             })
         };
-        let seen = wait_for_change(repo.path(), REF, &Value::Absent, Duration::from_secs(30))
-            .unwrap();
+        let seen =
+            wait_for_change(repo.path(), REF, &Value::Absent, Duration::from_secs(30)).unwrap();
         writer.join().unwrap();
         assert_eq!(seen, a);
         // Woken by the write, not by the once-a-second recheck.
-        assert!(started.elapsed() < Duration::from_millis(900), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "{:?}",
+            started.elapsed()
+        );
 
         // Already different: no wait at all.
         assert_eq!(
