@@ -179,14 +179,10 @@ describes it and `run_tool` runs it. Registering it as well would be a second wa
 to call one thing, and the two can disagree about which version runs — the
 harness's copy against the tree's. So the registry holds only what implements no
 entry and therefore has no path: the file tools, `grep`, the git readers, the
-subagent and async tools, `import_source`, `publish_source`, and
-`tool_help`/`run_tool` themselves. `std/README.md` is the index for the rest.
-
-`merge` is the one exception, and the reason is what its target is. Every other
-std tool reads a TREE, which `@in` lets a caller name; `merge` writes a merge
-commit INTO a source tree and so needs that tree's commit as `ours`. Nothing but
-the step's own routing supplies one and `run_tool` names no source tree, so merge
-cannot be reached by path yet and registering it is the only way to have it.
+subagent and async tools, and `tool_help`/`run_tool` themselves. `std/README.md`
+is the index for the rest. Importing and publishing are std entries
+(`caos-std/import-source`, `caos-std/publish-source` and the stack tools), so
+nothing registers them.
 
 ## Resolution
 
