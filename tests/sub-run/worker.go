@@ -244,6 +244,6 @@ func test() {
 		w.Report("sub-run: ALL PASS\n")
 
 	default:
-		w.True(false, "unknown --stage %q (%s)", stage, strconv.Quote(stage))
+		w.True(false, "unknown --stage %q", stage)
 	}
 }
