@@ -1445,6 +1445,9 @@ fn resolve_promise(
     let mut request: Option<String> = None;
     let (mut map, mut run, mut then) = (None, None, None);
     let mut eval = None;
+    // `ref-then`: the ref to wait on, the value it is waiting to leave, and
+    // how long it may wait (design/refs.md).
+    let (mut ref_name, mut ref_expected, mut ref_timeout) = (None, None, None);
     let mut catch = false;
     let mut max_parallel: Option<usize> = None;
     for entry in fetch_tree(config, cont)
