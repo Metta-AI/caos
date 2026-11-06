@@ -28,7 +28,8 @@ use std::path::{Path, PathBuf};
 ///
 /// Runs BEFORE anything opens the repo, so gix never caches one of these as
 /// present: its loose-object lookup is a path-exists check, which an empty file
-/// passes (see `storage::stored_despite`, which had the same blind spot).
+/// passes. The server's own writer (`loose::write_durable`) fsyncs before it
+/// renames, so it leaves none of these; git's writes and older servers can.
 pub(crate) fn sweep_empty_loose_objects(git_dir: &str) -> usize {
     let objects = Path::new(git_dir).join("objects");
     let Ok(fanout) = std::fs::read_dir(&objects) else {
