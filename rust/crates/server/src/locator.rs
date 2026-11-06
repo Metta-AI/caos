@@ -52,7 +52,7 @@ use git_locator::GitRef;
 use crate::Config;
 
 /// Where a resolved pin is recorded. Hidden from ref advertisement
-/// (`configure_ref_advertisements`): it is a memo, not something a client
+/// (`git_settings` in main): it is a memo, not something a client
 /// fetches by name.
 pub(crate) const TREE_REF_PREFIX: &str = "refs/caos/locator-trees/";
 
