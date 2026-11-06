@@ -1280,6 +1280,45 @@ mod tests {
     }
 
     #[test]
+    fn publish_hook_is_installed_and_refuses_a_foreign_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "caos-publish-hook-test-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        run_required_git(&["init", "-q", "--bare", dir.to_str().unwrap()]).unwrap();
+        let git_dir = dir.to_str().unwrap();
+        let hook = dir.join("hooks/pre-receive");
+
+        install_publish_hook(git_dir).unwrap();
+        let installed = std::fs::read_to_string(&hook).unwrap();
+        assert!(installed.contains(crate::loose::HOOK_MARKER));
+        assert!(installed.contains(crate::loose::HOOK_ARG));
+        // Idempotent, and a stale managed copy is rewritten.
+        install_publish_hook(git_dir).unwrap();
+        std::fs::write(&hook, format!("#!/bin/sh\n{}\nexit 0\n", crate::loose::HOOK_MARKER))
+            .unwrap();
+        install_publish_hook(git_dir).unwrap();
+        assert_eq!(std::fs::read_to_string(&hook).unwrap(), installed);
+
+        // Without the server's name in its environment, the hook declines.
+        let declined = Command::new("sh").arg(&hook).env_remove(crate::loose::SERVER_EXE_ENV).output().unwrap();
+        assert!(!declined.status.success());
+
+        // A hook that is not ours stops the server rather than being replaced.
+        std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+        let error = install_publish_hook(git_dir).unwrap_err();
+        assert!(error.contains("not caos's"), "{error}");
+        std::fs::remove_file(&hook).unwrap();
+
+        // So does a hooks path that sends git elsewhere.
+        run_required_git(&["-C", git_dir, "config", "core.hooksPath", "/elsewhere"]).unwrap();
+        let error = install_publish_hook(git_dir).unwrap_err();
+        assert!(error.contains("core.hooksPath"), "{error}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn unmanaged_pre_receive_hook_and_path_are_preserved() {
         let dir =
             std::env::temp_dir().join(format!("caos-unmanaged-hook-test-{}", std::process::id()));
