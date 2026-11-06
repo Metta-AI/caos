@@ -1,5 +1,5 @@
-//! Named, mutable refs that a worker reads and moves: `GET /ref`, `POST /ref`,
-//! and the wait behind `caos ref-then` (design/refs.md).
+//! Named, mutable refs that a worker reads and moves: `GET /ref` and
+//! `POST /ref` (design/refs.md).
 //!
 //! Everything else in the store is addressed by content. These are the one
 //! deliberate exception a worker is offered, for state that has to outlive a
