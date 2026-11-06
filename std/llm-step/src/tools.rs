@@ -199,14 +199,6 @@ impl TreeTool {
     /// A named tool from its parsed help.
     fn new(name: &str, help: Help) -> TreeTool {
         let mut args = help.args;
-        if help.wants_in {
-            args.push(TreeArg {
-                name: "in".to_string(),
-                doc: IN_DOC.to_string(),
-                required: false,
-                ty: ArgType::Tree,
-            });
-        }
         if help.root && !args.iter().any(|a| a.name == ROOT) {
             // First, because it is what the call is about.
             args.insert(
