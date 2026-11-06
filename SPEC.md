@@ -340,46 +340,6 @@ declares no `@root` either has no input beyond its own expression.
   then bytes in a file
 - An `{array}` parameter arrives as one blob of NEWLINE-SEPARATED elements
 
-**`in` is bound only for a tool that declared `@in`**, and the reason is the
-cache key. A tree is the biggest thing that can enter an ArgTree, so binding
-one a tool never reads makes it re-key on every edit to a tree it ignores:
-`caos-test-result`, whose entire input is a hash, could not hit the memo twice
-in a row. `grep` has always done this right — it binds only the scope it
-searches, which is why a scoped grep is cheap — and every reader now follows it.
-
-A tool whose `in` is something it BUILDS rather than the tree it was run on
-declares no `@in`: `grep`'s is the scope it searches, bound by its own dispatch.
-
-**`@in` makes the input a PARAMETER, so a caller can redirect it.** The tag
-gives the tool an optional `{tree}` argument named `in`, listed by `tool_help`;
-supplying it runs the tool over THAT tree, and omitting it falls back to the
-tree the tool's own path selected. Without this the input is derived from where
-a tool happens to SIT, which is wrong for any tool the session itself
-generated — a `caos-build` mounted at `caos-std/` could only ever build
-`caos-std/`, never the source tree you meant. A tool may not declare `@param
-in` by hand: `in` is what the interpreter binds, and `@in` is how to ask for it.
-
-However it arrives, `in` is bound in exactly ONE place — the request — because
-`caos curry` refuses a rebind, and binding the caller's tree onto the tool's
-curry while the request bound the default would be exactly that.
-
-**`@git` reaches only a DISPATCHED READER, and both halves matter.** An
-in-process built-in is handed the session's store directly and ignores the
-tag — `log`, `show` and `diff` declared it for years and it did nothing for
-them. And a WRITER's input commit is not a caller's to choose: its proposal must
-descend from the commit whose pointer is being advanced, so the input commit is
-pinned to the scope rather than offered as a parameter. `merge`, the one tool
-that really needs it, takes it as `ours` bound by the launch — "a model naming
-it would be naming the session it is already in" — which is also why the
-generic tag has no users: the tool that needed the input commit predates it and
-binds it under a name of its own.
-
-So the four combinations are not symmetric:
-
-| | tree | commit |
-|---|---|---|
-| reader's input | `@in` — defaulted, overridable | `@git` — what it is for; no users yet |
-| writer's input | — | pinned to the scope, never a parameter |
 
 ## Returning a result
 
