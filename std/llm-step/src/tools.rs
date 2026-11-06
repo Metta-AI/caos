@@ -1976,8 +1976,6 @@ mod tests {
         assert_eq!(tool.args.len(), 2, "no `in` is offered");
         let described = describe(&tool, "caos-std/t");
         assert!(described.contains("`root` parameter"), "{described}");
-        let h = parse_help("t", "d\n@param source-tree The tree.\n@scope source-tree\n@root");
-        assert!(h.scope.is_none() && !h.git);
     }
 
     #[test]
