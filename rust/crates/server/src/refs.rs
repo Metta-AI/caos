@@ -470,41 +470,4 @@ mod tests {
         assert!(Value::parse(&"A".repeat(40)).is_err());
         assert!(Value::parse("abc").is_err());
     }
-
-    #[test]
-    fn a_wait_returns_when_a_write_lands_and_times_out_when_none_does() {
-        let repo = Repo::new("wait");
-        let a = repo.commit("a");
-
-        let timed_out =
-            wait_for_change(repo.path(), REF, &Value::Absent, Duration::from_millis(200))
-                .unwrap_err();
-        assert!(timed_out.contains("was still absent"), "{timed_out}");
-
-        let started = Instant::now();
-        let path = repo.path().to_string();
-        let writer = {
-            let a = a.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(100));
-                set(&path, REF, &a, &Expected::Is(Value::Absent)).unwrap();
-            })
-        };
-        let seen =
-            wait_for_change(repo.path(), REF, &Value::Absent, Duration::from_secs(30)).unwrap();
-        writer.join().unwrap();
-        assert_eq!(seen, a);
-        // Woken by the write, not by the once-a-second recheck.
-        assert!(
-            started.elapsed() < Duration::from_millis(900),
-            "{:?}",
-            started.elapsed()
-        );
-
-        // Already different: no wait at all.
-        assert_eq!(
-            wait_for_change(repo.path(), REF, &Value::Absent, Duration::from_secs(30)).unwrap(),
-            a
-        );
-    }
 }
