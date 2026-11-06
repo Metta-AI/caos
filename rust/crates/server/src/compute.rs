@@ -1670,11 +1670,47 @@ fn resolve_promise(
                 )
             });
         Some(continuation_result(config, cont, evaluated, catch)?)
+    } else if let Some(name) = &ref_name {
+        // Wait, on THIS request thread, for the ref to leave the value the
+        // worker saw. The worker has exited, so no runner slot is held while
+        // the writer it is waiting for runs. The value travels as the blob
+        // `ref-get` would print; a timeout is a failure `catch` can deliver.
+        crate::refs::validate_name(name)?;
+        let from = crate::refs::Value::parse(ref_expected.as_deref().unwrap_or(crate::refs::ABSENT))
+            .map_err(|e| HttpError::new(400, format!("continuation {cont}: expected: {e}")))?;
+        let seconds = match ref_timeout.as_deref() {
+            None => REF_WAIT_DEFAULT_SECS,
+            Some(text) => match text.parse::<u64>() {
+                Ok(n) if (1..=crate::refs::MAX_WAIT_SECS).contains(&n) => n,
+                _ => {
+                    return Err(HttpError::new(
+                        400,
+                        format!(
+                            "continuation {cont}: timeout must be whole seconds from 1 to {}, got {text:?}",
+                            crate::refs::MAX_WAIT_SECS
+                        ),
+                    ))
+                }
+            },
+        };
+        let waited =
+            crate::refs::wait_for_change(&config.git_dir, name, &from, Duration::from_secs(seconds))
+                .map_err(|e| HttpError::new(500, e))
+                .and_then(|value| {
+                    store_git_blob(config, format!("{}\n", value.text()).as_bytes())
+                        .map(|oid| format!("blob {oid}"))
+                        .map_err(|e| HttpError::new(500, format!("storing ref value blob: {e}")))
+                });
+        Some(continuation_result(config, cont, waited, catch)?)
     } else {
         None
     };
 
-    let caught = mid.as_ref().is_some_and(|(_, _, caught)| *caught);
+    // A REF WAIT IS NEVER CACHED, caught or not: what it answers depends on
+    // when it ran, not on its ArgTree, so a memoized answer would hand the
+    // next caller a value the ref may no longer hold — and skip the wait. The
+    // same flag a caught failure sets keeps it out of the cache.
+    let caught = mid.as_ref().is_some_and(|(_, _, caught)| *caught) || ref_name.is_some();
 
     // The promise type, for the record. A continuation with only a `then` has
     // no middle step at all (a plain tail call), which is a shape in its own
