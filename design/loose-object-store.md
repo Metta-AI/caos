@@ -333,6 +333,24 @@ server's `objects/`, which is the same after the swap.
 3. Power-cut test of `publish_loose` on btrfs.
 4. `prod/caosd/configuration.nix`: the volume; the watchdog alert.
 5. Rehearse the migration on a copy, then run it.
+6. **TODO, once every server sharing a repository runs this build (prod,
+   the host stack and every dev stack on it): harden the server against
+   changes to the repository's git config.** This build stops writing the
+   config; nothing yet stops anyone else from writing it, and a setting there
+   (a `core.hooksPath`, an `unpackLimit`, a `gc.auto`) reaches every git that
+   does not carry the server's environment. Do then:
+   - make the repository's `config` immutable on the host and prod
+     (`chattr +i`, root): file mode alone does not stop git, which rewrites a
+     config by lock and rename. It cannot happen earlier, because servers
+     before this build rewrite the config at every start and stop when they
+     cannot;
+   - have the server check at start that `config` is unchanged from what it
+     expects (no `core.hooksPath`, no maintenance or unpack settings that
+     contradict `git_settings`) and refuse to start, naming the setting,
+     rather than run with it;
+   - a test that a server started on an existing repository leaves its
+     `config` and `hooks/` byte-identical (the unit test covers the settings
+     path; this covers the whole start-up).
 
 ## 8. Open questions
 
