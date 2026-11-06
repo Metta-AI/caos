@@ -85,7 +85,7 @@ Post `APPLIED: <what>` when you do any of these.
   `caosd down` followed by `rm -rf`, `chown -R`, pruning volumes, `docker
   system prune -a`. The state tree is deliberately mixed-ownership; a blanket
   chown "fixes" the permissions and breaks the server.
-- Resizing or relabelling volumes, security groups, IAM.
+- Resizing or relabeling volumes, security groups, IAM.
 
 For these, post `NEEDS APPROVAL: <action>. Because: <evidence>. Command for
 a human: <exact command>` and finish your report. Say what you expect the

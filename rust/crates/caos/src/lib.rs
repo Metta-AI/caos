@@ -671,9 +671,9 @@ impl GitTransport {
     /// reproduction above, not by that measurement.
     ///
     /// Processes, not threads, so the claim is a file. Bounded, and a stale claim
-    /// is ignored rather than honoured — a killed pusher must not park every
+    /// is ignored rather than honored — a killed pusher must not park every
     /// later one — and if the wait runs out we push anyway, which is exactly the
-    /// behaviour this replaces.
+    /// behavior this replaces.
     fn with_push_claim<T>(&self, hash: &str, body: impl FnOnce() -> T) -> T {
         /// Long enough to cover a large first push over a relayed path (measured:
         /// 300 MB in 4m56s), because waiting out the winner is strictly cheaper
@@ -1252,7 +1252,7 @@ impl GitTransport {
     ///
     /// Read from the odb rather than shelled out, and false for anything it
     /// cannot answer: the only caller uses it to decide whether to negotiate, so
-    /// an uncertain answer must mean "don't", which is today's behaviour.
+    /// an uncertain answer must mean "don't", which is today's behavior.
     fn is_commit_object(&self, hash: &str) -> bool {
         parse_oid(hash)
             .ok()
