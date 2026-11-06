@@ -316,7 +316,7 @@ needed for one. `tool_help` states each one's name,
 whether it is required, and its documentation as prose rather than as a JSON
 schema — the model reads it, and a schema dump is the registry that was just
 removed. A tool with no `@param` tags takes no parameters, and one that
-declares no `@in` either has no input beyond its own expression.
+declares no `@root` either has no input beyond its own expression.
 
 ## Invocation
 
