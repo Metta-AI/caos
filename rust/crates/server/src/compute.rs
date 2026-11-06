@@ -66,6 +66,9 @@ const REDIS_TIMEOUT: Duration = Duration::from_secs(5);
 /// resolve rather than a final value (the hash names the continuation tree).
 const PROMISE_KIND: &str = "promise";
 
+/// How long a `ref-then` waits when it names no `--timeout`.
+const REF_WAIT_DEFAULT_SECS: u64 = 600;
+
 /// Marker entry naming a curry node — a tree pairing a `base` image ref with an
 /// `args` subtree of bound arguments (mirrors the client's `CURRY_MARKER`).
 /// Promise resolution unwraps these server-side so `map`/`then` can be
