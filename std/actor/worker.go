@@ -16,28 +16,22 @@
 //
 // Neither position checks the state out: it travels as a tree oid.
 //
-// THE BRANCH IS MOVED WITHOUT `git push`. A push is a command line
-// "<old> <new> <ref>" plus a pack, and the pack may be empty when the server
-// already has the new object, which it does: `caos put-commit` put it there.
-// So finish POSTs that one command and an empty pack to git-receive-pack, and
-// the server does the compare-and-swap (a stale <old> is answered `ng`). No
-// scratch repository, no fetch of the parent, no history. `git push` cannot
-// do this: it resolves the new commit in a local repository and walks its
-// ancestry to build a pack, which needs every ancestor commit ("a deep
-// checkout"), and a partial clone with a promisor remote does not avoid that
-// (README.md, open question 6; tests/actor-ref proves the direct route).
+// THE BRANCH IS READ AND MOVED WITH `caos ref-get` AND `caos ref-set`, not with
+// git. `ref-set --expected=<observed head>` is a compare-and-swap the server
+// checks under the ref's lock, and the new commit is already on the server
+// (`caos put-commit` put it there), so nothing is pushed: no scratch
+// repository, no fetch of the parent, no history. `git push` cannot do this:
+// it resolves the new commit in a local repository and walks its ancestry to
+// build a pack, which needs every ancestor commit (README.md, open question
+// 6). The wrapper used to speak receive-pack directly to the same effect;
+// tests/actor-ref still proves that route works for git clients.
 package main
 
 import (
 	"bytes"
-	"crypto/sha1"
-	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"caos/w"
@@ -46,7 +40,7 @@ import (
 const (
 	stateEntry = "state"
 	noHead     = "none"
-	zeros      = "0000000000000000000000000000000000000000"
+	absent     = "absent"
 	gitDir     = "/tmp/actor-git"
 )
 
