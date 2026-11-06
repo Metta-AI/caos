@@ -35,7 +35,7 @@
 # which is the failure this whole mechanism exists to avoid.
 set -euo pipefail
 
-# THE SEEDING IS SERIALISED ACROSS CONTAINERS, and this is the one place in the
+# THE SEEDING IS SERIALIZED ACROSS CONTAINERS, and this is the one place in the
 # whole scheme that needs a lock. Several of these run at once against one
 # volume (SPEC, "several of these can run at once against one store"), and while
 # nix itself is built for that — it locks per derivation and its db is sqlite —

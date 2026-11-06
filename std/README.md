@@ -72,7 +72,7 @@ needs `paths`:
 are entries under `std/`, reached as `caos-std/<name>` like any other tool. Every one of
 them takes `root`, the path it works on (design/tool-contract.md), as do `bash-tool`,
 `merge`, `move-sed`, `caos-build`, `caos-test` and `flake-update`. `llm-step` still registers its own copies for the turns it drives itself;
-those are being retired in favour of these.
+those are being retired in favor of these.
 
 `import-source`, `publish-source`, `agent-spawn`, `agent-wait`, `agent-harvest` and `run-async`
 are entries for OPERATIONS OF THE STEP (`@op` in their help): they write the session's own

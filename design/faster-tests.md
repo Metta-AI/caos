@@ -17,7 +17,7 @@ runs, so treat anything under a couple of seconds here as noise.
 A fourth pass ("The longest test", below) went after the tail — chat-offline,
 which was the whole `tests` phase on its own. It halved the longest test and
 moved the total by nothing, because by then the total was not the tail's to
-move. That is the section worth reading if you are about to optimise this
+move. That is the section worth reading if you are about to optimize this
 suite again.
 
 A later split happened under different conditions: `llm-step` had grown from
@@ -264,7 +264,7 @@ Four changes in a row were made without a measurement between them, and two of
 them broke the suite in ways that presented as SLOW rather than failed: a
 120s idle timeout that fired mid-suite, and a pre-seed inside the start lock
 that turned a lost race into a stampede. Both were diagnosed as performance
-problems before being recognised as bugs. The lesson is in the ordering — one
+problems before being recognized as bugs. The lesson is in the ordering — one
 change, one measurement — not in any of the individual fixes.
 
 The older analysis follows, and is kept because the reasoning it records is
@@ -307,7 +307,7 @@ rustc first by a factor of two, then the object movement feeding it.
 Flake-built entries are already shared and cost nothing: the flake-builder
 short-circuits on a content-keyed registry tag (`flake-<H>`, `deps-<D>`) and the
 registry is deliberately shared across test stacks (stack/serve: "a
-content-addressed registry shared across tests cannot leak behaviour, only
+content-addressed registry shared across tests cannot leak behavior, only
 work"). `merge` resolves in 2s alone despite "building" a nix flake.
 
 **rustc results have no such short-circuit.** A rustc-built entry resolves to
@@ -420,7 +420,7 @@ A and B are separate containers. Workers get their own netns on `caos-net`
 (which is what lets a test stack bind its own `:80`), so A has a real address
 there, and the only mutable namespace both can reach is the outer server's git.
 So A publishes its address to a ref and B polls until it appears; B's `then` —
-the summariser — writes the stop signal to the same ref, and A exits.
+the summarizer — writes the stop signal to the same ref, and A exits.
 
 That works because **a promise does not complete until it resolves**: B's
 `map-then` leaves a continuation, and the server does not finish B until the
@@ -605,7 +605,7 @@ Four things were fixed by reading that:
   entry point in `build-builtins.sh` plus a results cache for the two loops —
   real structure for ~10% of a build.
 - **The compile's 3.3s is a chain**, not a width problem: `caos` rlib 1.2s then
-  `caos-cli` 1.8s. Nothing to parallelise without splitting the `caos` crate;
+  `caos-cli` 1.8s. Nothing to parallelize without splitting the `caos` crate;
   the linker is the other suspect and changing RUSTFLAGS re-bakes all ~176
   dependencies, which is what made the codegen-units experiment above expensive.
 
