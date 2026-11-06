@@ -62,7 +62,7 @@ fi
 grep -q 'takes only --run and --then' /tmp/err \
   || fail "wrong error for run-then --max-parallel: $(cat /tmp/err)"
 
-# A width the server cannot honour is refused where the caller can see it. Zero
+# A width the server cannot honor is refused where the caller can see it. Zero
 # is the interesting one: it reads as "no parallelism" but means "no children
 # ever run", which is a hang rather than a slow run.
 if caos map-then /cas/args/in --map:hash="$img" --max-parallel=0 2>/tmp/err; then

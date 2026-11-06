@@ -96,7 +96,7 @@ const CLOSE_TIMEOUT: Duration = Duration::from_millis(25);
 ///
 /// 11204 is iroh's own default port, so a firewall rule written for one tool
 /// fits the other. `--port 0` asks for an ephemeral one, and takes the
-/// unstable-ticket behaviour back.
+/// unstable-ticket behavior back.
 pub const DEFAULT_PORT: u16 = 11204;
 
 /// The endpoint builder both ends use, and the settings a restricted network
@@ -549,7 +549,7 @@ impl Server {
     ///
     /// MANY STREAMS PER CONNECTION, each spawned: a client opens one per request
     /// and has more than one in flight (a long `GET /run` alongside a status
-    /// poll), so answering them in sequence here would serialise the client.
+    /// poll), so answering them in sequence here would serialize the client.
     /// This is the one thing beyond dumbpipe's own listener, which serves a
     /// single stream and closes; a stock client sends one and loses nothing.
     pub async fn accept(self: Arc<Self>, incoming: Incoming) -> Result<(), String> {

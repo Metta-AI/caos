@@ -4245,9 +4245,9 @@ mod tests {
     }
 
     fn wait_for_interjection_refresh(app: &mut App) {
-        // SubmissionCommitted is an intermediate acknowledgement. The same
+        // SubmissionCommitted is an intermediate acknowledgment. The same
         // thread still fetches into the repo before sending its final refresh;
-        // deleting the fixture after that acknowledgement races those writes.
+        // deleting the fixture after that acknowledgment races those writes.
         let mut messages = Vec::new();
         loop {
             let message = app

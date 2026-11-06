@@ -109,7 +109,7 @@ launch)
   # NOT `run-request-then`. That verb runs an ArgTree by IDENTITY — for a caller
   # that already knows the exact request hash and must run that one unmodified,
   # which is what `prepare-request` is paired with. We have an ArgTree to run,
-  # not a request identity to honour, and using it here silently dropped every
+  # not a request identity to honor, and using it here silently dropped every
   # bound arg: nothing unwrapped the curry, so `args` and `.caos-curry` arrived
   # as two arguments of those names and dev/cli-test died on `/cas/args/test`.
   #
