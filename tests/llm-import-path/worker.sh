@@ -47,9 +47,14 @@ grep -q "into" /tmp/help.text || fail "tool_help did not describe the entry: $(c
 grep -q "Unused name inside root" /tmp/help.text || fail "tool_help lost the parameter docs: $(cat /tmp/help.text)"
 grep -qF 'Hello World!' /tmp/stub/request-4.json || fail "the read could not see the imported blob"
 
-# Mistakes are values the model can act on: a taken path, and an argument the operation
-# does not declare, each a single error result.
-for call in occupied stray; do
+# The import is reached only by path: llm-step registers no import tool of its own.
+jq -e '.tools | any(.name == "import_source") | not' /tmp/stub/request-1.json >/dev/null \
+  || fail "the session still offers the built-in import_source"
+
+# Mistakes are values the model can act on: a taken path, an argument the operation
+# does not declare, a source that is not an HTTPS repository, and a revision the
+# remote does not have, each a single error result.
+for call in occupied stray local missing; do
   jq -e --arg id "$call" '[.messages[].content | select(type == "array") | .[] | select(.type == "tool_result" and .tool_use_id == $id)] | length == 1 and .[0].is_error == true' /tmp/stub/request-4.json >/dev/null \
     || fail "$call did not yield one error result"
 done
