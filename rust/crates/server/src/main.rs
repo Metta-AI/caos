@@ -224,6 +224,10 @@ fn main() {
         eprintln!("fatal: {error}");
         std::process::exit(1);
     });
+    install_publish_hook(&git_dir).unwrap_or_else(|error| {
+        eprintln!("fatal: {error}");
+        std::process::exit(1);
+    });
     // Serve partial-clone (`--filter`) fetches: the std/merge worker fetches
     // the commit GRAPH only (`--filter=tree:0`) and lazily faults in just the
     // three trees `git merge-tree` needs, rather than the whole history's
