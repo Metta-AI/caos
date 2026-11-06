@@ -582,7 +582,11 @@ mod tests {
         // Writing again is a no-op.
         write_durable(&objects, Kind::Blob, b"hello\n").unwrap();
         let fsck = git(&dir, &["fsck", "--strict"]);
-        assert!(fsck.status.success(), "{}", String::from_utf8_lossy(&fsck.stderr));
+        assert!(
+            fsck.status.success(),
+            "{}",
+            String::from_utf8_lossy(&fsck.stderr)
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
