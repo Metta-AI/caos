@@ -662,6 +662,78 @@ fn remove_managed_pre_receive_hook(git_dir: &str) -> Result<(), String> {
     remove_git_config_value(git_dir, "core.hooksPath", hooks_value)
 }
 
+/// `*.unpackLimit` meaning "always unpack": git keeps a transfer as a pack only
+/// when it carries at least this many objects, and this is the largest value it
+/// accepts.
+const UNPACK_ALWAYS: &str = "2147483647";
+
+/// Install the `pre-receive` hook that publishes a push's objects children
+/// first (`loose::publish_quarantine`). Without it git would migrate them in
+/// directory order, so a hook that is someone else's, or a `core.hooksPath`
+/// that sends git elsewhere, stops the server instead of being skipped.
+fn install_publish_hook(git_dir: &str) -> Result<(), String> {
+    use std::path::{Path, PathBuf};
+    let hooks = Path::new(git_dir).join("hooks");
+    let configured = std::process::Command::new("git")
+        .args(["-C", git_dir, "config", "--get", "core.hooksPath"])
+        .output()
+        .map_err(|error| format!("reading core.hooksPath: {error}"))?;
+    if configured.status.success() {
+        let value = String::from_utf8_lossy(&configured.stdout).trim().to_string();
+        let path = Path::new(&value);
+        let path: PathBuf = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            Path::new(git_dir).join(path)
+        };
+        let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => a == b,
+        };
+        if !same(&path, &hooks) {
+            return Err(format!(
+                "core.hooksPath is {value:?}: caos needs its own pre-receive hook in {} to \
+                 publish pushed objects in dependency order",
+                hooks.display()
+            ));
+        }
+    }
+    std::fs::create_dir_all(&hooks)
+        .map_err(|error| format!("creating {}: {error}", hooks.display()))?;
+    let hook = hooks.join("pre-receive");
+    let script = loose::hook_script();
+    match std::fs::read(&hook) {
+        Ok(existing) if existing == script.as_bytes() => return Ok(()),
+        Ok(existing)
+            if !existing
+                .windows(loose::HOOK_MARKER.len())
+                .any(|window| window == loose::HOOK_MARKER.as_bytes()) =>
+        {
+            return Err(format!(
+                "{} is not caos's: caos needs its own pre-receive hook to publish pushed \
+                 objects in dependency order; move this one aside",
+                hook.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("reading {}: {error}", hook.display())),
+    }
+    // Written aside and renamed, so a push never runs half a hook. Several
+    // servers may share the repo; they all write the same script.
+    let temp = hooks.join(format!("pre-receive.caos-{}", std::process::id()));
+    let written = (|| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&temp, &script)?;
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::rename(&temp, &hook)
+    })();
+    written.map_err(|error| {
+        let _ = std::fs::remove_file(&temp);
+        format!("installing {}: {error}", hook.display())
+    })
+}
+
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
