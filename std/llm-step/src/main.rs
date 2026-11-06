@@ -1705,17 +1705,10 @@ fn launch_resolved_tool(
         .iter()
         .map(|(key, value)| Ok((key.clone(), value.ready()?)))
         .collect::<Result<_, String>>()?;
-    let (args, input) = split_input(&ready, tool.wants_in, ws.as_str());
-    let mut args = args;
-    if tool.git {
-        args.push(("wc", Arg::Path(&wc)));
-        if let Some(refs) = cfg.merge_refs.as_deref() {
-            args.push(("refs", Arg::Lit(refs)));
-        }
-    }
-    if tool.call {
-        args.push(("call", Arg::Lit(&call.id)));
-    }
+    let mut args: Vec<(&str, Arg)> = ready
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.arg()))
+        .collect();
     // `@request-id` the caller left out: the call's own id, so this call is its
     // own run and the transcript says which key it used.
     if tool.request_id && !args.iter().any(|(name, _)| *name == tools::REQUEST_ID) {
