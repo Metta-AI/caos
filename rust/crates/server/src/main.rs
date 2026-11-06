@@ -923,6 +923,7 @@ fn spawn_request_ref_pruner(git_dir: String) {
         // Through git rather than by unlinking: it takes the same locks the
         // push path does, and it copes with a ref that has been packed since.
         let mut child = match std::process::Command::new("git")
+            .envs(git_env())
             .args(["-C", &git_dir, "update-ref", "--stdin"])
             .stdin(std::process::Stdio::piped())
             .spawn()
