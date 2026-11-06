@@ -105,7 +105,7 @@ build)
   # completed drvs stay in the store, so each retry makes monotonic progress
   # and a genuinely broken flake still fails on its first real error.
   #
-  # PARAMETERISED ON THE ATTRIBUTE, because the litter is a property of
+  # PARAMETERIZED ON THE ATTRIBUTE, because the litter is a property of
   # unsandboxed nix, not of which output you asked for. It wrapped only
   # #caosImage while the go build happened to live under that attribute;
   # moving the docker client into #depsImage's closure (where it belongs — it
