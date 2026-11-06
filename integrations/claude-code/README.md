@@ -20,7 +20,7 @@ cloud/    configure a claude.ai/code cloud environment
 ```
 
 The deny list bans the GitHub MCP server's tools (`mcp__github__*`) that
-caos covers with `import_source`, `publish_source` and `caos-std/github` (see
+caos covers with `caos-std/import-source`, `caos-std/stack-publish`, `caos-std/publish-source` and `caos-std/github` (see
 [`std/GIT.md`](../../std/GIT.md)). Six stay available, because `caos-std/github`
 cannot do what they do or is not shown to: `get_job_logs` (GitHub serves CI logs
 through a redirect `caos-std/github` does not follow), `run_secret_scanning`, and
