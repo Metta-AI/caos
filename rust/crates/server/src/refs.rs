@@ -539,7 +539,11 @@ mod tests {
         writer.join().unwrap();
         assert_eq!(seen, a);
         // Woken by the write, not by the once-a-second recheck.
-        assert!(started.elapsed() < Duration::from_millis(900), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "{:?}",
+            started.elapsed()
+        );
 
         // Already different: no wait at all.
         assert_eq!(
