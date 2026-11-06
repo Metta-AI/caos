@@ -956,8 +956,8 @@ and its complete history directly into the server's object store. It prints
 the commit hash. Use --github-token-file=PATH for private repositories.
 Resolve branch names before calling; retry with the same hash.
 
-The agent's import_source tool also accepts branch names and defaults to the
-remote's default branch. It saves the resolved hash in session progress
-before invoking import-git, then attaches the snapshot and provenance at the
-requested unused path. Use /import for local checkouts.
+The agent's `caos-std/import-source` tool also accepts branch names and
+defaults to the remote's default branch. It imports the commit through
+`std/github` and returns the snapshot and its provenance under an unused name
+in its `root` directory. Use /import for local checkouts.
 
