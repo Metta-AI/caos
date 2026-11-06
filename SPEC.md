@@ -244,14 +244,13 @@ These bare tags are flags:
 - `@writer` — this tool PROPOSES A CHANGE to the tree it is run on, rather
   than returning a value. Absent means READ-ONLY, which is the default because
   it is the safe reading of a tool that forgot to say
-- `@in` — bind the tree it is run on as `in`. Absent means DO NOT, and that is
-  the point: see "Receiving args"
-- `@git` — bind the input as a COMMIT (`wc`) plus the turn's ref snapshot
-  (`refs`), for a tool that must walk HISTORY rather than read content: `in` is
-  a tree, and a tree cannot say what its parent was, what the last commit
-  changed, or what `main` points at. Off by default because `wc` changes on
-  every accepted edit while the tree often does not, so binding it would make
-  every call a miss for a commit the tool never reads
+- `@root` — the tool takes a REQUIRED `root` parameter, a path relative to the
+  session, and is given the object there as `/cas/args/root`: a blob for a
+  file, a tree for a directory, a commit for a gitlink (which is how a reader
+  walks history), and nothing when nothing is there. No other part of the
+  session reaches it; another tree it needs is a `{tree}` or `{commit}`
+  parameter (design/tool-contract.md, "`root`"). Absent means the tool reads
+  nothing of the session: see "Receiving args"
 - `@request-id` — the tool reads or changes something outside caos, so a
   result must never be reused by a later call that merely has the same
   arguments. It gets an optional `request-id` parameter, which the harness
