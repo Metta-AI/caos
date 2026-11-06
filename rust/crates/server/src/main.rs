@@ -1061,7 +1061,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("caos-init-test-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         initialize_repo(dir.to_str().unwrap()).unwrap();
-        let mode = std::fs::metadata(dir.join("config")).unwrap().permissions().mode();
+        let mode = std::fs::metadata(dir.join("config"))
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o444);
         let get = |key: &str| {
             let output = Command::new("git")
