@@ -85,8 +85,8 @@ func next(stage string, extra ...string) string {
 // The handshake's refs, under a prefix unique to this run.
 func ref(nonce, name string) string { return "refs/heads/tests/sub-run/" + nonce + "/" + name }
 
-// mint stores an empty-tree commit labelled for this run: a ref under
-// refs/heads/ names a commit.
+// mint stores an empty-tree commit labelled for this run, and returns the CAS
+// path it is recorded at: a ref under refs/heads/ names a commit.
 func mint(nonce, label string) string {
 	dir := "/tmp/empty"
 	w.Must(os.MkdirAll(dir, 0o755))
@@ -94,12 +94,24 @@ func mint(nonce, label string) string {
 	body := fmt.Sprintf("tree %s\nauthor sub-run <sub-run@caos> 0 +0000\n"+
 		"committer sub-run <sub-run@caos> 0 +0000\n\nsub-run %s %s\n", w.Hash("/cas/empty"), nonce, label)
 	w.Must(os.WriteFile("/tmp/commit", []byte(body), 0o644))
-	return w.Caos("put-commit", "/tmp/commit", "/cas/commit-"+label)
+	path := "/cas/commit-" + label
+	w.Caos("put-commit", "/tmp/commit", path)
+	return path
 }
 
-// create sets a ref that must not exist yet.
+// create sets a ref that must not exist yet, to a commit passed by its CAS
+// path.
 func create(nonce, name, label string) {
-	w.Caos("ref-set", ref(nonce, name), mint(nonce, label), "--expected="+absent)
+	w.Caos("ref-set", ref(nonce, name), "--new:@="+mint(nonce, label), "--expected="+absent)
+}
+
+// delivered is the commit a `ref-then` handed this stage as --result, checked
+// to be one: a deletion would have come as --absent instead.
+func delivered(name string) string {
+	w.True(!has("absent"), "ref-then on %s delivered a deletion", name)
+	kind := w.Caos("kind", "/cas/args/result")
+	w.True(kind == "commit", "ref-then on %s delivered a %s, not a commit", name, kind)
+	return w.Hash("/cas/args/result")
 }
 
 var requestReply = regexp.MustCompile(`^request [0-9a-f]{40}$`)
