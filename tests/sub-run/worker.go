@@ -105,6 +105,21 @@ func create(nonce, name, label string) {
 	w.Caos("ref-set", ref(nonce, name), "--new:@="+mint(nonce, label), "--expected="+absent)
 }
 
+// refGet records the commit ref names at the CAS path and reports true, or
+// false if there is no such ref (`caos ref-get` exits 2 and writes nothing).
+// Any other failure ends the test.
+func refGet(ref, path string) bool {
+	cmd := exec.Command("caos", "ref-get", ref, path)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 2 {
+		return false
+	}
+	w.True(err == nil, "caos ref-get %s %s: %v: %s", ref, path, err, strings.TrimSpace(stderr.String()))
+	return true
+}
+
 // delivered is the commit a `ref-then` handed this stage as --result, checked
 // to be one: a deletion would have come as --absent instead.
 func delivered(name string) string {
