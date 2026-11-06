@@ -73,9 +73,14 @@ it is waiting for may be queued for one: the hold-and-wait that
 - The worker records `ref-then` as its final act and exits. Its slot is free.
 - The server's promise interpreter blocks a request thread until the ref holds
   something other than `--expected` (default `absent`, so by default it waits
-  for the ref to be set), then runs `--then` with `--result`: a blob holding
-  what `ref-get` would print. With no `--then`, that blob is the request's
-  result.
+  for the ref to be set), then runs `--then` with `--result`: the new commit,
+  as a commit entry exactly like what `ref-get` records. The callback reads
+  `/cas/args/result` like any commit-valued arg, and can wait for the change
+  after that one with `--expected:@=/cas/args/result`. With no `--then`, the
+  commit is the request's result.
+- A ref **deleted** while it was waited on, which can only happen when
+  `--expected` names a commit, reaches `--then` as a bare `--absent` flag and
+  no `--result`. With no `--then`, the request's result is then an empty blob.
 - `--timeout` bounds the wait: 600s by default, a day at most. A timeout fails
   the wait, and `--catch` hands that failure to `--then` as `--error` instead,
   so the callback can report what it was waiting for.
