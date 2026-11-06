@@ -1842,11 +1842,11 @@ fn validate_continuation_shape(
     }
     // Both checked here rather than client-side only: a continuation is a tree
     // any worker can hand us, so the interpreter states its own contract.
-    if catch && !has_run && !has_request && !has_eval {
+    if catch && !has_run && !has_request && !has_eval && !has_ref {
         return Err(HttpError::new(
             500,
             format!(
-                "continuation {cont} has 'catch' without 'run', 'request' or 'eval' (catch covers one fallible step)"
+                "continuation {cont} has 'catch' without 'run', 'request', 'eval' or 'ref' (catch covers one fallible step)"
             ),
         ));
     }
