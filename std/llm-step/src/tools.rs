@@ -154,7 +154,7 @@ pub fn grep_declaration() -> Value {
 /// declaring one. Reserving a name for its history costs a tool author a
 /// perfectly good parameter and tells the next reader that something binds it.
 const RESERVED_ARGS: &[&str] = &[
-    "in", "worker1", "base", "salt", "wc", "refs", "call",
+    "worker1", "base", "salt",
     // The tool's own ArgTree binds `help` (SPEC, "Tools"), and `caos curry`
     // refuses to rebind — so a tool declaring `@param help` would fail at
     // invocation rather than here, where the model can be told why.
