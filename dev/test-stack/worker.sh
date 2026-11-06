@@ -19,7 +19,7 @@
 #   status      what is up, and for how long.
 #   logs        a stack member's log from a cursor.
 #   harvest     export refs from the stack's git to the outer server, under
-#               refs/stacks/<instance>/ — the stack's conversations die with it.
+#               refs/stacks/<instance>/ — the stack's sessions die with it.
 #   stop        stop the stack and leave.
 #
 # `status`, `logs`, `harvest` and `stop` NEVER start a stack: asked of a tree
@@ -96,7 +96,7 @@ ensure_stack() {
   cd "$WS"
 
   # The wrong tree is a CLEAN RESULT, not an error: caos-test and caos-stack are
-  # offered on every conversation, and run on one that is not caos they have no
+  # offered on every session, and run on one that is not caos they have no
   # stack to build. The routers say so before sending a message at all; this is
   # the same guard for a message that arrived without them.
   if [ ! -f flake.nix ] || [ ! -x dev/stack-up ]; then
@@ -177,7 +177,7 @@ op_build() {
   cd /tmp
 
   # A tree whose flake builds something else is not a failed build but the wrong
-  # tree: the conversation root of an ordinary session is exactly this case, since
+  # tree: the session root of an ordinary session is exactly this case, since
   # a repo pinning caos has a flake of its own. Nix's own message is the cheapest
   # reliable test for it.
   if [ "$status" -ne 0 ] && grep -q "does not provide attribute" /tmp/build.log; then
@@ -185,7 +185,7 @@ op_build() {
       echo "caos-build compiles the caos source tree with nix, and this tree's flake"
       echo "builds something else — it has no default package."
       echo "caos-build is specific to the caos codebase; run it there, or pass the"
-      echo "caos tree's conversation path as \`in\`."
+      echo "caos tree's session path as \`in\`."
     } > /tmp/build.log
     reply /tmp/build.log
     return 0
@@ -448,7 +448,7 @@ op_logs() {
 }
 
 # Export refs from the stack's git to the OUTER server. The stack's repo is
-# in this container and dies with it, and so would the conversations a cloud
+# in this container and dies with it, and so would the sessions a cloud
 # session recorded in it.
 #
 # The daemon does the pushing, with the OUTER client's server URL; the code under
@@ -456,8 +456,8 @@ op_logs() {
 # harvest can overwrite only its own.
 #
 # The source repo, /caos-dev/git, is SHARED by every dev stack on the host, so a
-# pattern broader than conversations may export a neighbor's refs too. The
-# default is the conversations, which are named by hash and so are no one else's.
+# pattern broader than sessions may export a neighbor's refs too. The
+# default is the sessions, which are named by hash and so are no one else's.
 harvest() { # <refs, one pattern per line>
   local instance patterns pattern dst
   instance=$(arg affinity)
@@ -479,7 +479,9 @@ harvest() { # <refs, one pattern per line>
   done <<<"$patterns"
 }
 
-DEFAULT_HARVEST='refs/caos/v3/conversations/*'
+# Session heads: v4, and v3 for sessions recorded before the rename.
+DEFAULT_HARVEST='refs/caos/v4/sessions/*
+refs/caos/v3/conversations/*'
 
 op_harvest() {
   if not_running; then return 0; fi

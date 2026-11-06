@@ -3,7 +3,7 @@
 #
 # Exercises the generic stateless LLM call worker against the scripted API
 # stub: caller-owned prompt/messages/config in, plain text blob out, with no
-# agent tools, thinking mode, commits, or conversation refs.
+# agent tools, thinking mode, commits, or session refs.
 #
 # ONE STAGE, WHICH IS THE POINT. The stub only exists while this container does,
 # so everything that observes it has to happen here — and a worker may not block

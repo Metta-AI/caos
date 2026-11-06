@@ -755,18 +755,18 @@ func joinAny(v any) string {
 	return strings.Join(out, ", ")
 }
 
-// conv finds the CONVERSATION a session records into, on the caos server.
+// conv finds the caos SESSION a Claude Code session records into, on the caos server.
 //
-// THE ID IS NOT THE ONE IN THE URL. A conversation is `cc/<the Claude Code
+// THE ID IS NOT THE ONE IN THE URL. A session is `cc/<the Claude Code
 // INTERNAL session uuid>`, which appears only in hook payloads, and the ref
 // spells that HEX-ENCODED — so neither the session id you can see nor a plain
 // grep of the refs will find it.
 //
-// Why bother: the conversation tree is the one place that says what a session
+// Why bother: the session tree is the one place that says what a Claude Code session
 // actually evaluates. A checkout can be rewritten (dev mode rewrites
-// .caos-expr) while the conversation still carries the committed file, and
+// .caos-expr) while the session still carries the committed file, and
 // from inside the session the two are indistinguishable — mcp__caos__read
-// shows the conversation's copy, which is the one that matters and the one
+// shows the session's copy, which is the one that matters and the one
 // nobody thinks to doubt.
 func conv(o opts) error {
 	id, err := wantSession(o, "--conv")
@@ -796,23 +796,30 @@ func conv(o opts) error {
 	}
 	if internal == "" {
 		return fmt.Errorf("no hook payload in %s yet, so no internal session id.\n"+
-			"  A session that has not run a turn has no conversation.", id)
+			"  A Claude Code session that has not run a turn has no caos session yet.", id)
 	}
 	name := "cc/" + internal
-	ref := "refs/caos/v3/conversations/" + fmt.Sprintf("%x", name) + "/head"
 	server := os.Getenv("CAOS_SERVER_URL")
 	if server == "" {
 		server = "http://localhost:9090"
 	}
-	fmt.Println("session:      " + id)
+	// v4, or for a session recorded before the rename and not written since, v3.
+	var ref string
+	var head []string
+	for _, prefix := range []string{"refs/caos/v4/sessions/", "refs/caos/v3/conversations/"} {
+		ref = prefix + fmt.Sprintf("%x", name) + "/head"
+		ls, _ := exec.Command("git", "ls-remote", server, ref).Output()
+		if head = strings.Fields(string(ls)); len(head) > 0 {
+			break
+		}
+	}
+	fmt.Println("claude code:  " + id)
 	fmt.Println("internal id:  " + internal)
-	fmt.Println("conversation: " + name)
+	fmt.Println("caos session: " + name)
 	fmt.Println("ref:          " + ref)
-	ls, _ := exec.Command("git", "ls-remote", server, ref).Output()
-	head := strings.Fields(string(ls))
 	if len(head) == 0 {
 		fmt.Println("head:         (not on " + server + " — wrong server, or no turn yet)")
-		return errors.New("conversation head not found on " + server)
+		return errors.New("session head not found on " + server)
 	}
 	fmt.Println("head:         " + head[0])
 	fmt.Printf(convNote, server, head[0], head[0], server)
@@ -1069,9 +1076,9 @@ later push from that checkout dies for an unrelated-looking reason.
   git -C /tmp/conv.git ls-tree %s
   git -C /tmp/conv.git cat-file blob <blob-sha>       # e.g. .caos-expr
 
-Every conversation, with the names decoded:
+Every session, with the names decoded:
 
-  git ls-remote %s 'refs/caos/v3/conversations/*' |
+  git ls-remote %s 'refs/caos/v4/sessions/*' |
     while read -r sha ref; do
       hex=$(echo "$ref" | cut -d/ -f5)
       echo "$sha $(echo "$hex" | fold -w2 | while read -r b; do printf "\x$b"; done)"

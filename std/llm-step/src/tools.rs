@@ -52,48 +52,48 @@ pub fn is_inline(name: &str) -> bool {
 /// then dashed `@param` tags. They are parsed by the same `parse_help` the tree
 /// tools use, so a built-in and a project tool are described one way — the docs
 /// live with the tool, not inside a hand-written JSON schema.
-const READ_HELP: &str = "Read a file's contents. Paths start in the conversation tree and traverse code references, for example feature/dirty/README.md. With an explicit source tree they are relative to its code tree; pass `root` — a commit, tree, or blob hash (one printed by `log`/`show`/`diff`/`eval_path`, or a stage oid from `.caos/conflicts`) — to read as of another revision or inside an evaluated result such as caos-std/. With a commit or tree `root`, `file-path` names the file within it; with a blob `root`, omit `file-path` to read the blob directly. Prefer this over `cat` via bash — it is immediate and needs no `paths` declaration. Large files are truncated; use `offset`/`limit` (line-based) to page.
-@param [file-path] Conversation path, such as feature/dirty/README.md; code-relative when source tree is explicit.
-@param [root] Optional commit/tree/blob hash to read from — an older revision, or a bare blob (e.g. a `.caos/conflicts` stage oid). Omit for the current conversation tree.
+const READ_HELP: &str = "Read a file's contents. Paths start in the session tree and traverse code references, for example feature/dirty/README.md. With an explicit source tree they are relative to its code tree; pass `root` — a commit, tree, or blob hash (one printed by `log`/`show`/`diff`/`eval_path`, or a stage oid from `.caos/conflicts`) — to read as of another revision or inside an evaluated result such as caos-std/. With a commit or tree `root`, `file-path` names the file within it; with a blob `root`, omit `file-path` to read the blob directly. Prefer this over `cat` via bash — it is immediate and needs no `paths` declaration. Large files are truncated; use `offset`/`limit` (line-based) to page.
+@param [file-path] Session path, such as feature/dirty/README.md; code-relative when source tree is explicit.
+@param [root] Optional commit/tree/blob hash to read from — an older revision, or a bare blob (e.g. a `.caos/conflicts` stage oid). Omit for the current session tree.
 @param [offset] 1-based first line to return.
 @param [limit] Number of lines to return.";
 
-const LS_HELP: &str = "List a directory: one entry per line, directories with a trailing `/`. Paths start in the conversation tree and traverse code references, for example feature/dirty/README.md. With an explicit source tree they are relative to its code tree; pass `root` (a commit or tree hash, such as one `eval_path` printed) to list it as of another revision or inside an evaluated result, and `path` to descend within that root. Prefer this over `ls` via bash.
-@param [path] Directory to list (relative to `root`, or to the conversation root unless source tree is explicit); omit for the root itself.
-@param [root] Optional commit or tree hash to list as of another revision. Omit for the current conversation tree.";
+const LS_HELP: &str = "List a directory: one entry per line, directories with a trailing `/`. Paths start in the session tree and traverse code references, for example feature/dirty/README.md. With an explicit source tree they are relative to its code tree; pass `root` (a commit or tree hash, such as one `eval_path` printed) to list it as of another revision or inside an evaluated result, and `path` to descend within that root. Prefer this over `ls` via bash.
+@param [path] Directory to list (relative to `root`, or to the session root unless source tree is explicit); omit for the root itself.
+@param [root] Optional commit or tree hash to list as of another revision. Omit for the current session tree.";
 
-const WRITE_HELP: &str = "Write a file at a conversation path or beneath a code reference (creating parent directories, overwriting an existing file). Prefer this over heredocs/redirection via bash.
-@param file-path Conversation path, such as feature/dirty/README.md; code-relative when source tree is explicit.
+const WRITE_HELP: &str = "Write a file at a session path or beneath a code reference (creating parent directories, overwriting an existing file). Prefer this over heredocs/redirection via bash.
+@param file-path Session path, such as feature/dirty/README.md; code-relative when source tree is explicit.
 @param content The full new file content.";
 
-const EDIT_HELP: &str = "Replace text in a conversation file or beneath a code reference. `old-string` must match the file content exactly and (unless `replace-all`) appear exactly once — include surrounding context to disambiguate. Prefer this over sed via bash.
-@param file-path Conversation path, such as feature/dirty/README.md; code-relative when source tree is explicit.
+const EDIT_HELP: &str = "Replace text in a session file or beneath a code reference. `old-string` must match the file content exactly and (unless `replace-all`) appear exactly once — include surrounding context to disambiguate. Prefer this over sed via bash.
+@param file-path Session path, such as feature/dirty/README.md; code-relative when source tree is explicit.
 @param old-string Exact text to replace.
 @param new-string Replacement text.
 @param [replace-all] Replace every occurrence (default false).";
 
-const COPY_HELP: &str = "Copy a file or directory to a new conversation path, creating any missing parent directories. The destination must not exist. The copy is the entry itself: a source tree stays a source tree, with its history. Prefer this over cp via bash — it needs no `paths` declaration.
-@param from Conversation path to copy, such as sources/repo/00-base.
-@param to Conversation path of the copy, such as feature/01-change.";
+const COPY_HELP: &str = "Copy a file or directory to a new session path, creating any missing parent directories. The destination must not exist. The copy is the entry itself: a source tree stays a source tree, with its history. Prefer this over cp via bash — it needs no `paths` declaration.
+@param from Session path to copy, such as sources/repo/00-base.
+@param to Session path of the copy, such as feature/01-change.";
 
-const MOVE_HELP: &str = "Move or rename a file or directory to a new conversation path, creating any missing parent directories. The destination must not exist. A source tree stays a source tree, with its history. Prefer this over mv via bash — it needs no `paths` declaration.
-@param from Conversation path to move, such as feature/01-change.
-@param to New conversation path, such as feature/02-change.";
+const MOVE_HELP: &str = "Move or rename a file or directory to a new session path, creating any missing parent directories. The destination must not exist. A source tree stays a source tree, with its history. Prefer this over mv via bash — it needs no `paths` declaration.
+@param from Session path to move, such as feature/01-change.
+@param to New session path, such as feature/02-change.";
 
-const REMOVE_HELP: &str = "Remove a file or directory, and everything under it, from the conversation. Removing a source tree removes the whole tree from the conversation. Prefer this over rm via bash — it needs no `paths` declaration.
-@param file-path Conversation path to remove, such as feature/01-change/old.txt.";
+const REMOVE_HELP: &str = "Remove a file or directory, and everything under it, from the session. Removing a source tree removes the whole tree from the session. Prefer this over rm via bash — it needs no `paths` declaration.
+@param file-path Session path to remove, such as feature/01-change/old.txt.";
 
-const TOOL_HELP_HELP: &str = "Describe the repository tool at a conversation path: what it does and which parameters `run_tool` accepts for it. A tool is a directory carrying a `.caos-expr` that binds a `help`, such as feature/01-change/caos-tools/test. Tools are NOT listed for you; they are documented in each repository's own docs (AGENTS.md, README, and so on), and this tool is the authoritative description of what one takes. Call it before `run_tool` whenever you have not been told a tool's parameters, or the docs might be stale. It evaluates the path, including the target expression, and reads the resulting help. This may build the tool but does not invoke it.
-@param path Conversation-relative directory of the tool, such as feature/01-change/caos-tools/test.";
+const TOOL_HELP_HELP: &str = "Describe the repository tool at a session path: what it does and which parameters `run_tool` accepts for it. A tool is a directory carrying a `.caos-expr` that binds a `help`, such as feature/01-change/caos-tools/test. Tools are NOT listed for you; they are documented in each repository's own docs (AGENTS.md, README, and so on), and this tool is the authoritative description of what one takes. Call it before `run_tool` whenever you have not been told a tool's parameters, or the docs might be stale. It evaluates the path, including the target expression, and reads the resulting help. This may build the tool but does not invoke it.
+@param path Session-relative directory of the tool, such as feature/01-change/caos-tools/test.";
 
-const GREP_HELP: &str = "Search the conversation tree, including code references, with a regular expression (Rust regex syntax, line-based). Returns matches as `path:linenum:line`. Scope with `path` (a directory or file) to narrow the search; results are cached per unchanged subtree, so repeated and scoped greps are cheap. Pass `root` (a commit or tree hash, such as one `eval_path` printed) to search as of another revision or inside an evaluated result. Prefer this over grep/find via bash.
+const GREP_HELP: &str = "Search the session tree, including code references, with a regular expression (Rust regex syntax, line-based). Returns matches as `path:linenum:line`. Scope with `path` (a directory or file) to narrow the search; results are cached per unchanged subtree, so repeated and scoped greps are cheap. Pass `root` (a commit or tree hash, such as one `eval_path` printed) to search as of another revision or inside an evaluated result. Prefer this over grep/find via bash.
 @param pattern The regular expression to search for.
-@param [path] Directory or file to search (relative to `root`, or to the conversation root); omit for everything.
-@param [root] Optional commit or tree hash to search as of another revision. Omit for the current conversation tree.";
+@param [path] Directory or file to search (relative to `root`, or to the session root); omit for everything.
+@param [root] Optional commit or tree hash to search as of another revision. Omit for the current session tree.";
 
-const EVAL_PATH_HELP: &str = "Evaluate a path and return the hash of what it produces — the BUILD PRODUCT of a tree, without having to know which tool makes it. Every `.caos-expr` from the root down to the path is applied, so a directory that declares a build evaluates to the built thing and a directory that declares none evaluates to itself. Paths are conversation-relative, and a source-tree prefix selects that tree with the rest evaluated against its own root: feature/dirty/tests/hello evaluates tests/hello inside feature/dirty. The answer is a `<kind> <hash>` line — pass that hash as `root` to `read`, `ls` or `grep` to look inside the result, or back to this tool to evaluate a path within it.
-@param [path] Conversation-relative path to evaluate, such as feature/dirty/tests/hello. Omit to evaluate the root itself.
-@param [root] Optional tree or commit hash to evaluate within instead of the conversation tree — one this tool printed, or any object hash. `path` is then relative to it.";
+const EVAL_PATH_HELP: &str = "Evaluate a path and return the hash of what it produces — the BUILD PRODUCT of a tree, without having to know which tool makes it. Every `.caos-expr` from the root down to the path is applied, so a directory that declares a build evaluates to the built thing and a directory that declares none evaluates to itself. Paths are session-relative, and a source-tree prefix selects that tree with the rest evaluated against its own root: feature/dirty/tests/hello evaluates tests/hello inside feature/dirty. The answer is a `<kind> <hash>` line — pass that hash as `root` to `read`, `ls` or `grep` to look inside the result, or back to this tool to evaluate a path within it.
+@param [path] Session-relative path to evaluate, such as feature/dirty/tests/hello. Omit to evaluate the root itself.
+@param [root] Optional tree or commit hash to evaluate within instead of the session tree — one this tool printed, or any object hash. `path` is then relative to it.";
 
 /// Build a built-in tool's registry entry from its help text, through the very
 /// same `parse_help` → `tree_tool_declaration` path a discovered caos-tools
@@ -135,12 +135,12 @@ pub fn grep_declaration() -> Value {
 
 // ---- Repository tools (SPEC "CaosTools") -----------------------------------
 //
-// A repository tool is ANY directory in the conversation whose `.caos-expr`
+// A repository tool is ANY directory in the session whose `.caos-expr`
 // binds a `help` -- there is no registry and no reserved directory name. The
 // model names its path: `tool_help` describes it, `run_tool` invokes it.
 //
 // Nothing enumerates them, and that is the design. Enumeration meant injecting
-// every source tree's tools into the system prompt, so a conversation that
+// every source tree's tools into the system prompt, so a session that
 // gains a tree mid-run re-keyed the prompt and grew it per tree. Naming a path
 // instead makes the tool list tree-INDEPENDENT (see `mcp::declarations`), at
 // the price of discovery being documentation: an undocumented tool is
@@ -205,11 +205,11 @@ pub struct TreeTool {
 /// in` stays refused, because `in` is bound by the interpreter and a tool
 /// declaring it by hand would be declaring the thing that binds it. Making it
 /// a parameter is what lets a caller redirect the input: a tool that lives in
-/// one tree (`caos-std/caos-build`, put there by the conversation's own
+/// one tree (`caos-std/caos-build`, put there by the session's own
 /// expression) can be run over another (`feature/01-change`), which it cannot
 /// do while the input is derived from where the tool happens to sit.
 const IN_DOC: &str = "The tree to run over. Defaults to the source tree this \
-                      tool sits in, which for a tool the conversation itself \
+                      tool sits in, which for a tool the session itself \
                       generated is usually not the tree you mean.";
 
 impl TreeTool {
@@ -271,10 +271,10 @@ pub enum ArgType {
     /// which is the encoding `bash` already gave its `paths` by hand.
     Lines,
     /// A TREE, bound as the object itself rather than as bytes naming it. The
-    /// model sends a conversation-relative path or a tree oid; either way the
+    /// model sends a session-relative path or a tree oid; either way the
     /// script finds a real directory at `/cas/args/<name>`.
     Tree,
-    /// A COMMIT. An oid only — a conversation path cannot denote one, because
+    /// A COMMIT. An oid only — a session path cannot denote one, because
     /// `caos resolve` traverses a gitlink to the tree inside it. The oids a
     /// model has are the ones `log`/`show`/`diff` printed.
     Commit,
@@ -306,7 +306,7 @@ impl ArgType {
                 json!({"type": "array", "items": {"type": "string"}, "description": doc})
             }
             ArgType::Tree => text(
-                "Give a conversation-relative path (such as feature/01-change/src) \
+                "Give a session-relative path (such as feature/01-change/src) \
                  or a tree hash.",
             ),
             ArgType::Commit => text("Give a commit hash, such as one printed by log or diff."),
@@ -446,7 +446,7 @@ pub struct Help {
     ///
     /// IT APPLIES ONLY TO A DISPATCHED READER, and both halves of that are
     /// load-bearing:
-    /// - DISPATCHED: an in-process built-in gets the conversation's store
+    /// - DISPATCHED: an in-process built-in gets the session's store
     ///   directly and ignores this. `log`/`show`/`diff` declared it for exactly
     ///   that reason and it did nothing for them.
     /// - READER: a WRITER's input commit is not a caller's to choose. Its
@@ -454,7 +454,7 @@ pub struct Help {
     ///   (`writer_callback`'s ancestry check, and `reconcile`'s own `before`),
     ///   so it is pinned to the scope. `merge` — the one tool that really needs
     ///   the input commit — takes it as `ours`, bound by the launch, and its
-    ///   help says why: a model naming it "would be naming the conversation it
+    ///   help says why: a model naming it "would be naming the session it
     ///   is already in".
     ///
     /// NO TOOL USES IT TODAY. `merge` predates it and binds `wc` itself under a
@@ -481,11 +481,11 @@ pub struct Help {
     pub call: bool,
     /// `@scope <param>`: the tool runs over, and a writer changes, the SOURCE
     /// TREE the argument `<param>` names (the path of a code reference in the
-    /// conversation, such as `feature/01-change`).
+    /// session, such as `feature/01-change`).
     ///
     /// Everything else gets its scope from WHERE THE TOOL SITS: a tool reached
     /// at `feature/01-change/caos-tools/test` runs over `feature/01-change`, and
-    /// one at `caos-std/…` over the conversation. That is wrong for a tool that
+    /// one at `caos-std/…` over the session. That is wrong for a tool that
     /// is a SHARED one and acts on a tree the caller picks: `merge` is reached at
     /// `caos-std/merge` and must advance `feature/01-change`. The tag says which
     /// parameter names the tree; with it the tool gets that tree's commit as
@@ -496,7 +496,7 @@ pub struct Help {
     /// `@op <name>`: the tool is an OPERATION OF THE STEP, not a worker. The entry
     /// that declares it exists to give the operation a path, a help and a place in
     /// `tool_help`/`run_tool`; running it is the step doing the work in process,
-    /// because the operation writes the conversation's own records (a source tree
+    /// because the operation writes the session's own records (a source tree
     /// imported, a publication, a subagent) and owns its call's lifecycle.
     pub op: Option<String>,
 }
@@ -825,7 +825,7 @@ pub struct WriterResult {
     /// The text the model reads.
     pub out: String,
     /// An optional commit message, used when the harness mints. Without it the
-    /// mint falls back to the tool's path, which is why a conversation's source
+    /// mint falls back to the tool's path, which is why a session's source
     /// history is otherwise a column of identical one-word messages.
     pub message: Option<String>,
     /// The `failed` entry is PRESENT, so the call is an error. A marker rather
@@ -885,12 +885,12 @@ pub fn writer_result(result: &str) -> Result<WriterResult, String> {
 /// arg, an undeclared one, or a non-scalar value is the model's mistake, so it
 /// comes back as a ready-made `is_error` tool_result rather than a worker
 /// error — the same contract `grep_precheck` uses.
-/// `conversation` is the tree oid a PATH-valued argument resolves against, and
+/// `session` is the tree oid a PATH-valued argument resolves against, and
 /// `None` for a caller that runs without one (the in-process history tools).
 ///
-/// THE CONVERSATION TREE, not the source tree the tool runs in. A `{tree}`
+/// THE SESSION TREE, not the source tree the tool runs in. A `{tree}`
 /// argument is how the model names a tree, and what it has to name one with is
-/// a conversation-relative path — the same vocabulary as the tool's own path,
+/// a session-relative path — the same vocabulary as the tool's own path,
 /// and the only one that can reach a tree OTHER than the one the tool runs in.
 /// Resolving against the source tree instead silently rejects
 /// `main/caos-tools/x` while accepting `caos-tools/x`, which is the opposite of
@@ -901,7 +901,7 @@ pub fn writer_result(result: &str) -> Result<WriterResult, String> {
 pub fn tree_tool_args(
     call: &Value,
     tool: &TreeTool,
-    conversation: Option<&str>,
+    session: Option<&str>,
 ) -> Result<Vec<(String, Bound)>, Value> {
     let id = call["id"].as_str().unwrap_or("");
     let fail = |msg: String| Err(result_block(id, &msg, true));
@@ -955,7 +955,7 @@ pub fn tree_tool_args(
                 let wanted = match a.ty {
                     ArgType::Text => "a string",
                     ArgType::Lines => "an array of strings",
-                    ArgType::Tree => "a string naming a tree: a conversation path or a hash",
+                    ArgType::Tree => "a string naming a tree: a session path or a hash",
                     ArgType::Commit => "a string naming a commit: a hash",
                 };
                 return fail(format!("{}'s {:?} must be {wanted}", tool.name, a.name));
@@ -967,7 +967,7 @@ pub fn tree_tool_args(
         // be an oid rather than a `/cas` path.
         let bound = match a.ty.object() {
             None => Bound::Lit(value),
-            Some(kind) => match resolve_object(&value, kind, conversation) {
+            Some(kind) => match resolve_object(&value, kind, session) {
                 Ok(bound) => bound,
                 Err(why) => {
                     return fail(format!("{}'s {:?}: {why}", tool.name, a.name));
@@ -988,7 +988,7 @@ fn is_oid(value: &str) -> bool {
 /// parameter promises, and CHECK ITS KIND.
 ///
 /// A hex string of oid length is an oid; anything else is a
-/// conversation-relative path, resolved the way a tool's own path is. The
+/// session-relative path, resolved the way a tool's own path is. The
 /// heuristic is safe in the direction that matters: a path component of
 /// exactly 40 or 64 hex characters would have to be deliberate.
 ///
@@ -998,7 +998,7 @@ fn is_oid(value: &str) -> bool {
 pub fn resolve_object(
     value: &str,
     want: &str,
-    conversation: Option<&str>,
+    session: Option<&str>,
 ) -> Result<Bound, String> {
     let materialized = fresh("arg-object");
     if is_oid(value) {
@@ -1013,11 +1013,11 @@ pub fn resolve_object(
         let not_a_commit = || {
             format!(
                 "{value:?} is not a commit hash or the path of a source tree (a code \
-                 reference in the conversation). A path to anything else names a tree, \
+                 reference in the session). A path to anything else names a tree, \
                  not a commit; use a hash such as one printed by log, show or diff"
             )
         };
-        let Some(tree) = conversation else {
+        let Some(tree) = session else {
             return Err(not_a_commit());
         };
         let comps: Vec<&str> = value
@@ -1044,7 +1044,7 @@ pub fn resolve_object(
         }
         return Ok(Bound::Commit(worker_common::cas_hash(path(&entry))?));
     } else {
-        let Some(tree) = conversation else {
+        let Some(tree) = session else {
             return Err(format!(
                 "{value:?} is a path, and this tool runs without a tree to resolve \
                  one against. Pass a tree hash instead"
@@ -1334,7 +1334,7 @@ fn resolve(root: Option<&str>, ws: &str, comps: &[String]) -> Result<PathBuf, Fa
     Ok(PathBuf::from(destination))
 }
 
-/// What a failed lookup tells the model. A path missing from the conversation
+/// What a failed lookup tells the model. A path missing from the session
 /// tree is most often one that only EVALUATION produces — `caos-std/` is a
 /// mount in the evaluated tree, never in the recorded one — and the raw
 /// `caos resolve` exit status said none of that, so a model that tried
@@ -1344,7 +1344,7 @@ fn resolve(root: Option<&str>, ws: &str, comps: &[String]) -> Result<PathBuf, Fa
 fn resolve_failure(rooted: bool, relative: &str, stderr: &str) -> String {
     if !rooted && stderr.contains("no such path") {
         format!(
-            "{relative} is not in the conversation tree. Check the path first: `ls` its \
+            "{relative} is not in the session tree. Check the path first: `ls` its \
              parent, and note an import lives where `import_source` put it (e.g. \
              sources/<repo>/00-base). Only if an expression produces it (a mount \
              such as caos-std/ exists only in the evaluated tree) call eval_path with \
@@ -1516,13 +1516,13 @@ fn edit(call: &Value, ws: &str) -> Result<(String, String), Fail> {
     ))
 }
 
-/// `.caos` at the conversation root is protocol metadata, for the same reason
+/// `.caos` at the session root is protocol metadata, for the same reason
 /// `write` and `edit` refuse it (see `execute_inline` in main.rs, which only
 /// sees the one `file-path` argument and so cannot guard `from` and `to`).
 fn reject_protocol(comps: &[String]) -> Result<(), Fail> {
     if comps.first().is_some_and(|c| c == ".caos") {
         return Err(User(
-            ".caos is protocol metadata; use conversation commands to change it".to_string(),
+            ".caos is protocol metadata; use session commands to change it".to_string(),
         ));
     }
     Ok(())
@@ -1672,7 +1672,7 @@ fn remove_entry(ws: &str, comps: &[String]) -> Result<String, Fail> {
 /// **`.` is the case that matters**, because nothing sends it deliberately:
 /// `normalize_inline_call` substitutes it when an `ls` names no path at all. So
 /// routing it through [`components`] made the two shapes that have no path to
-/// name fail with "`path` names no path: \".\"" — `ls` at the conversation root,
+/// name fail with "`path` names no path: \".\"" — `ls` at the session root,
 /// and `ls` of a `root` hash, which is every build product, since a product
 /// exists at no path in any tree.
 fn components_opt(call: &Value, key: &str) -> Result<Vec<String>, Fail> {
@@ -1762,13 +1762,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_path_missing_from_the_conversation_names_eval_path() {
+    fn a_path_missing_from_the_session_names_eval_path() {
         let m = resolve_failure(
             false,
             "caos-std/README.md",
             "caos: no such path: caos-std/README.md",
         );
-        assert!(m.starts_with("caos-std/README.md is not in the conversation tree"));
+        assert!(m.starts_with("caos-std/README.md is not in the session tree"));
         assert!(m.contains("eval_path"), "{m}");
         assert!(m.contains("`root`"), "{m}");
     }
@@ -1834,7 +1834,7 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(doc.contains("The tree to test."), "keeps the author's text");
-        assert!(doc.contains("conversation-relative path"), "says how to name one");
+        assert!(doc.contains("session-relative path"), "says how to name one");
         let doc = d["input_schema"]["properties"]["against"]["description"]
             .as_str()
             .unwrap();
@@ -2224,7 +2224,7 @@ mod tests {
             .find(|d| d["name"] == EVAL_PATH)
             .expect("eval_path is offered");
         // Nothing is required: no path is the root, and no root is the
-        // conversation tree.
+        // session tree.
         assert!(declared["input_schema"].get("required").is_none());
         for param in ["path", "root"] {
             assert!(declared["input_schema"]["properties"][param]["type"] == "string");

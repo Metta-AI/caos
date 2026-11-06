@@ -282,7 +282,7 @@ dependencies = [
  "caos",
  "caos-iroh",
  "caos-world",
- "conversation-protocol",
+ "session-protocol",
  "ed25519-dalek",
  "gix",
  "libc",
@@ -457,7 +457,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
-name = "conversation-protocol"
+name = "session-protocol"
 version = "0.1.0"
 dependencies = [
  "flate2",
@@ -3859,7 +3859,7 @@ version = "0.1.0"
 dependencies = [
  "caos-eval",
  "caos-world",
- "conversation-protocol",
+ "session-protocol",
  "ed25519-dalek",
  "git-locator",
  "gix",

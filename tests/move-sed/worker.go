@@ -1,6 +1,6 @@
 // tests/move-sed — a WORKER test: no client, no repo.
 //
-// Runs std/move-sed over a fixture conversation holding a stack the way
+// Runs std/move-sed over a fixture session holding a stack the way
 // design/publish-stack.md lays one out: sources/repo with 00-base and its
 // .source.json, two layers with their .pr.md descriptions, a 99-dirty, plus a
 // source tree and a file at the root. A success is checked by the tree it
@@ -75,10 +75,10 @@ func file(path, content string) {
 	w.Must(os.WriteFile(path, []byte(content), 0o644))
 }
 
-// conversation stages the fixture at dir, with the entries of `where` renamed
+// session stages the fixture at dir, with the entries of `where` renamed
 // as `renames` says. The fixture's entries are written under their final
 // names, so the expected tree for a success is built by the same function.
-func conversation(dir, where string, renames map[string]string) string {
+func session(dir, where string, renames map[string]string) string {
 	w.Must(os.RemoveAll(dir))
 	w.Must(os.MkdirAll(filepath.Join(dir, ".caos"), 0o755))
 	name := func(in, entry string) string {
@@ -92,7 +92,7 @@ func conversation(dir, where string, renames map[string]string) string {
 	root := func(entry string) string { return filepath.Join(dir, name("", entry)) }
 	repo := func(entry string) string { return filepath.Join(dir, "sources/repo", name("sources/repo", entry)) }
 	file(filepath.Join(dir, ".caos/meta"), "protocol\n")
-	file(root("notes.txt"), "conversation notes ("+salt+")\n")
+	file(root("notes.txt"), "session notes ("+salt+")\n")
 	link(root("src"), "b")
 	link(repo("00-base"), "b")
 	file(repo("00-base.source.json"), `{"repository":"https://example.com/repo.git"}`+"\n")
@@ -112,7 +112,7 @@ func build() {
 	b := mint("b", bT, 1700000000, "base")
 	l1 := mint("l1", mktree("l1-t", "f.txt=base", "a.txt=one"), 1700000100, "layer 1", b)
 	mint("l2", mktree("l2-t", "f.txt=base", "a.txt=one", "b.txt=two"), 1700000200, "layer 2", l1)
-	conv = conversation("/tmp/conv", "", nil)
+	conv = session("/tmp/conv", "", nil)
 
 	args := func(dir, pattern, replacement string, extra ...string) []string {
 		a := []string{"--pattern=" + pattern, "--replacement=" + replacement}
@@ -132,7 +132,7 @@ func build() {
 		// The root, named as `.`, with .caos left alone because the pattern is anchored.
 		{name: "root", args: args(".", `^notes\.txt$`, "NOTES.txt"), dir: "",
 			renames: map[string]string{"notes.txt": "NOTES.txt"}},
-		// A dry run lists the renames and proposes the conversation unchanged.
+		// A dry run lists the renames and proposes the session unchanged.
 		{name: "dry-run", args: args("sources/repo", `^01-feature(\..+)?$`, "02-y$1", "--dry-run=true"),
 			dryRun: true, says: []string{"dry run", "01-feature -> 02-y", "01-feature.pr.md -> 02-y.pr.md"}},
 		// Refusals, each before anything changes.
@@ -196,21 +196,21 @@ func check(i int) {
 	switch {
 	case c.renames != nil:
 		w.True(!failed, "case %s was refused: %s", c.name, out)
-		expect := conversation("/tmp/expect", c.dir, c.renames)
+		expect := session("/tmp/expect", c.dir, c.renames)
 		w.True(prop == expect, "case %s: the proposal is not the fixture with %v renamed in %q; out: %s", c.name, c.renames, c.dir, out)
 		for from, to := range c.renames {
 			w.True(strings.Contains(out, from+" -> "+to), "case %s: out does not list %s -> %s: %s", c.name, from, to, out)
 		}
-		w.True(w.Exists(filepath.Join(r, "message")), "case %s: no commit message for the conversation", c.name)
+		w.True(w.Exists(filepath.Join(r, "message")), "case %s: no commit message for the session", c.name)
 		fmt.Fprintf(os.Stderr, "  ok: %s", out)
 	case c.dryRun:
 		w.True(!failed, "case %s was refused: %s", c.name, out)
-		w.True(prop == conv, "case %s: a dry run changed the conversation", c.name)
+		w.True(prop == conv, "case %s: a dry run changed the session", c.name)
 		fmt.Fprintf(os.Stderr, "  ok: %s", out)
 	default:
 		w.True(failed, "case %s was not refused: %s", c.name, out)
 		w.True(strings.HasPrefix(out, "FAILED: "), "case %s has no FAILED banner: %s", c.name, out)
-		w.True(prop == conv, "case %s: a refusal changed the conversation", c.name)
+		w.True(prop == conv, "case %s: a refusal changed the session", c.name)
 		fmt.Fprintf(os.Stderr, "  ok: %s", out)
 	}
 }

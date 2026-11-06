@@ -9,10 +9,10 @@
 //! before forming the request — and the server forms requests, in
 //! `caos_eval`'s walk, exactly where the client's did.
 //!
-//! What made the client the wrong place is the agent. A conversation's tree is
+//! What made the client the wrong place is the agent. A session's tree is
 //! evaluated SERVER-SIDE (`eval_path`, the `eval` continuation), and a session
 //! that starts from a caos-session commit has no source tree on anyone's disk to
-//! fall back to. With resolution here, `eval_path ./caos-std` in a conversation
+//! fall back to. With resolution here, `eval_path ./caos-std` in a session
 //! evaluates the repo's root expression, resolves its pin, and hands the model
 //! the mounted tree; with it on the client, that walk died on a locator it was
 //! structurally unable to follow.

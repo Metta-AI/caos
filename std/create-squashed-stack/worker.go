@@ -1,18 +1,18 @@
 // The `create-squashed-stack` tool's worker. Its docs live in the sibling `.caos-expr`
 // here-string, not in this header (SPEC, "CaosTools").
 //
-// A writer run on the conversation (SPEC, "Writers"). Args, under /cas/args:
+// A writer run on the session (SPEC, "Writers"). Args, under /cas/args:
 //
-//	in    the conversation tree it was run on
-//	plan  the conversation path of the plan file
+//	in    the session tree it was run on
+//	plan  the session path of the plan file
 //
 // The plan names everything else: `onto`, `into`, and one block per layer of
 // `layer=`, `commit=` and `message=` lines.
 //
-// The result is {prop, out, message, failed?}. `prop` is the conversation
+// The result is {prop, out, message, failed?}. `prop` is the session
 // with `into` replaced by {<layer>: <squashed commit>}. It is built from links
 // to the CAS entries it keeps, which `caos put` records by oid, so nothing in
-// the conversation is checked out.
+// the session is checked out.
 //
 // A refusal proposes `in` unchanged and marks `failed`: the agent reads it and
 // acts (merges, fixes the plan). Only a broken environment is a job error.
@@ -95,22 +95,22 @@ func isOid(s string) bool {
 	return true
 }
 
-// splitPath checks a conversation-relative path and splits it.
+// splitPath checks a session-relative path and splits it.
 func splitPath(what, raw string) []string {
 	path := strings.TrimSuffix(raw, "/")
 	if path == "" || strings.HasPrefix(path, "/") {
-		refuse("%s must be a conversation-relative path, not %q", what, raw)
+		refuse("%s must be a session-relative path, not %q", what, raw)
 	}
 	parts := strings.Split(path, "/")
 	for _, part := range parts {
 		if part == "" || part == "." || part == ".." {
-			refuse("%s must be a conversation-relative path without . or .., not %q", what, raw)
+			refuse("%s must be a session-relative path without . or .., not %q", what, raw)
 		}
 	}
 	return parts
 }
 
-// node finds a conversation path's entry without looking inside a source
+// node finds a session path's entry without looking inside a source
 // tree, and returns its CAS path, or "" when nothing is there.
 func node(what, raw string) string {
 	dir := in
@@ -133,7 +133,7 @@ func node(what, raw string) string {
 }
 
 // commitOf resolves a plan's commit reference: a full hash, or the
-// conversation path of a gitlink. It returns the commit's oid.
+// session path of a gitlink. It returns the commit's oid.
 func commitOf(what, ref string) string {
 	if isOid(ref) {
 		dst := "/cas/ref-" + ref
@@ -245,7 +245,7 @@ func parse(text string) plan {
 	return p
 }
 
-// within reports whether path is at or below dir, both conversation paths.
+// within reports whether path is at or below dir, both session paths.
 func within(path, dir string) bool {
 	return path == dir || strings.HasPrefix(path, dir+"/")
 }

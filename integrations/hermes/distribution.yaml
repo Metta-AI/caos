@@ -3,7 +3,7 @@ version: 0.1.0
 description: >
   Wires Hermes to caos: bans the built-in toolsets caos replaces
   (terminal, file, code_execution) and installs the caos MCP server plus
-  the hook plugin that attributes tool calls to a caos conversation.
+  the hook plugin that attributes tool calls to a caos session.
 hermes_requires: ">=0.0.0"
 author: "Metta-AI/caos"
 license: MIT

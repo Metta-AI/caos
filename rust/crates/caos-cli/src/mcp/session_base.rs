@@ -1,12 +1,12 @@
-//! Where a new session's conversation content comes from: a git locator naming a
+//! Where a new Claude Code session's caos session content comes from: a git locator naming a
 //! COMMIT.
 //!
-//! The harness puts whatever it wants the conversation to start from into a git
+//! The harness puts whatever it wants the session to start from into a git
 //! repository (committing and pushing dirty files first, if it has them) and names
 //! the commit by locator. The hook does not read a checkout, push anything or
 //! resolve the locator: it hands the step `content-locator=<locator>` with the
 //! first prompt, and the step imports the commit, with its history, and records
-//! it -- as the parent of a new conversation's root, or merged into a fork
+//! it -- as the parent of a new session's root, or merged into a fork
 //! (`std/llm-step/src/record.rs`). The commit rather than its tree, because that
 //! history is what lets git find the base when the repository's newer commit is
 //! merged in later.
@@ -20,7 +20,7 @@
 //!
 //! A directive counts only as a LEADING line, so a prompt that merely quotes one
 //! further down is not a request (the rule `fork::parse_command` uses for
-//! `/fork-caos-conversation`). With none of them the conversation starts without
+//! `/fork-caos-session`). With none of them the session starts without
 //! code.
 //!
 //! A locator pins its commit (`rev=<sha>`). It is passed as written: the step
@@ -38,7 +38,7 @@ fn leading_start_from(prompt: &str) -> Option<String> {
     words.next().map(str::to_string)
 }
 
-/// The content locator for a new conversation, ready to send as `content-locator`.
+/// The content locator for a new session, ready to send as `content-locator`.
 pub(super) fn content_locator(configured: Option<&str>, prompt: &str) -> Option<String> {
     leading_start_from(prompt).or_else(|| configured.map(str::to_string))
 }
@@ -60,7 +60,7 @@ mod tests {
             None
         );
         assert_eq!(leading_start_from("/caos-session-start-from"), None);
-        assert_eq!(leading_start_from("/fork-caos-conversation abc"), None);
+        assert_eq!(leading_start_from("/fork-caos-session abc"), None);
     }
 
     #[test]

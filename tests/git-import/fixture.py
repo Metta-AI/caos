@@ -264,7 +264,7 @@ def main():
             assert "index-pack" in checks and "rev-list" not in checks, checks
             visible(second[0])
             # Imported commits have no refs. Clients must still be able to
-            # fetch them before any conversation or branch has been created.
+            # fetch them before any session or branch has been created.
             consumer = root / "consumer"
             run("git", "init", "-q", str(consumer))
             run("git", "-C", str(consumer), "fetch", "-q", base, second[0])
@@ -677,9 +677,9 @@ def main():
             genesis = run("git", "--git-dir", str(origin), "commit-tree", empty,
                           input=b"caos-conversation-genesis-v3\n", env=genesis_env)
             assert genesis == "a2519b3360c5b1ded9a8cb7e5869d32901eae743"
-            conversation = source_commit(empty, genesis)
-            assert push(conversation, branch="conversation")["status"] == "complete"
-            assert push(first[0], branch="code-after-conversation")["status"] == "complete"
+            session = source_commit(empty, genesis)
+            assert push(session, branch="session")["status"] == "complete"
+            assert push(first[0], branch="code-after-session")["status"] == "complete"
             # Authentication fails before git sends an update, so it is certain.
             refused = push(first[0], branch="private-test", dest=private, credential="wrong-token")
             assert refused["status"] == "conflict" and refused["code"] == "credential-rejected", refused

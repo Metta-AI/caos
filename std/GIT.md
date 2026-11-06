@@ -7,7 +7,7 @@ file is the working guide.
 
 ## The model in one paragraph
 
-Code is never checked out. A **source tree** is a gitlink in the conversation
+Code is never checked out. A **source tree** is a gitlink in the session
 tree (a path such as `sources/myrepo/01-parser`) that points at a commit.
 `import_source` creates one from GitHub, `copy` duplicates one with its
 history, `write`/`edit` (and `bash-tool`) change one, and every accepted change
@@ -106,7 +106,7 @@ was imported from, and prints what it did. Run it again after more edits and
 it fast-forwards the branch; the PR follows.
 
 - Edit and publish a source tree (`sources/<repo>/...`), never the
-  conversation root. `edit` on a bare path succeeds but changes only scratch
+  session root. `edit` on a bare path succeeds but changes only scratch
   files, and `publish_source` rejects `.`.
 - Omit `revision` to import the default branch. A new `import_source` call
   observes the remote again, so importing the same branch at a fresh path gives
@@ -189,7 +189,7 @@ base (a layer rebuilt on a force-pushed upstream: `merge-base` is the old tip
 of the previous layer).
 
 `theirs` is a **full commit hash** (from `log` on a source tree) or the **path of a
-source tree** in the conversation, such as one `import_source` just made. A branch
+source tree** in the session, such as one `import_source` just made. A branch
 NAME is not accepted: to merge `origin/main`, `import_source` the remote at
 `revision=main` into a fresh path, then pass that path as `theirs`.
 
@@ -300,7 +300,7 @@ rather than partly installed.
 
 ## Publishing
 
-The conversation history has many commits (agent turns, merges), and that is
+The session history has many commits (agent turns, merges), and that is
 what gets published. **Branches are always merged by squashing**, so the
 commits on a branch never reach the trunk: only its net diff does, and the
 history inside a branch does not matter. Do not spend effort tidying it, and
@@ -331,6 +331,8 @@ stack 367: unchanged
   call to run. A refusal pushes nothing and says so.
 - Repository and trunk come from `00-base.source.json`; pass `repository` and
   `trunk` when the base was imported by commit hash, or to publish elsewhere.
+  A repository that was renamed or moved to another owner since the import
+  is followed: the GitHub calls use the name GitHub gives it now.
 - `dry-run=true` reports the layers, branches, bases and titles without
   observing or changing anything. Use it first on a new stack.
 - The `.pr.md` is the description's home. A PR whose title or body differs is
@@ -391,14 +393,38 @@ run_tool(path="caos-std/stack-sync", arguments={"stack": "sources/<repo>", "remo
 - Before anything merges it refuses unless every selected layer has an open
   PR whose head is the layer's commit (run `stack-sync` and `stack-publish`
   first) and CI on each of those heads is passing. A failing or unfinished
-  check refuses the whole merge; `force=true` merges anyway. `dry-run=true`
-  reads the PRs and checks and says what it would do.
+  check refuses the whole merge, and the refusal lists every check of the
+  layers that are not passing; `force=true` merges anyway. `dry-run=true`
+  reads the PRs and checks and says what it would do. `wait-for-ci-min=20`
+  first waits up to 20 minutes for unfinished CI, ending as soon as a check
+  fails or none is pending.
 - Each PR is merged with GitHub's asynchronous merge, after GitHub has
   pointed it at the trunk, which it does itself for a linked stack once the
   PR below merges. A failure stops it there: the layers below are merged, the
   ones above are untouched, and running it again carries on.
 - `caos-std/ci-status` prints the checks of one branch: `branch` is a branch
-  name, a commit, or with `stack` a layer (`02-tests` or `tests`).
+  name, a commit, or with `stack` a layer (`02-tests` or `tests`). Its first
+  line is the verdict, and failing checks are listed first.
+
+### Waiting for CI
+
+GitHub has no long poll for checks, so waiting is polling, and the tools do
+it for you. `wait-min=<minutes>` makes `ci-status` read again
+every 15 seconds until a check fails or none is pending, then print as usual;
+if the time runs out first it says it is still pending. Run it with `start`
+and pick it up with `result`, so the wait does not hold up other work:
+
+```text
+start(path="caos-std/ci-status", arguments={
+  "stack": "sources/<repo>", "branch": "02-tests", "wait-min": "30"})
+... other work ...
+result(ticket=<ticket>)
+```
+
+Every call reads GitHub afresh: `ci-status` runs inside the step, which is
+keyed on the call itself, so the same arguments after a new push are a new
+read, not a cached answer. A check that has not been created yet is not
+waited for: right after a push the answer can be `no checks`.
 
 ### The repository's squash setting
 
@@ -447,7 +473,7 @@ there is no feedback:
 
 | what | `GET` |
 |---|---|
-| the PR conversation | `/repos/{owner}/{repo}/issues/{n}/comments` |
+| the PR session | `/repos/{owner}/{repo}/issues/{n}/comments` |
 | inline comments on the diff, from submitted reviews | `/repos/{owner}/{repo}/pulls/{n}/comments` |
 | reviews and their state | `/repos/{owner}/{repo}/pulls/{n}/reviews` |
 | the comments of one review, **including a pending one** | `/repos/{owner}/{repo}/pulls/{n}/reviews/{review_id}/comments` |
@@ -534,7 +560,7 @@ reach usually means the grant is missing.
 - `edit` takes `file-path`, `old-string` and `new-string` (hyphens, not
   underscores), and the old string must occur exactly once.
 - `theirs` for `merge` is a full commit hash or the path of a source tree in
-  the conversation, never a branch name.
+  the session, never a branch name.
 - `copy` and `move` refuse an existing destination; `remove` first. `move`
   takes one path, so a layer's `.pr.md` stays behind: rename both with
   `caos-std/move-sed`.

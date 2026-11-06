@@ -209,7 +209,7 @@ func plan(m1, m2 string) string {
 
 func main() {
 	w.Main(func() {
-		w.Step("a source tree, a stub model, and a conversation")
+		w.Step("a source tree, a stub model, and a session")
 		caos("get", "/cas/args/test-salt")
 		salt := strings.TrimSpace(string(w.Check(os.ReadFile("/cas/args/test-salt"))))
 		install("tool", "llm-test-tool", tool)
@@ -231,7 +231,7 @@ func main() {
 		w.Must(os.WriteFile("/tmp/system.txt", []byte("You are a coding agent."), 0o644))
 		caos("put", "/tmp/system.txt", "/cas/system")
 		llm := caos("curry", "--base:hash="+caos("hash", "/cas/args/llm-step"), "--system:@=/cas/system",
-			"--model=test-model", fmt.Sprintf("--base-url=http://%s:%d", stubHost(), port), "--conversation="+conv)
+			"--model=test-model", fmt.Sprintf("--base-url=http://%s:%d", stubHost(), port), "--session="+conv)
 
 		// The tools, staged the way chat-tools-mixed stages its shell: a folder
 		// whose .caos-expr names the image by hash. An agent reaches the same
@@ -246,7 +246,7 @@ func main() {
 				"repository": "https://caos-squash-publish.invalid/repo.git", "branch": "feature", "force": true})
 		}
 		// The same operation reached BY PATH: std/publish-source is an entry for an
-		// operation of the step (`@op`), so a conversation that mounts it runs it with
+		// operation of the step (`@op`), so a session that mounts it runs it with
 		// run_tool like any tool. Its arguments are strings, like every tool's.
 		publishByPath := func(id, source string) map[string]any {
 			return use(id, "run_tool", map[string]any{"path": "tools/publish-source", "arguments": map[string]any{
@@ -295,7 +295,7 @@ func main() {
 		w.True(reported(second, "01-feature") == c1, "an unchanged layer squashed to a different commit on the republish")
 		w.True(c2b != c2, "a reworded message did not change its layer's commit")
 
-		// The conversation holds exactly the republished pair at publish/mystack,
+		// The session holds exactly the republished pair at publish/mystack,
 		// as gitlinks: the first run's folder replaced, not merged into.
 		want := "160000 commit " + c1 + "\t01-feature\n160000 commit " + c2b + "\t02-tests"
 		listing := git("ls-tree", head+":publish/mystack")

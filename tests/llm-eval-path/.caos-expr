@@ -8,6 +8,6 @@
 # result: a scripted stub can only replay a batch it was written before the
 # batch ran, and there is no model here to script.
 #
-# dev/worker-test, not std/bash: the conversation REF is the completion signal,
+# dev/worker-test, not std/bash: the session REF is the completion signal,
 # and refs on the server are the one thing caos gives a worker no verb for.
 curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --bash:@=DEEP-DEPS/bash --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --tool:@=DEEP-DEPS/llm-test-tool --common:@=DEEP-DEPS/llm-test/worker-common.sh

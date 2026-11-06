@@ -3,17 +3,17 @@
 #
 # tests/llm-tools-only-http — a tool call run with HTTP alone.
 #
-# The conversation and its prompt are made as in tests/llm-tools-only,
-# because opening a conversation is a prompt hook's job. From there a call
+# The session and its prompt are made as in tests/llm-tools-only,
+# because opening a session is a prompt hook's job. From there a call
 # needs ONE request: the configured step, the call's id, the tool and its
 # arguments. The step declares the call -- an assistant message carrying the
 # tool_use -- and runs it, and the run's RESULT is the call's output:
 #
 #   POST /start/run   base:hash=<llm-step>  tools-only=<id>  tool=<name>  arguments=<json>
-#   GET  /result/<ticket>   ->   ok tree <oid>   {status, observation, conversation}
+#   GET  /result/<ticket>   ->   ok tree <oid>   {status, observation, session}
 #
-# The caller names no request, no head and no conversation checkout, and reads
-# nothing back from the conversation to learn what the tool said.
+# The caller names no request, no head and no session checkout, and reads
+# nothing back from the session to learn what the tool said.
 set -euo pipefail
 
 caos get /cas/args/common || { echo "FAIL: reading worker-common.sh" >&2; exit 1; }
@@ -49,8 +49,8 @@ read_result() { # <tree oid> <dir>
   caos get "$2/status" && caos get "$2/observation" || fail "fetching the result files of $1"
   result_status=$(cat "$2/status")
   result_observation=$(cat "$2/observation")
-  result_head=$(caos hash "$2/conversation")
-  assert_oid "$result_head" "the result's conversation"
+  result_head=$(caos hash "$2/session")
+  assert_oid "$result_head" "the result's session"
 }
 
 stage "workspace and a step with no model to call"
@@ -68,7 +68,7 @@ rm -rf /tmp/stub
 mkdir -p /tmp/stub
 start_stub /tmp/stub
 
-new_llm_conversation tools-only-http "$STUB_PORT" "$ws" \
+new_llm_session tools-only-http "$STUB_PORT" "$ws" \
   "You are a coding agent operating on a git workspace."
 admit_turn "read the greeting, then write a file"
 
@@ -95,15 +95,15 @@ case "$result_observation" in
   *) fail "the result's observation lacks the file: $result_observation" ;;
 esac
 
-stage "the conversation recorded what the result says"
-head=$($TOOL fetch --repo /tmp/repo --ref "$conversation_ref") \
-  || fail "fetching the conversation"
+stage "the session recorded what the result says"
+head=$($TOOL fetch --repo /tmp/repo --ref "$session_ref") \
+  || fail "fetching the session"
 head=${head#head }
 [ "$head" = "$result_head" ] \
-  || fail "the result's conversation $result_head is not the ref's head $head"
+  || fail "the result's session $result_head is not the ref's head $head"
 $TOOL tool-observation --repo /tmp/repo --head "$head" \
   --id toolu_read > /tmp/read.observation \
-  || fail "the conversation recorded no observation for the call"
+  || fail "the session recorded no observation for the call"
 grep -qF "hello tools" /tmp/read.observation || fail "the recorded observation lacks the file"
 
 stage "a second call, run to completion with one blocking request"
@@ -140,7 +140,7 @@ stage "the same call again, as a new run, is declared once"
 params[4]="salt=$SALT-retry"
 post /eval/run "${params[@]}"
 [ "$code" = 200 ] || fail "repeat: HTTP $code: $body"
-head=$($TOOL fetch --repo /tmp/repo --ref "$conversation_ref") || fail "fetching the conversation"
+head=$($TOOL fetch --repo /tmp/repo --ref "$session_ref") || fail "fetching the session"
 head=${head#head }
 # The prompt and one declaration per call: the retry declared nothing.
 roles=$($TOOL transcript --repo /tmp/repo --head "$head" \

@@ -37,7 +37,7 @@ jq -n --arg s "$spawn_img" --arg w "$wait_img" --arg h "$harvest_img" --arg a "$
   stop_reason:"tool_use"}' > /tmp/stub/response-1.json
 start_stub /tmp/stub
 
-new_llm_conversation llm-subagent-path "$STUB_PORT" "$ws" \
+new_llm_session llm-subagent-path "$STUB_PORT" "$ws" \
   "You are a coding agent operating on a git source_tree."
 LLM_TEST_USERNAME=Alice
 admit_turn "delegate a focused edit"
@@ -50,7 +50,7 @@ request1=$request
 # not matter.
 #
 # The parent's wait and harvest calls name the child. Its id is derived from the durable
-# spawn call (the parent conversation and the call id), so it is
+# spawn call (the parent session and the call id), so it is
 # known here, before the child exists.
 child_id=$($TOOL child-id --parent "$conv" \
   --tool toolu_spawn) || fail "deriving the child id"
@@ -79,7 +79,7 @@ run_tool_call() {
 }
 CHILD_SYSTEM='You are a focused subagent'
 
-# The child (the only conversation with that system prompt): after its write, report;
+# The child (the only session with that system prompt): after its write, report;
 # before it, write.
 rule 01-child-reports \
   '{"content":[{"text":"child done","type":"text"}],"stop_reason":"end_turn"}' \
@@ -96,13 +96,13 @@ rule 04-parent-harvests "$(run_tool_call toolu_harvest tools/agent-harvest)" \
   '"tool_use_id":"toolu_wait"'
 rule 05-parent-waits "$(run_tool_call toolu_wait tools/agent-wait)"
 
-# On any failure below, say what the stub saw and what the conversation looks like.
+# On any failure below, say what the stub saw and what the session looks like.
 diagnose_failure() {
   local status=$?
   if [ "$status" -ne 0 ]; then
     echo "--- llm-stub log ---" >&2
     cat /tmp/stub/log >&2 || true
-    dump_conversation "$conversation_ref" "$request1" || true
+    dump_session "$session_ref" "$request1" || true
   fi
   llm_test_cleanup
 }

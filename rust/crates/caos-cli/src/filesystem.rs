@@ -1,7 +1,7 @@
-//! Read-only browsing of conversation files and adjacent source commits.
+//! Read-only browsing of session files and adjacent source commits.
 use super::*;
-use conversation_protocol::v3::tree::{Snapshot, TreeEntry};
-use conversation_protocol::v3::Mode;
+use session_protocol::v3::tree::{Snapshot, TreeEntry};
+use session_protocol::v3::Mode;
 
 const MAX_BLOB: usize = 256 * 1024;
 
@@ -27,7 +27,7 @@ pub struct Preview {
 
 pub fn snapshot(t: &GitTransport, id: &str) -> Result<SnapshotInfo, String> {
     let store = open_store(t)?;
-    let (_, head) = fetch_head(t, &store, id)?.ok_or("conversation has no snapshot yet")?;
+    let (_, head) = fetch_head(t, &store, id)?.ok_or("session has no snapshot yet")?;
     let commit = store.read_commit(&head)?;
     Ok(SnapshotInfo {
         head: head.to_string(),
@@ -44,7 +44,7 @@ fn lookup(store: &dyn ObjectStore, root: &Oid, path: &str) -> Result<Option<Tree
     if path.is_empty() {
         return Ok(Some(entry));
     }
-    conversation_protocol::v3::paths::validate_tree_path(path)?;
+    session_protocol::v3::paths::validate_tree_path(path)?;
     for part in path.split('/') {
         if entry.mode == Mode::Commit {
             entry.oid = store.read_commit(&entry.oid)?.tree;

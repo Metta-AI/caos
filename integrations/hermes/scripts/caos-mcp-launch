@@ -32,7 +32,7 @@
 #      tree's full `.caos-expr` chain, which is "exactly right for an image
 #      locator" like this one (rust/crates/caos-cli/src/mcp/session_base.rs's
 #      own words -- it was only wrong for THAT module's different purpose,
-#      resolving a conversation's raw content commit, not an image). So
+#      resolving a session's raw content commit, not an image). So
 #      `:@@=github:Metta-AI/caos-session?rev=<sha>&dir=caos-std/llm-step`
 #      lets the evaluation mount caos's std/ from caos-session's OWN
 #      flake.lock pin itself, exactly like Claude Code's own

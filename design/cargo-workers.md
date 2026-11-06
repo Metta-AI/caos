@@ -95,7 +95,7 @@ run `cargo build` / `cargo test` `--offline` atop the baked deps, return
   transcript budget. Failures come back `is_error`, like bash.
 
 Value delivered immediately: a no-change rebuild is a cache hit, identical
-trees across conversations and branches share one compile, and the work runs
+trees across sessions and branches share one compile, and the work runs
 off the agent's slot (run-then — no held container). Honest caveat: this
 phase materializes the whole *source* tree in one worker — a deliberate,
 bounded interim violation of the never-materialize rule (the source is small;

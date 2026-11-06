@@ -9,10 +9,10 @@ path = "src/main.rs"
 
 [dependencies]
 worker-common = { path = "worker-common" }
-conversation-protocol = { path = "conversation-protocol", features = ["git-cli"] }
+session-protocol = { path = "session-protocol", features = ["git-cli"] }
 
 [dev-dependencies]
-conversation-protocol = { path = "conversation-protocol", features = ["memory-store"] }
+session-protocol = { path = "session-protocol", features = ["memory-store"] }
 
 [profile.dev.package."*"]
 opt-level = 2

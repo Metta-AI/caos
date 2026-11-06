@@ -27,16 +27,16 @@ fi
 export CAOS_BIN
 
 # `caos mcp` reads no checkout. It is told, by argument, the server, the step that
-# runs tools and (for a new conversation) where its content comes from -- all by
+# runs tools and (for a new session) where its content comes from -- all by
 # name, and the step and the content by locator, which the server resolves:
 #
 #   CAOS_SERVER_URL  the server (required)
 #   CAOS_STEP        a git locator for the step, `git+…?rev=<sha>&dir=std/llm-step`;
 #                    by default the server's own `refs/caos/dev`, which `caosd up`
 #                    publishes
-#   CAOS_BASE        a git locator for what a new conversation starts from; it must
+#   CAOS_BASE        a git locator for what a new session starts from; it must
 #                    be committed (and pushed) first. Optional: without it the
-#                    conversation starts without code.
+#                    session starts without code.
 server="${CAOS_SERVER_URL:?set CAOS_SERVER_URL to the URL of the caos server}"
 step="${CAOS_STEP:-}"
 if [ -z "$step" ]; then

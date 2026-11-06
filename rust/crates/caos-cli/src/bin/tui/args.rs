@@ -7,8 +7,8 @@ pub(crate) struct Args {
     pub(crate) user: String,
     pub(crate) list_archived: bool,
     pub(crate) unarchive: Option<String>,
-    pub(crate) conversation: Option<String>,
-    pub(crate) new_conversation: bool,
+    pub(crate) session: Option<String>,
+    pub(crate) new_session: bool,
     pub(crate) from_commit: Option<String>,
     pub(crate) empty: bool,
     pub(crate) import: Option<String>,
@@ -53,20 +53,22 @@ impl Args {
                 "--username" => user_flag = Some(value(&mut args, arg)?),
                 "--list-archived" => parsed.list_archived = true,
                 "--unarchive" => parsed.unarchive = Some(value(&mut args, arg)?),
-                "-c" | "--conversation" => parsed.conversation = Some(value(&mut args, arg)?),
-                "--new" => parsed.new_conversation = true,
+                "-c" | "--session" | "--conversation" => {
+                    parsed.session = Some(value(&mut args, arg)?)
+                }
+                "--new" => parsed.new_session = true,
                 "--empty" => {
                     parsed.empty = true;
-                    parsed.new_conversation = true;
+                    parsed.new_session = true;
                 }
                 "--import" => {
                     if parsed.import.is_some() {
                         return Err("--import may only be specified once".into());
                     }
                     parsed.import = Some(value(&mut args, arg)?);
-                    // Initial content only applies to a new conversation; do
+                    // Initial content only applies to a new session; do
                     // not silently discard an import when resuming the latest.
-                    parsed.new_conversation = true;
+                    parsed.new_session = true;
                     if args
                         .as_slice()
                         .first()
@@ -125,13 +127,11 @@ impl Args {
         if parsed.from_commit.is_some() && parsed.turn.base.is_some() {
             return Err("--from and --base are mutually exclusive".to_string());
         }
-        if parsed.from_commit.is_some() && parsed.conversation.is_some() {
-            return Err(
-                "--from starts a fresh conversation and cannot be combined with -c".to_string(),
-            );
+        if parsed.from_commit.is_some() && parsed.session.is_some() {
+            return Err("--from starts a fresh session and cannot be combined with -c".to_string());
         }
         if let Some(from) = &parsed.from_commit {
-            parsed.new_conversation = true;
+            parsed.new_session = true;
             parsed.turn.base = Some(from.clone());
         }
         if parsed.list_archived && parsed.unarchive.is_some() {
@@ -139,14 +139,13 @@ impl Args {
         }
         if (parsed.list_archived || parsed.unarchive.is_some())
             && (parsed.import.is_some()
-                || parsed.conversation.is_some()
-                || parsed.new_conversation
+                || parsed.session.is_some()
+                || parsed.new_session
                 || parsed.from_commit.is_some()
                 || parsed.turn != TurnOptions::default())
         {
             return Err(
-                "archive-management options cannot be combined with conversation options"
-                    .to_string(),
+                "archive-management options cannot be combined with session options".to_string(),
             );
         }
         // A session that only lists or restores archives touches no worker, and
@@ -170,10 +169,10 @@ impl Args {
 
 pub(crate) fn usage() -> String {
     "usage: caos tui --llm-step:@=<path> --llm-call:@=<path> [--username <name>] \
-     [--list-archived | --unarchive <conversation-id>] \
+     [--list-archived | --unarchive <session-id>] \
      [--new | --from <commit> | --empty] [--import <path> [<source> [<revision>]]] [--base <revspec>] [--server <url>] [--harness <path>] \
      [--system <text> | --system-file <path>] [--model <model>] [--base-url <url>]\n\
-     \x20 imports start a new conversation: local sources default to clean HEAD; Git URIs require a full hash.\n\
+     \x20 imports start a new session: local sources default to clean HEAD; Git URIs require a full hash.\n\
      \x20 omit the import source to use the launching checkout (--base selects its revision).\n\
      \x20 the two image args also take :@@=<git ref>, :hash=<oid> and :docker=<ref>"
         .to_string()
@@ -183,7 +182,7 @@ pub(crate) fn usage() -> String {
 pub(crate) mod tests {
     use super::Args;
 
-    /// A conversation session names its two workers, so every parse that is
+    /// A TUI run on a session names its two workers, so every parse that is
     /// meant to SUCCEED carries them. `app.rs` uses this too.
     pub(crate) fn with_images(raw: &[&str]) -> Vec<String> {
         ["--llm-step:@=std/llm-step", "--llm-call:@=std/llm-call"]
@@ -244,7 +243,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_conversation_names_its_workers_and_an_archive_listing_does_not() {
+    fn a_session_names_its_workers_and_an_archive_listing_does_not() {
         let named = Args::parse_with_default_user(
             &with_images(&["--username", "alice"]),
             Some("alice".to_string()),
@@ -279,7 +278,7 @@ pub(crate) mod tests {
             &["--llm-step:@=std/llm-step".to_string()],
             Some("alice".to_string()),
         )
-        .expect_err("a conversation ran without its llm-call image");
+        .expect_err("a session ran without its llm-call image");
         assert!(missing.contains("--llm-call:@="), "{missing}");
         assert!(missing.contains("caos-std/llm-call"), "{missing}");
 

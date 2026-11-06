@@ -4,7 +4,7 @@
 # directory has no `.caos-expr` on purpose: a `:@=` target without one is DATA.
 #
 # The tools are the history reads `llm-step` ran in-process against the
-# conversation's own store, over the same `GitStore`: it fetches the commit from
+# session's own store, over the same `GitStore`: it fetches the commit from
 # the server and asks git, so the tree alone is never asked to say what its
 # parent was.
 [package]
@@ -20,7 +20,7 @@ path = "src/main.rs"
 [dependencies]
 # Spliced in by std/rustc at `worker-common/` (its `--worker-common` arg).
 worker-common = { path = "worker-common" }
-conversation-protocol = { path = "conversation-protocol", features = ["git-cli"] }
+session-protocol = { path = "session-protocol", features = ["git-cli"] }
 
 # Match the caos workspace's dev profile so dependency fingerprints line up with
 # the std/cargo bake (see std/run-and-update-ref/Cargo.toml).

@@ -130,7 +130,7 @@ func main() {
 	// file existing is the whole claim.
 	if rev := dev["rev"]; rev != "" {
 		fmt.Printf("caos dev mode: ON -- the whole install package came from "+
-			"refs/caos/dev at %s, and this session's conversation seeds from %s "+
+			"refs/caos/dev at %s, and this session seeds from %s "+
 			"(HEAD pointed at the dev server; the checkout is untouched).\n", short(rev), short(dev["seed"]))
 		reportDev(rev, <-served)
 	} else {
@@ -330,9 +330,9 @@ func mustGetwd() string {
 	return dir
 }
 
-// Says so when the commit new conversations start from is not the checkout's.
+// Says so when the commit new sessions start from is not the checkout's.
 // Setup computes that commit once and the environment caches the result, so a
-// checkout cloned later at a newer HEAD starts its conversations from the older
+// checkout cloned later at a newer HEAD starts its sessions from the older
 // one. A NOTE, not a failure: refusing every session after any commit to the
 // repo would make the setup line a thing to edit on each push.
 func reportContent(installed string) {
@@ -345,6 +345,6 @@ func reportContent(installed string) {
 	if err != nil || head == rev {
 		return
 	}
-	fmt.Printf("caos: new conversations start from %s, the commit setup saw; this checkout is at %s.\n"+
+	fmt.Printf("caos: new sessions start from %s, the commit setup saw; this checkout is at %s.\n"+
 		"  Change the environment's setup line to start from the checkout's.\n", short(rev), short(head))
 }

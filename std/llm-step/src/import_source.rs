@@ -2,10 +2,10 @@
 use super::*;
 use std::process::Command;
 
-pub(super) const HELP: &str = "Import an HTTPS Git repository as a new, unchanged snapshot at an unused conversation path. Returns its full commit hash; preserves its tree and ancestor history. Does not merge or overwrite code. Import into sources/<repo>/00-base, the upstream tip the stack builds on: it is never edited, so `copy` it to sources/<repo>/99-dirty to work (see std/GIT.md). Public repositories need no token. For origin/main, select the repository from the chosen source's .source.json provenance and request main; use an explicit repository when ambiguous. Local checkouts use the client's /import command.
+pub(super) const HELP: &str = "Import an HTTPS Git repository as a new, unchanged snapshot at an unused session path. Returns its full commit hash; preserves its tree and ancestor history. Does not merge or overwrite code. Import into sources/<repo>/00-base, the upstream tip the stack builds on: it is never edited, so `copy` it to sources/<repo>/99-dirty to work (see std/GIT.md). Public repositories need no token. For origin/main, select the repository from the chosen source's .source.json provenance and request main; use an explicit repository when ambiguous. Local checkouts use the client's /import command.
 @param source HTTPS repository URL, without credentials.
 @param [revision] Remote branch, full refs/... name, or full commit hash. Omit for the remote default branch. A new call observes the remote again.
-@param into Unused conversation path, one directory per repo: sources/<repo>/00-base for the first import, or a fresh sibling such as sources/<repo>/00-base-2 for a newer tip. Its .source.json sibling must also be free.";
+@param into Unused session path, one directory per repo: sources/<repo>/00-base for the first import, or a fresh sibling such as sources/<repo>/00-base-2 for a newer tip. Its .source.json sibling must also be free.";
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -20,7 +20,7 @@ fn parameters(call: &Call) -> Result<Parameters, String> {
         .map_err(|error| format!("invalid import_source arguments: {error}"))?;
     git_locator::import::remote(&args.source)?;
     if let Some(revision) = &args.revision {
-        conversation_protocol::v3::source_trees::validate_branch(revision)?;
+        session_protocol::v3::source_trees::validate_branch(revision)?;
     }
     paths::validate_source_tree_name(&args.into)?;
     paths::validate_source_tree_name(&format!("{}.source.json", args.into))?;
@@ -40,7 +40,7 @@ pub(super) fn token_file(source: &str) -> Option<&'static str> {
         .then_some("/secret/github-token")
 }
 
-fn free_destination(view: &Conversation<'_>, into: &str) -> Result<(), String> {
+fn free_destination(view: &Session<'_>, into: &str) -> Result<(), String> {
     for name in [into.to_string(), format!("{into}.source.json")] {
         // entry refuses traversal through a gitlink, file or symlink as well.
         if view.snapshot().exists(&name)? {
@@ -64,10 +64,10 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
     } = &args;
     let revision = revision.as_deref();
     let token_file = token_file(source);
-    if let Err(error) = free_destination(&state.conversation()?, into) {
+    if let Err(error) = free_destination(&state.session()?, into) {
         return site.fail(state, &error);
     }
-    let provenance = match pinned(&state.conversation()?, site)? {
+    let provenance = match pinned(&state.session()?, site)? {
         Some(value) => value,
         None => {
             let token = token_file
@@ -183,7 +183,7 @@ pub(super) fn pin_path(site: &CallSite<'_>) -> String {
     )
 }
 
-fn pinned(view: &Conversation<'_>, site: &CallSite<'_>) -> Result<Option<Value>, String> {
+fn pinned(view: &Session<'_>, site: &CallSite<'_>) -> Result<Option<Value>, String> {
     match view.tool(&site.call.id)? {
         Some(record) if record.status == CallStatus::Started => {
             let bytes = view.payload(&pin_path(site))?;
@@ -203,7 +203,7 @@ pub(super) fn pin<S: progress::RefStore>(
 ) -> Result<Option<Value>, String> {
     for _ in 0..32 {
         state.reload()?;
-        let view = state.conversation()?;
+        let view = state.session()?;
         if let Some(record) = view.tool(&site.call.id)? {
             return if record.is_terminal() {
                 Ok(None)
@@ -222,7 +222,7 @@ pub(super) fn pin<S: progress::RefStore>(
             },
         )?;
     }
-    Err("conversation kept moving while pinning import".into())
+    Err("session kept moving while pinning import".into())
 }
 
 pub(super) fn attach<S: progress::RefStore>(
@@ -235,14 +235,14 @@ pub(super) fn attach<S: progress::RefStore>(
     for _ in 0..32 {
         state.reload()?;
         if state
-            .conversation()?
+            .session()?
             .tool(&site.call.id)?
             .is_some_and(|r| r.is_terminal())
         {
             return Ok(());
         }
         let stub = site.stub(None);
-        let (block, files) = match free_destination(&state.conversation()?, into) {
+        let (block, files) = match free_destination(&state.session()?, into) {
             Ok(()) => (
                 result_block(
                     &site.call.id,
@@ -277,7 +277,7 @@ pub(super) fn attach<S: progress::RefStore>(
             return Ok(());
         }
     }
-    Err("conversation kept moving while attaching import".into())
+    Err("session kept moving while attaching import".into())
 }
 
 #[cfg(test)]

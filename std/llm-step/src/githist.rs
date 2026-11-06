@@ -1,13 +1,13 @@
 //! Read-only history tools over the existing Git store.
 //!
 //! These declared `@git` and it did nothing: that tag binds `wc`/`refs` for a
-//! DISPATCHED tool, and these run IN-PROCESS against the conversation's own
+//! DISPATCHED tool, and these run IN-PROCESS against the session's own
 //! store (`execute` takes it directly). `parsed_declarations_are_byte_identical`
 //! is the proof that dropping it changed nothing — a flag tag contributes
 //! neither description nor parameters.
 
-use conversation_protocol::v3::git_store::HistoryQuery;
-use conversation_protocol::v3::{GitStore, ObjectStore, Oid};
+use session_protocol::v3::git_store::HistoryQuery;
+use session_protocol::v3::{GitStore, ObjectStore, Oid};
 use serde_json::Value;
 
 use crate::tools::{builtin_tool, tree_tool_declaration, TreeTool};
@@ -42,7 +42,7 @@ pub fn execute(
     let Some(tool) = tool(name) else {
         return crate::error_block(id, "unknown history tool");
     };
-    // `None`: these run in-process against the conversation's own object store,
+    // `None`: these run in-process against the session's own object store,
     // with no materialized tree, and their parameters are all `{string}`.
     let bound = match crate::tools::tree_tool_args(call, &tool, None) {
         Ok(bound) => bound,

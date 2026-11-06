@@ -1,0 +1,150 @@
+use super::oid::hex_lower;
+
+pub const FORMAT: &str = ".caos/format";
+/// The format this build writes into every new session.
+pub const FORMAT_BYTES: &str = "caos-session-v7\n";
+/// v6 is v7 under the names from before caos called a conversation a session:
+/// `conversation.root`/`conversation.fork` commits and a transcript entry's
+/// `conversation` key. A v6 session is read and appended to as v6; forking one
+/// makes a v7 session.
+pub const V6_FORMAT_BYTES: &str = "caos-conversation-v6\n";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Format {
+    V6,
+    V7,
+}
+pub const IDENTITY: &str = ".caos/identity.json";
+pub const TITLE: &str = ".caos/title";
+pub const TRANSCRIPT_DIR: &str = ".caos/transcript";
+pub const CALLS_DIR: &str = ".caos/tools";
+pub const CAOS_DIR: &str = ".caos";
+pub const CONFLICTS_LEDGER: &str = ".caos/conflicts";
+
+const MAX_PATH_COMPONENT: usize = 255;
+pub const MAX_PATH: usize = 4096;
+const MAX_TREE_DEPTH: usize = 64;
+pub const MAX_TITLE: usize = 1024;
+pub const MAX_JSON_INT: u64 = 9_007_199_254_740_991;
+
+pub fn validate_format(bytes: &[u8]) -> Result<(), String> {
+    parse_format(bytes).map(|_| ())
+}
+
+pub fn parse_format(bytes: &[u8]) -> Result<Format, String> {
+    match bytes {
+        bytes if bytes == FORMAT_BYTES.as_bytes() => Ok(Format::V7),
+        bytes if bytes == V6_FORMAT_BYTES.as_bytes() => Ok(Format::V6),
+        b"caos-conversation-v5\n" => Err("unsupported session format v5 (turn records); this build reads v6 and v7, a flat transcript. Open it with an earlier v5 build".into()),
+        b"caos-conversation-v4\n" => Err("unsupported session format v4; this build reads v6 and v7. Open it with the earlier v4 build".into()),
+        _ => Err("session format is invalid".into()),
+    }
+}
+
+pub fn validate_component(name: &str) -> Result<(), String> {
+    let lower = name.to_ascii_lowercase();
+    if name.is_empty()
+        || name.len() > MAX_PATH_COMPONENT
+        || matches!(name, "." | "..")
+        || name.bytes().any(|byte| matches!(byte, b'/' | 0))
+        || lower == ".git"
+        || lower == "git~1"
+        || name.ends_with(['.', ' '])
+    {
+        return Err(format!("invalid tree path component {name:?}"));
+    }
+    Ok(())
+}
+
+pub fn validate_tree_path(path: &str) -> Result<(), String> {
+    if path.is_empty() || path.len() > MAX_PATH || path.starts_with('/') || path.ends_with('/') {
+        return Err(format!("invalid tree path {path:?}"));
+    }
+    let components: Vec<&str> = path.split('/').collect();
+    if components.len() > MAX_TREE_DEPTH {
+        return Err(format!("invalid tree path {path:?}"));
+    }
+    for component in components {
+        validate_component(component).map_err(|_| format!("invalid tree path {path:?}"))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_unique(values: &[String], what: &str) -> Result<(), String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for value in values {
+        if !seen.insert(value) {
+            return Err(format!("duplicate {what} {value:?}"));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_source_tree_name(name: &str) -> Result<(), String> {
+    validate_tree_path(name)?;
+    if name == CAOS_DIR || name.starts_with(".caos/") {
+        return Err("code references belong outside .caos".into());
+    }
+    Ok(())
+}
+
+pub fn validate_protocol_id_component(id: &str) -> Result<(), String> {
+    if id.is_empty()
+        || id.len() > MAX_PATH_COMPONENT
+        || id.starts_with('.')
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(format!("invalid protocol id component {id:?}"));
+    }
+    Ok(())
+}
+
+pub fn admit_external_id(id: &str) -> String {
+    if validate_protocol_id_component(id).is_ok() {
+        id.to_string()
+    } else {
+        hex_lower(id.as_bytes())
+    }
+}
+
+pub fn source_tree_commit_path(name: &str) -> String {
+    name.to_string()
+}
+
+pub fn transcript_entry_path(ordinal: u64, message_id: &str) -> String {
+    format!("{TRANSCRIPT_DIR}/{ordinal:012}-{message_id}.json")
+}
+
+pub fn transcript_payload_dir(ordinal: u64, message_id: &str) -> String {
+    format!("{TRANSCRIPT_DIR}/{ordinal:012}-{message_id}")
+}
+
+/// Where a call's payloads live: under its id alone, which is unique within a
+/// session (a model's `tool_use` id, or the harness's).
+pub fn call_payload_dir(tool_id: &str) -> String {
+    format!("{CALLS_DIR}/{}", admit_external_id(tool_id))
+}
+
+pub fn files_path(relative: &str) -> String {
+    relative.to_string()
+}
+
+pub fn parse_transcript_entry_path(path: &str) -> Result<(u64, String), String> {
+    let invalid = || format!("invalid transcript entry path {path:?}");
+    let rest = path
+        .strip_prefix(&format!("{TRANSCRIPT_DIR}/"))
+        .ok_or_else(invalid)?;
+    let filename = rest;
+    let stem = filename.strip_suffix(".json").ok_or_else(invalid)?;
+    let (ordinal, message_id) = stem.split_once('-').ok_or_else(invalid)?;
+    if ordinal.len() != 12
+        || !ordinal.bytes().all(|byte| byte.is_ascii_digit())
+        || validate_protocol_id_component(message_id).is_err()
+    {
+        return Err(invalid());
+    }
+    let ordinal = ordinal.parse::<u64>().map_err(|_| invalid())?;
+    Ok((ordinal, message_id.to_string()))
+}

@@ -6,7 +6,7 @@
 # `instructions` that tell the model how the five fit together. `tools/list` is a
 # CONSTANT: it needs no step, no cache, no warm-up hook and no server, so there is
 # nothing for a re-list-averse client to miss. A call is one request to the server,
-# and what a tool runs is named by a PATH in the conversation.
+# and what a tool runs is named by a PATH in the session.
 #
 # The regressions this guards: a listing that waited on a worker run (a first
 # session in a tree built the step before the client's startup budget ran out, and
@@ -205,8 +205,8 @@ printf '{"hook_event_name":"UserPromptSubmit","session_id":"%s","prompt":"test g
   | "$CAOS_CLI" mcp hook $CAOS_MCP_ARGS "$(mcp_base_arg)"
 key=$(printf 'cc/%s' "$session" | od -An -tx1 | tr -d ' \n')
 # The prompt hook recorded it on the server; fetch it.
-git fetch -q caos "+refs/caos/v3/conversations/$key/head:refs/caos/v3/conversations/$key/head"
-head=$(git rev-parse "refs/caos/v3/conversations/$key/head")
+git fetch -q caos "+refs/caos/v4/sessions/$key/head:refs/caos/v4/sessions/$key/head"
+head=$(git rev-parse "refs/caos/v4/sessions/$key/head")
 # Discover the repository mount, so this test does not prescribe startup's
 # source-tree prefix (or require a prefix if startup mounts content directly).
 prefix=$(git ls-tree -r "$head" | awk '$1 == "160000" && !found {print $4; found=1}')
@@ -289,7 +289,7 @@ hook() { # <event JSON>
   printf '%s\n' "$1" | "$CAOS_CLI" mcp hook $CAOS_MCP_ARGS "$(mcp_base_arg)"
 }
 hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$held\",\"prompt\":\"run slow\"}"
-held_ref="refs/caos/v3/conversations/$(printf 'cc/%s' "$held" | od -An -tx1 | tr -d ' \n')/head"
+held_ref="refs/caos/v4/sessions/$(printf 'cc/%s' "$held" | od -An -tx1 | tr -d ' \n')/head"
 send "$(jq -nc --arg session "$held" --arg path "${prefix}slow" --arg request_id "$held" \
   '{jsonrpc:"2.0",id:30,method:"tools/call",params:{name:"run",arguments:{
     caos_session:$session,caos_tool_use_id:"held-30",path:$path,
@@ -324,7 +324,7 @@ sync_held
 # Stop (which came while the call ran), the call's start, and its declaration.
 subjects=$(git log --format=%s "$held_ref" | tr '\n' ' ')
 case "$subjects" in
-  "message.append message.append tool.complete message.append tool.start message.append message.append conversation.root "*) ;;
+  "message.append message.append tool.complete message.append tool.start message.append message.append session.root "*) ;;
   *) fail "the backgrounded call was not recorded as it happened: $subjects" ;;
 esac
 
@@ -335,7 +335,7 @@ echo "== a started call loses nothing to the Stop right behind its ticket ==" >&
 # and kept failing, for its ticket is the call's id. A Stop closes nothing now.
 started="mcp-start-$(date +%s)-$$"
 hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$started\",\"prompt\":\"start slow\"}"
-started_ref="refs/caos/v3/conversations/$(printf 'cc/%s' "$started" | od -An -tx1 | tr -d ' \n')/head"
+started_ref="refs/caos/v4/sessions/$(printf 'cc/%s' "$started" | od -An -tx1 | tr -d ' \n')/head"
 send "$(jq -nc --arg session "$started" --arg path "${prefix}slow" --arg request_id "$started" \
   '{jsonrpc:"2.0",id:40,method:"tools/call",params:{name:"start",arguments:{
     caos_session:$session,caos_tool_use_id:"started-40",path:$path,

@@ -1,4 +1,4 @@
-# std/files — the file tools of a conversation tree: read, ls, write, edit, copy,
+# std/files — the file tools of a session tree: read, ls, write, edit, copy,
 # move and remove. ONE crate, SEVEN entries: `std/read`, `std/ls` and the rest
 # are directories of their own (each with its `.caos-expr` and its `help`) that
 # build THIS source and curry `--op=<name>`, so the tools have paths and docs of

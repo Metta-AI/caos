@@ -1,11 +1,11 @@
-//! The conversation client has its own harness checkout. Attached code never
+//! The session client has its own harness checkout. Attached code never
 //! replaces that harness, and launcher state never enters a source tree.
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use caos::GitTransport;
-use conversation_protocol::v3::{GitStore, Oid};
+use session_protocol::v3::{GitStore, Oid};
 
 use super::args::Args;
 
@@ -30,7 +30,7 @@ fn data_dir() -> Result<PathBuf, String> {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
-        .ok_or("set XDG_DATA_HOME or HOME for the conversation client")?;
+        .ok_or("set XDG_DATA_HOME or HOME for the session client")?;
     Ok(base.join("caos"))
 }
 
@@ -67,9 +67,9 @@ pub(super) fn prepare(args: &mut Args) -> Result<PathBuf, String> {
         args.turn.system =
             Some(fs::read_to_string(&file).map_err(|e| format!("reading {file}: {e}"))?);
     }
-    let mut seed = conversation_protocol::v3::tree::TreeBuilder::from(None);
+    let mut seed = session_protocol::v3::tree::TreeBuilder::from(None);
     if let Some(name) = &args.import {
-        conversation_protocol::v3::paths::validate_source_tree_name(name)?;
+        session_protocol::v3::paths::validate_source_tree_name(name)?;
         let repository = match &args.import_source {
             Some(repository) => repository.clone(),
             None => checkout
@@ -89,13 +89,9 @@ pub(super) fn prepare(args: &mut Args) -> Result<PathBuf, String> {
                     .as_deref()
                     .or(args.turn.base.as_deref()),
             )?;
-        seed.put_oid(
-            name,
-            conversation_protocol::v3::Mode::Commit,
-            commit.clone(),
-        );
+        seed.put_oid(name, session_protocol::v3::Mode::Commit, commit.clone());
         if let Some((path, bytes)) = metadata {
-            seed.put(&path, conversation_protocol::v3::Mode::Blob, bytes);
+            seed.put(&path, session_protocol::v3::Mode::Blob, bytes);
         }
         args.turn.base = Some(commit.to_string());
         if args.from_commit.is_some() {
@@ -228,7 +224,7 @@ fn create_harness(source: &Path, data: &Path) -> Result<PathBuf, String> {
             "commit",
             "--quiet",
             "-m",
-            "conversation harness",
+            "session harness",
         ],
     )?;
     match fs::rename(&staging.0, &destination) {
@@ -302,16 +298,16 @@ fn create_client(
     }
 }
 
-/// Local checkout preferences are keyed by conversation and gitlink path, never
-/// inferred from a publishing destination or included in conversation content.
-fn checkout_key(client: &Path, conversation: &str, source: &str) -> Result<String, String> {
+/// Local checkout preferences are keyed by session and gitlink path, never
+/// inferred from a publishing destination or included in session content.
+fn checkout_key(client: &Path, session: &str, source: &str) -> Result<String, String> {
     Ok(format!(
         "caos.checkout-{}",
         hash_key(
             client,
             &serde_json::json!([
                 git(client, &["remote", "get-url", "caos"]).ok(),
-                conversation,
+                session,
                 source
             ])
         )?
@@ -320,7 +316,7 @@ fn checkout_key(client: &Path, conversation: &str, source: &str) -> Result<Strin
 
 pub(super) fn remember_checkout(
     client: &Path,
-    conversation: &str,
+    session: &str,
     source: &str,
     destination: &Path,
 ) -> Result<(), String> {
@@ -330,7 +326,7 @@ pub(super) fn remember_checkout(
             "config",
             "--file",
             &git(client, &["config", "--get", "caos.checkout-settings"])?,
-            &checkout_key(client, conversation, source)?,
+            &checkout_key(client, session, source)?,
             &destination.to_string_lossy(),
         ],
     )?;
@@ -340,7 +336,7 @@ pub(super) fn remember_checkout(
 /// Publication preferences stay beside local checkout preferences, outside CAOS.
 pub(super) fn checkout_for(
     client: &Path,
-    conversation: &str,
+    session: &str,
     source: &str,
     head: &str,
 ) -> Result<PathBuf, String> {
@@ -352,7 +348,7 @@ pub(super) fn checkout_for(
             &git(client, &["config", "--get", "caos.checkout-settings"])?,
             "--null",
             "--get",
-            &checkout_key(client, conversation, source)?,
+            &checkout_key(client, session, source)?,
         ],
     )
     .map_err(|_| {
@@ -486,9 +482,9 @@ mod tests {
             ],
         )
         .unwrap();
-        remember_checkout(&checkout, "conversation", "feature/dirty", &client).unwrap();
+        remember_checkout(&checkout, "session", "feature/dirty", &client).unwrap();
         assert_eq!(
-            checkout_for(&checkout, "conversation", "feature/dirty", head.as_str()).unwrap(),
+            checkout_for(&checkout, "session", "feature/dirty", head.as_str()).unwrap(),
             client
         );
         import_local_commit(&checkout, &client, &head).unwrap();
@@ -556,13 +552,12 @@ mod tests {
             fs::read_to_string(first.join("DEPS")).unwrap(),
             "./std/llm-step llm-step\n"
         );
-        let error =
-            checkout_for(&first, "conversation", "feature/dirty", &"a".repeat(40)).unwrap_err();
+        let error = checkout_for(&first, "session", "feature/dirty", &"a".repeat(40)).unwrap_err();
         assert!(error.contains("choose a local destination"));
-        remember_checkout(&first, "conversation", "feature/dirty", &first).unwrap();
+        remember_checkout(&first, "session", "feature/dirty", &first).unwrap();
         let head = git(&first, &["rev-parse", "HEAD"]).unwrap();
         assert_eq!(
-            checkout_for(&third, "conversation", "feature/dirty", &head).unwrap(),
+            checkout_for(&third, "session", "feature/dirty", &head).unwrap(),
             first
         );
         assert!(checkout_for(&third, "other", "feature/dirty", &head).is_err());

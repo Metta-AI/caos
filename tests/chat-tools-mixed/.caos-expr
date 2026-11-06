@@ -6,6 +6,6 @@
 # loop, which has its own test. std/llm-test/worker-common.sh does the three
 # steps that were plumbing.
 #
-# dev/worker-test, not std/bash: the conversation REF is the completion signal,
+# dev/worker-test, not std/bash: the session REF is the completion signal,
 # and refs on the server are the one thing caos gives a worker no verb for.
 curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --bash:@=DEEP-DEPS/bash --bash-tool:@=DEEP-DEPS/bash-tool --merge:@=DEEP-DEPS/merge --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --tool:@=DEEP-DEPS/llm-test-tool --common:@=DEEP-DEPS/llm-test/worker-common.sh

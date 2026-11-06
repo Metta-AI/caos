@@ -40,5 +40,5 @@ path = "../caos-eval"
 [dependencies.git-locator]
 path = "../git-locator"
 
-[dependencies.conversation-protocol]
-path = "../conversation-protocol"
+[dependencies.session-protocol]
+path = "../session-protocol"

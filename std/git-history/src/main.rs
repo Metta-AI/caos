@@ -1,18 +1,18 @@
 //! `log`, `show` and `diff` over a source tree's git history.
 //!
 //! They were built into `llm-step`, which ran them in-process against the
-//! conversation's own object store. They are std tools now (`std/log`,
+//! session's own object store. They are std tools now (`std/log`,
 //! `std/show`, `std/diff`): each curries this binary with `--op=<name>`.
 //!
-//! A source tree is a COMMIT entry in the conversation's tree, and the history is
+//! A source tree is a COMMIT entry in the session's tree, and the history is
 //! that commit's: the tool takes the tree's path (`source-tree`), finds the
 //! entry as stored, and asks git about it. Git history is what the tree alone
 //! cannot say, which is why these need a commit and not the `in` tree's content.
 //!
 //! REVISIONS are a commit hash, `HEAD` (the source tree's own commit), and
 //! `~N`/`^` ancestry on either, or (for `diff`) the path of another source tree in the
-//! conversation, which names that tree's own commit. Branch and tag names are not available: they
-//! resolved from a snapshot of the conversation's refs, which a tool run on its
+//! session, which names that tree's own commit. Branch and tag names are not available: they
+//! resolved from a snapshot of the session's refs, which a tool run on its
 //! own does not have.
 //!
 //! A call the model got wrong is a VALUE (a `report` that opens `FAILED`), never
@@ -23,8 +23,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use conversation_protocol::v3::git_store::HistoryQuery;
-use conversation_protocol::v3::{GitStore, ObjectStore, Oid};
+use session_protocol::v3::git_store::HistoryQuery;
+use session_protocol::v3::{GitStore, ObjectStore, Oid};
 use worker_common::{arg, caos, cas_hash, cas_kind, path, read_arg, run_worker, scratch};
 
 fn main() -> ExitCode {
@@ -139,7 +139,7 @@ fn commit_at(raw: &str) -> Result<Oid, Failure> {
 /// A revision as git history takes it: `HEAD`/`wc`/`@` or a commit hash, then any
 /// `~N`/`^` ancestry.
 fn revision(store: &GitStore, head: &Oid, spec: &str) -> Result<Oid, Failure> {
-    // A path names another source tree in the conversation (`sources/foo/99-dirty`):
+    // A path names another source tree in the session (`sources/foo/99-dirty`):
     // its own commit, which may sit on a different line of history than `head`.
     if spec.contains('/') {
         let commit = commit_at(spec)?;

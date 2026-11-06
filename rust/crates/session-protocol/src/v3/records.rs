@@ -1,0 +1,1700 @@
+pub use super::tasks::TaskStatus;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
+
+#[cfg(test)]
+use super::canonical::canonical_object;
+use super::canonical::{canonical_bytes, parse_canonical};
+use super::oid::Oid;
+use super::paths::{self, validate_tree_path};
+
+#[cfg(test)]
+fn obj(fields: &[(&str, Value)]) -> Value {
+    canonical_object(fields)
+}
+
+#[cfg(test)]
+fn value_str(value: &str) -> Value {
+    Value::String(value.to_string())
+}
+
+fn path(value: &str, what: &str) -> Result<(), String> {
+    validate_tree_path(value)?;
+    if !value.starts_with(".caos/") {
+        return Err(format!("{what} must start with .caos/, got {value:?}"));
+    }
+    Ok(())
+}
+
+fn relative_path(value: &str, what: &str) -> Result<(), String> {
+    validate_tree_path(value).map_err(|_| format!("invalid {what} {value:?}"))
+}
+
+fn encode_record(value: Value) -> Vec<u8> {
+    canonical_bytes(&value).expect("record values are canonical JSON objects")
+}
+
+fn nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer)
+}
+
+fn some_of<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer).map(Some)
+}
+
+fn absent<T>(value: &Option<T>) -> bool {
+    value.is_none()
+}
+
+mod arguments_path {
+    use super::*;
+
+    #[derive(Serialize)]
+    struct Arguments<'a> {
+        path: &'a str,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct OwnedArguments {
+        path: String,
+    }
+
+    pub fn serialize<S>(value: &String, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        Arguments { path: value }.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<String, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        OwnedArguments::deserialize(deserializer).map(|arguments| arguments.path)
+    }
+}
+
+pub(crate) trait Record: Sized {
+    fn to_value(&self) -> Value;
+    fn from_value(value: &Value) -> Result<Self, String>;
+}
+
+macro_rules! impl_record {
+    ($type:ty $(, $validate:ident)?) => {
+        impl $type {
+            pub fn to_value(&self) -> Value {
+                serde_json::to_value(self).expect("record serialization is infallible")
+            }
+
+            pub fn from_value(value: &Value) -> Result<Self, String> {
+                let record: Self =
+                    serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
+                $(record.$validate()?;)?
+                Ok(record)
+            }
+
+            pub fn encode(&self) -> Vec<u8> {
+                encode_record(self.to_value())
+            }
+
+            pub fn parse(bytes: &[u8]) -> Result<Self, String> {
+                Self::from_value(&parse_canonical(bytes)?)
+            }
+        }
+
+        impl Record for $type {
+            fn to_value(&self) -> Value {
+                <$type>::to_value(self)
+            }
+
+            fn from_value(value: &Value) -> Result<Self, String> {
+                <$type>::from_value(value)
+            }
+        }
+    };
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IdentityKind {
+    Root,
+    Fork { source: Oid },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Owner {
+    pub parent: String,
+    pub parent_head: Oid,
+    /// The id of the parent's call that spawned this session.
+    pub tool: String,
+}
+
+impl_record!(Owner, validate);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawIdentity", into = "RawIdentity")]
+pub struct Identity {
+    pub id: String,
+    pub kind: IdentityKind,
+    pub owner: Option<Owner>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawIdentity {
+    id: String,
+    kind: String,
+    #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
+    source: Option<Oid>,
+    #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
+    owner: Option<Owner>,
+}
+
+impl TryFrom<RawIdentity> for Identity {
+    type Error = String;
+
+    fn try_from(raw: RawIdentity) -> Result<Self, Self::Error> {
+        let kind = match (raw.kind.as_str(), raw.source) {
+            ("root", None) => IdentityKind::Root,
+            ("root", Some(_)) => return Err("identity source is forbidden for root".to_string()),
+            ("fork", Some(source)) => IdentityKind::Fork { source },
+            ("fork", None) => return Err("identity source is required for fork".to_string()),
+            (kind, _) => return Err(format!("invalid identity kind {kind:?}")),
+        };
+        if raw.owner.is_some() && !matches!(kind, IdentityKind::Root) {
+            return Err("identity owner is only allowed for root".to_string());
+        }
+        Ok(Identity {
+            id: raw.id,
+            kind,
+            owner: raw.owner,
+        })
+    }
+}
+
+impl From<Identity> for RawIdentity {
+    fn from(identity: Identity) -> Self {
+        let (kind, source) = match identity.kind {
+            IdentityKind::Root => ("root".to_string(), None),
+            IdentityKind::Fork { source } => ("fork".to_string(), Some(source)),
+        };
+        RawIdentity {
+            id: identity.id,
+            kind,
+            source,
+            owner: identity.owner,
+        }
+    }
+}
+
+impl_record!(Identity, validate);
+impl Identity {
+    pub fn content_bytes(&self) -> Vec<u8> {
+        let mut value = self.to_value();
+        let object = value.as_object_mut().expect("identity object");
+        object.remove("kind");
+        object.remove("source");
+        encode_record(value)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceTreeRecord {
+    pub commit: Oid,
+}
+
+impl_record!(SourceTreeRecord);
+
+pub fn encode_title(title: &str) -> Result<Vec<u8>, String> {
+    if title.is_empty()
+        || title.len() > paths::MAX_TITLE
+        || title.bytes().any(|byte| matches!(byte, 0 | b'\r' | b'\n'))
+    {
+        return Err(format!("invalid session title {title:?}"));
+    }
+    Ok(format!("{title}\n").into_bytes())
+}
+
+pub fn parse_title(bytes: &[u8]) -> Result<String, String> {
+    let title = bytes
+        .strip_suffix(b"\n")
+        .ok_or_else(|| "session title must end with LF".to_string())?;
+    let title = std::str::from_utf8(title)
+        .map_err(|_| "session title must be UTF-8".to_string())?
+        .to_string();
+    if encode_title(&title)? != bytes {
+        return Err("invalid session title encoding".to_string());
+    }
+    Ok(title)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    User,
+    Assistant,
+    System,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Block {
+    Text {
+        text: String,
+    },
+    Payload {
+        path: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        #[serde(with = "arguments_path")]
+        arguments: String,
+    },
+}
+
+impl_record!(Block, validate);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Proposal {
+    pub base: Oid,
+    pub commit: Oid,
+    #[serde(alias = "workspace_name")]
+    pub source_tree_name: String,
+}
+
+impl_record!(Proposal, validate);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MergeInfo {
+    pub base: Oid,
+    pub ours: Oid,
+    pub theirs: Oid,
+    pub implementation: String,
+    #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
+    pub output: Option<Oid>,
+    #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
+    pub conflict_paths: Option<Vec<String>>,
+}
+
+impl_record!(MergeInfo, validate);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SourceTreeResolution {
+    AlreadyApplied {
+        current: Oid,
+        #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
+        candidate: Option<Oid>,
+    },
+    Direct {
+        current: Oid,
+        output: Oid,
+    },
+    Merged {
+        current: Oid,
+        merge: MergeInfo,
+        output: Oid,
+    },
+    Conflict {
+        #[serde(deserialize_with = "nullable")]
+        current: Option<Oid>,
+        candidate: Oid,
+        #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
+        merge: Option<MergeInfo>,
+    },
+}
+
+impl SourceTreeResolution {
+    pub fn new_pointer(&self) -> Option<&Oid> {
+        match self {
+            SourceTreeResolution::AlreadyApplied { .. } | SourceTreeResolution::Conflict { .. } => {
+                None
+            }
+            SourceTreeResolution::Direct { output, .. }
+            | SourceTreeResolution::Merged { output, .. } => Some(output),
+        }
+    }
+
+    pub fn candidate(&self) -> Option<&Oid> {
+        match self {
+            SourceTreeResolution::AlreadyApplied { candidate, .. } => candidate.as_ref(),
+            SourceTreeResolution::Direct { output, .. } => Some(output),
+            SourceTreeResolution::Merged { merge, .. } => Some(&merge.theirs),
+            SourceTreeResolution::Conflict { candidate, .. } => Some(candidate),
+        }
+    }
+}
+
+impl_record!(SourceTreeResolution, validate);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TranscriptEntry {
+    pub message_id: String,
+    /// `conversation` in a v6 session ([`TranscriptEntry::encode_as`]).
+    #[serde(alias = "conversation")]
+    pub session: String,
+    pub role: Role,
+    pub actor: String,
+    #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
+    pub model: Option<String>,
+    pub blocks: Vec<Block>,
+    #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
+    pub proposal: Option<Proposal>,
+    #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
+    #[serde(alias = "workspace_resolution")]
+    pub source_tree_resolution: Option<SourceTreeResolution>,
+}
+
+impl_record!(TranscriptEntry, validate);
+
+impl TranscriptEntry {
+    /// The entry's bytes in a session of `format`: v6 spells the `session` key
+    /// `conversation`, as it was written before the rename.
+    pub fn encode_as(&self, format: super::paths::Format) -> Vec<u8> {
+        let mut value = self.to_value();
+        if format == super::paths::Format::V6 {
+            let object = value
+                .as_object_mut()
+                .expect("a transcript entry is an object");
+            let session = object
+                .remove("session")
+                .expect("an entry names its session");
+            object.insert("conversation".to_string(), session);
+        }
+        encode_record(value)
+    }
+}
+
+/// The text of the system message a person appends to stop whatever is driving
+/// the session. It is a fact in the transcript like any other: a driver
+/// that sees one after the prompt it is answering stops, and the calls it had
+/// not finished are left as they are.
+pub const INTERRUPT_TEXT: &str = "Interrupted.";
+
+impl TranscriptEntry {
+    /// Whether this entry is an interruption (`INTERRUPT_TEXT`).
+    pub fn is_interrupt(&self) -> bool {
+        self.role == Role::System
+            && matches!(self.blocks.as_slice(), [Block::Text { text }] if text == INTERRUPT_TEXT)
+    }
+
+    /// The `tool_use` blocks this entry declares, as (id, name, arguments path).
+    pub fn tool_uses(&self) -> impl Iterator<Item = (&str, &str, &str)> {
+        self.blocks.iter().filter_map(|block| match block {
+            Block::ToolUse {
+                id,
+                name,
+                arguments,
+            } => Some((id.as_str(), name.as_str(), arguments.as_str())),
+            _ => None,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CallStatus {
+    Started,
+    Complete,
+    Failed,
+    Cancelled,
+    Conflict,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+pub enum ToolResult {
+    Complete {
+        observation: String,
+        #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
+        proposal: Option<Oid>,
+    },
+    Failed {
+        error: String,
+    },
+    Cancelled {
+        reason: String,
+    },
+}
+
+impl_record!(ToolResult, validate);
+
+impl ToolResult {
+    pub fn observation(&self) -> Option<&str> {
+        match self {
+            ToolResult::Complete { observation, .. } => Some(observation),
+            ToolResult::Failed { .. } | ToolResult::Cancelled { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilesOutcome {
+    pub applied: Vec<String>,
+    pub conflicted: Vec<String>,
+}
+
+impl_record!(FilesOutcome, validate);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawCallRecord", into = "RawCallRecord")]
+pub struct CallRecord {
+    pub id: String,
+    pub name: String,
+    pub declaration_message: String,
+    #[serde(alias = "workspace_name")]
+    pub source_tree_name: Option<String>,
+    #[serde(alias = "input_workspace", alias = "input_source_tree")]
+    pub input_commit: Option<Oid>,
+    pub status: CallStatus,
+    pub task: Option<Oid>,
+    pub result: Option<ToolResult>,
+    #[serde(alias = "workspace_resolution")]
+    pub source_tree_resolution: Option<SourceTreeResolution>,
+    pub files: Vec<String>,
+    pub files_outcome: Option<FilesOutcome>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCallRecord {
+    id: String,
+    name: String,
+    declaration_message: String,
+    #[serde(deserialize_with = "nullable")]
+    #[serde(alias = "workspace_name")]
+    source_tree_name: Option<String>,
+    #[serde(deserialize_with = "nullable")]
+    #[serde(alias = "input_workspace", alias = "input_source_tree")]
+    input_commit: Option<Oid>,
+    status: CallStatus,
+    #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
+    task: Option<Oid>,
+    #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
+    result: Option<ToolResult>,
+    #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
+    #[serde(alias = "workspace_resolution")]
+    source_tree_resolution: Option<SourceTreeResolution>,
+    #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
+    files: Option<Vec<String>>,
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "absent"
+    )]
+    files_outcome: Option<Option<FilesOutcome>>,
+}
+
+impl TryFrom<RawCallRecord> for CallRecord {
+    type Error = String;
+
+    fn try_from(raw: RawCallRecord) -> Result<Self, Self::Error> {
+        let (files, files_outcome) = if raw.status == CallStatus::Started {
+            if raw.result.is_some()
+                || raw.source_tree_resolution.is_some()
+                || raw.files.is_some()
+                || raw.files_outcome.is_some()
+            {
+                return Err("started tool carries invalid fields".to_string());
+            }
+            (Vec::new(), None)
+        } else {
+            if raw.result.is_none() {
+                return Err("terminal tool requires result".to_string());
+            }
+            (
+                raw.files
+                    .ok_or_else(|| "terminal tool requires files".to_string())?,
+                raw.files_outcome
+                    .ok_or_else(|| "terminal tool requires files_outcome".to_string())?,
+            )
+        };
+        let record = CallRecord {
+            id: raw.id,
+            name: raw.name,
+            declaration_message: raw.declaration_message,
+            source_tree_name: raw.source_tree_name,
+            input_commit: raw.input_commit,
+            status: raw.status,
+            task: raw.task,
+            result: raw.result,
+            source_tree_resolution: raw.source_tree_resolution,
+            files,
+            files_outcome,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+}
+
+impl From<CallRecord> for RawCallRecord {
+    fn from(record: CallRecord) -> Self {
+        let terminal = record.status != CallStatus::Started;
+        RawCallRecord {
+            id: record.id,
+            name: record.name,
+            declaration_message: record.declaration_message,
+            source_tree_name: record.source_tree_name,
+            input_commit: record.input_commit,
+            status: record.status,
+            task: record.task,
+            result: record.result,
+            source_tree_resolution: record.source_tree_resolution,
+            files: terminal.then_some(record.files),
+            files_outcome: terminal.then_some(record.files_outcome),
+        }
+    }
+}
+
+impl CallRecord {
+    fn validate(&self) -> Result<(), String> {
+        if let Some(source_tree_name) = &self.source_tree_name {
+            paths::validate_source_tree_name(source_tree_name)?;
+        }
+        if self.source_tree_name.is_some() && self.input_commit.is_none() {
+            return Err("a selected source tree requires an input commit".to_string());
+        }
+        if self.source_tree_resolution.is_some() && self.source_tree_name.is_none() {
+            return Err("tool source_tree_resolution requires source_tree_name".to_string());
+        }
+        if self.status == CallStatus::Started {
+            if self.result.is_some()
+                || self.source_tree_resolution.is_some()
+                || !self.files.is_empty()
+                || self.files_outcome.is_some()
+            {
+                return Err("started tool carries terminal fields".to_string());
+            }
+        } else {
+            let result = self
+                .result
+                .as_ref()
+                .ok_or_else(|| "terminal tool requires result".to_string())?;
+            if Self::expected_status(result, self.source_tree_resolution.as_ref()) != self.status {
+                return Err("tool status does not match result".to_string());
+            }
+        }
+        match (&self.result, &self.source_tree_resolution) {
+            (
+                Some(ToolResult::Complete {
+                    proposal: Some(_), ..
+                }),
+                Some(_),
+            )
+            | (Some(ToolResult::Complete { .. }), None)
+            | (None, None) => {}
+            (Some(ToolResult::Complete { proposal: None, .. }), Some(_)) => {
+                return Err("tool source_tree_resolution requires proposal".to_string())
+            }
+            (_, Some(_)) => {
+                return Err("tool source_tree_resolution requires complete result".to_string())
+            }
+            _ => {}
+        }
+        if let Some(result) = &self.result {
+            result.validate()?;
+        }
+        if let Some(resolution) = &self.source_tree_resolution {
+            resolution.validate()?;
+        }
+        if let Some(outcome) = &self.files_outcome {
+            outcome.validate()?;
+        }
+        for item in &self.files {
+            relative_path(item, "tool file path")?;
+        }
+        Ok(())
+    }
+}
+
+impl CallRecord {
+    pub fn is_terminal(&self) -> bool {
+        self.status != CallStatus::Started
+    }
+
+    pub fn expected_status(
+        result: &ToolResult,
+        resolution: Option<&SourceTreeResolution>,
+    ) -> CallStatus {
+        match result {
+            ToolResult::Complete { .. }
+                if matches!(resolution, Some(SourceTreeResolution::Conflict { .. })) =>
+            {
+                CallStatus::Conflict
+            }
+            ToolResult::Complete { .. } => CallStatus::Complete,
+            ToolResult::Failed { .. } => CallStatus::Failed,
+            ToolResult::Cancelled { .. } => CallStatus::Cancelled,
+        }
+    }
+}
+
+impl_record!(CallRecord);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AsyncRecord {
+    pub task: Oid,
+    pub status: TaskStatus,
+    #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
+    pub target_ref: Option<String>,
+    #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
+    pub result: Option<Oid>,
+    #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
+    pub reason: Option<String>,
+}
+impl_record!(AsyncRecord, validate);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpawnIntent {
+    pub tool: String,
+    pub prompt: String,
+    pub model: String,
+    pub configuration: String,
+    pub content: Oid,
+}
+impl_record!(SpawnIntent, validate);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChildRecord {
+    pub id: String,
+    pub initial_head: Oid,
+    pub request: Oid,
+    pub relay: Oid,
+    pub spawn_intent: SpawnIntent,
+    #[serde(with = "child_status")]
+    pub status: TaskStatus,
+    #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
+    pub terminal_head: Option<Oid>,
+}
+impl_record!(ChildRecord, validate);
+
+mod child_status {
+    use super::TaskStatus;
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(status: &TaskStatus, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(match status {
+            TaskStatus::Pending => "running",
+            TaskStatus::Complete => "completed",
+            TaskStatus::Failed => "failed",
+            TaskStatus::Cancelled => "cancelled",
+        })
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<TaskStatus, D::Error> {
+        match String::deserialize(deserializer)?.as_str() {
+            "running" => Ok(TaskStatus::Pending),
+            "completed" => Ok(TaskStatus::Complete),
+            "failed" => Ok(TaskStatus::Failed),
+            "cancelled" => Ok(TaskStatus::Cancelled),
+            other => Err(serde::de::Error::custom(format!(
+                "invalid child status {other:?}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Descriptor {
+    pub source_base: Oid,
+    pub source_head: Oid,
+    pub target_base: Oid,
+    pub policy: String,
+    pub implementation: String,
+    pub commit_policy: String,
+}
+impl_record!(Descriptor, validate);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PublicationStatus {
+    Pending,
+    Complete,
+    Conflict,
+    Uncertain,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Evidence {
+    pub kind: String,
+    #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
+    pub diagnostic: Option<String>,
+}
+impl_record!(Evidence, validate);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawPublicationRecord", into = "RawPublicationRecord")]
+pub struct PublicationRecord {
+    pub id: String,
+    pub key: String,
+    pub descriptor: Descriptor,
+    pub planned_head: Oid,
+    pub repository: String,
+    pub refname: String,
+    pub expected_old: Option<Oid>,
+    #[serde(alias = "workspace_name")]
+    pub source_tree_name: String,
+    pub status: PublicationStatus,
+    pub evidence: Option<Evidence>,
+    pub observed: Option<Oid>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPublicationRecord {
+    id: String,
+    key: String,
+    descriptor: Descriptor,
+    planned_head: Oid,
+    repository: String,
+    #[serde(rename = "ref")]
+    refname: String,
+    #[serde(deserialize_with = "nullable")]
+    expected_old: Option<Oid>,
+    #[serde(alias = "workspace_name")]
+    source_tree_name: String,
+    status: PublicationStatus,
+    #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
+    evidence: Option<Evidence>,
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "absent"
+    )]
+    observed: Option<Option<Oid>>,
+}
+
+impl TryFrom<RawPublicationRecord> for PublicationRecord {
+    type Error = String;
+
+    fn try_from(raw: RawPublicationRecord) -> Result<Self, Self::Error> {
+        let observed = if raw.status == PublicationStatus::Pending {
+            if raw.evidence.is_some() || raw.observed.is_some() {
+                return Err("pending publication forbids terminal fields".to_string());
+            }
+            None
+        } else {
+            if raw.evidence.is_none() || raw.observed.is_none() {
+                return Err(
+                    "publication evidence is required iff status is not pending".to_string()
+                );
+            }
+            raw.observed
+                .expect("terminal observation presence was checked")
+        };
+        let record = PublicationRecord {
+            id: raw.id,
+            key: raw.key,
+            descriptor: raw.descriptor,
+            planned_head: raw.planned_head,
+            repository: raw.repository,
+            refname: raw.refname,
+            expected_old: raw.expected_old,
+            source_tree_name: raw.source_tree_name,
+            status: raw.status,
+            evidence: raw.evidence,
+            observed,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+}
+
+impl From<PublicationRecord> for RawPublicationRecord {
+    fn from(record: PublicationRecord) -> Self {
+        let terminal = record.status != PublicationStatus::Pending;
+        RawPublicationRecord {
+            id: record.id,
+            key: record.key,
+            descriptor: record.descriptor,
+            planned_head: record.planned_head,
+            repository: record.repository,
+            refname: record.refname,
+            expected_old: record.expected_old,
+            source_tree_name: record.source_tree_name,
+            status: record.status,
+            evidence: record.evidence,
+            observed: terminal.then_some(record.observed),
+        }
+    }
+}
+
+impl PublicationRecord {
+    fn validate(&self) -> Result<(), String> {
+        paths::validate_source_tree_name(&self.source_tree_name)?;
+        self.descriptor.validate()?;
+        match self.status {
+            PublicationStatus::Pending if self.evidence.is_none() && self.observed.is_none() => {}
+            PublicationStatus::Pending => {
+                return Err("pending publication forbids terminal fields".to_string())
+            }
+            _ if self.evidence.is_some() => {}
+            _ => {
+                return Err("publication evidence is required iff status is not pending".to_string())
+            }
+        }
+        if let Some(evidence) = &self.evidence {
+            evidence.validate()?;
+        }
+        Ok(())
+    }
+}
+impl_record!(PublicationRecord);
+
+impl Owner {
+    fn validate(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+impl Identity {
+    fn validate(&self) -> Result<(), String> {
+        if self.owner.is_some() && !matches!(self.kind, IdentityKind::Root) {
+            return Err("identity owner is only allowed for root".to_string());
+        }
+        if let Some(owner) = &self.owner {
+            owner.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl Block {
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Block::Text { .. } => Ok(()),
+            Block::Payload { path: value } => path(value, "payload path"),
+            Block::ToolUse {
+                arguments: value, ..
+            } => path(value, "tool arguments path"),
+        }
+    }
+}
+
+impl Proposal {
+    fn validate(&self) -> Result<(), String> {
+        paths::validate_source_tree_name(&self.source_tree_name)
+    }
+}
+
+impl MergeInfo {
+    fn validate(&self) -> Result<(), String> {
+        if self.output.is_some() == self.conflict_paths.is_some() {
+            return Err("merge requires exactly one of output or conflict_paths".to_string());
+        }
+        if let Some(paths) = &self.conflict_paths {
+            for item in paths {
+                relative_path(item, "merge conflict path")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl SourceTreeResolution {
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            SourceTreeResolution::Merged { merge, .. }
+            | SourceTreeResolution::Conflict {
+                merge: Some(merge), ..
+            } => merge.validate(),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl TranscriptEntry {
+    fn validate(&self) -> Result<(), String> {
+        for block in &self.blocks {
+            block.validate()?;
+        }
+        if let Some(proposal) = &self.proposal {
+            proposal.validate()?;
+        }
+        if let Some(resolution) = &self.source_tree_resolution {
+            resolution.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl ToolResult {
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            ToolResult::Complete { observation, .. } => path(observation, "tool observation path"),
+            ToolResult::Failed { error } => path(error, "tool error path"),
+            ToolResult::Cancelled { .. } => Ok(()),
+        }
+    }
+}
+
+impl FilesOutcome {
+    fn validate(&self) -> Result<(), String> {
+        for item in self.applied.iter().chain(&self.conflicted) {
+            relative_path(item, "files outcome path")?;
+        }
+        Ok(())
+    }
+}
+
+impl AsyncRecord {
+    fn validate(&self) -> Result<(), String> {
+        let valid = match self.status {
+            TaskStatus::Pending => self.result.is_none() && self.reason.is_none(),
+            TaskStatus::Complete | TaskStatus::Failed => {
+                self.result.is_some() && self.reason.is_none()
+            }
+            TaskStatus::Cancelled => self.result.is_none() && self.reason.is_some(),
+        };
+        if !valid {
+            return Err("async terminal fields do not match status".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl SpawnIntent {
+    fn validate(&self) -> Result<(), String> {
+        path(&self.prompt, "spawn prompt path")?;
+        if self.configuration.is_empty() {
+            return Err("spawn configuration must not be empty".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl ChildRecord {
+    fn validate(&self) -> Result<(), String> {
+        if self.status == TaskStatus::Pending {
+            if self.terminal_head.is_some() {
+                return Err("running child forbids terminal fields".to_string());
+            }
+        } else if self.terminal_head.is_none() {
+            return Err("child terminal fields are required iff status is not running".to_string());
+        }
+        self.spawn_intent.validate()?;
+        Ok(())
+    }
+}
+
+impl Descriptor {
+    fn validate(&self) -> Result<(), String> {
+        if !matches!(self.policy.as_str(), "squash" | "preserve" | "force") {
+            return Err(format!("invalid descriptor policy {:?}", self.policy));
+        }
+        Ok(())
+    }
+}
+
+impl Evidence {
+    fn validate(&self) -> Result<(), String> {
+        if !matches!(
+            self.kind.as_str(),
+            "push-success"
+                | "ref-converged"
+                | "ref-drift"
+                | "lease-rejected"
+                | "validation-rejected"
+                | "push-rejected"
+                | "ambiguous"
+                | "operator-resolution"
+        ) {
+            return Err(format!("invalid evidence kind {:?}", self.kind));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn oid(character: char) -> Oid {
+        Oid::parse(&character.to_string().repeat(40), "test oid").unwrap()
+    }
+
+    fn direct() -> SourceTreeResolution {
+        SourceTreeResolution::Direct {
+            current: oid('a'),
+            output: oid('b'),
+        }
+    }
+
+    fn spawn_intent() -> SpawnIntent {
+        SpawnIntent {
+            tool: "tool-1".into(),
+            prompt: ".caos/tools/prompt".into(),
+            model: "model".into(),
+            configuration: "configuration-hash".into(),
+            content: oid('a'),
+        }
+    }
+    fn child(status: TaskStatus) -> ChildRecord {
+        ChildRecord {
+            id: "child-1".into(),
+            initial_head: oid('2'),
+            request: oid('1'),
+            relay: oid('3'),
+            spawn_intent: spawn_intent(),
+            status,
+            terminal_head: (status != TaskStatus::Pending).then(|| oid('4')),
+        }
+    }
+    fn descriptor() -> Descriptor {
+        Descriptor {
+            source_base: oid('a'),
+            source_head: oid('b'),
+            target_base: oid('c'),
+            policy: "squash".to_string(),
+            implementation: "project-v1".to_string(),
+            commit_policy: "single".to_string(),
+        }
+    }
+
+    // Existing sessions use the former field names; new events use source_tree.
+    fn legacy_keys(value: Value) -> Value {
+        match value {
+            Value::Object(fields) => Value::Object(
+                fields
+                    .into_iter()
+                    .map(|(key, value)| {
+                        (key.replace("source_tree", "workspace"), legacy_keys(value))
+                    })
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(items.into_iter().map(legacy_keys).collect()),
+            other => other,
+        }
+    }
+
+    macro_rules! round_trip {
+        ($type:ty, $value:expr) => {{
+            let value: $type = $value;
+            assert_eq!(<$type>::parse(&value.encode()).unwrap(), value);
+            assert_eq!(
+                <$type>::from_value(&legacy_keys(value.to_value())).unwrap(),
+                value
+            );
+        }};
+    }
+
+    #[test]
+    fn basic_records_round_trip() {
+        let owner = Owner {
+            parent: "parent".to_string(),
+            parent_head: oid('a'),
+            tool: "tool".to_string(),
+        };
+        round_trip!(Owner, owner.clone());
+        round_trip!(
+            Identity,
+            Identity {
+                id: "root".to_string(),
+                kind: IdentityKind::Root,
+                owner: Some(owner),
+            }
+        );
+        round_trip!(
+            Identity,
+            Identity {
+                id: "fork".to_string(),
+                kind: IdentityKind::Fork { source: oid('c') },
+                owner: None,
+            }
+        );
+        round_trip!(SourceTreeRecord, SourceTreeRecord { commit: oid('a') });
+        for block in [
+            Block::Text {
+                text: "hello".to_string(),
+            },
+            Block::Payload {
+                path: ".caos/transcript/payload".to_string(),
+            },
+            Block::ToolUse {
+                id: "tool-1".to_string(),
+                name: "shell".to_string(),
+                arguments: ".caos/transcript/arguments".to_string(),
+            },
+        ] {
+            round_trip!(Block, block);
+        }
+        round_trip!(
+            Proposal,
+            Proposal {
+                base: oid('a'),
+                commit: oid('b'),
+                source_tree_name: "main".to_string(),
+            }
+        );
+        round_trip!(SpawnIntent, spawn_intent());
+
+        round_trip!(Descriptor, descriptor());
+        round_trip!(
+            Evidence,
+            Evidence {
+                kind: "push-success".to_string(),
+                diagnostic: Some("ok".to_string())
+            }
+        );
+        round_trip!(
+            FilesOutcome,
+            FilesOutcome {
+                applied: vec!["a.txt".to_string()],
+                conflicted: vec!["b.txt".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn merge_and_source_tree_resolution_variants_round_trip() {
+        let merged = MergeInfo {
+            base: oid('a'),
+            ours: oid('b'),
+            theirs: oid('c'),
+            implementation: "merge-v1".to_string(),
+            output: Some(oid('d')),
+            conflict_paths: None,
+        };
+        let conflict = MergeInfo {
+            output: None,
+            conflict_paths: Some(vec!["src/lib.rs".to_string()]),
+            ..merged.clone()
+        };
+        round_trip!(MergeInfo, merged.clone());
+        round_trip!(MergeInfo, conflict.clone());
+        for resolution in [
+            SourceTreeResolution::AlreadyApplied {
+                current: oid('a'),
+                candidate: None,
+            },
+            direct(),
+            SourceTreeResolution::Merged {
+                current: oid('b'),
+                merge: merged,
+                output: oid('d'),
+            },
+            SourceTreeResolution::Conflict {
+                current: Some(oid('b')),
+                candidate: oid('c'),
+                merge: Some(conflict),
+            },
+        ] {
+            round_trip!(SourceTreeResolution, resolution);
+        }
+    }
+
+    #[test]
+    fn transcript_roles_round_trip() {
+        for role in [Role::User, Role::Assistant, Role::System] {
+            round_trip!(
+                TranscriptEntry,
+                TranscriptEntry {
+                    message_id: "message-1".to_string(),
+                    session: "session".to_string(),
+                    role,
+                    actor: "actor".to_string(),
+                    model: Some("model".to_string()),
+                    blocks: vec![Block::Text {
+                        text: "text".to_string()
+                    }],
+                    proposal: None,
+                    source_tree_resolution: None,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn configurations_are_opaque_nonempty_strings() {
+        let mut intent = spawn_intent();
+        intent.configuration = "opaque value that is not a tree path".to_string();
+        round_trip!(SpawnIntent, intent.clone());
+        intent.configuration.clear();
+        assert!(SpawnIntent::from_value(&intent.to_value()).is_err());
+    }
+
+    #[test]
+    fn every_record_rejects_unknown_keys() {
+        macro_rules! rejects_unknown {
+            ($type:ty, $value:expr) => {{
+                let mut value = $value.to_value();
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("unknown".to_string(), Value::Null);
+                assert!(
+                    <$type>::from_value(&value).is_err(),
+                    "{} accepted an unknown key",
+                    stringify!($type)
+                );
+            }};
+        }
+
+        let owner = Owner {
+            parent: "parent".to_string(),
+            parent_head: oid('a'),
+            tool: "tool".to_string(),
+        };
+        let merge = MergeInfo {
+            base: oid('a'),
+            ours: oid('b'),
+            theirs: oid('c'),
+            implementation: "merge-v1".to_string(),
+            output: Some(oid('d')),
+            conflict_paths: None,
+        };
+        let tool = CallRecord {
+            id: "tool-1".to_string(),
+            name: "shell".to_string(),
+            declaration_message: "message-1".to_string(),
+            source_tree_name: None,
+            input_commit: None,
+            status: CallStatus::Started,
+            task: Some(oid('2')),
+            result: None,
+            source_tree_resolution: None,
+            files: Vec::new(),
+            files_outcome: None,
+        };
+
+        let publication = PublicationRecord {
+            id: "publication-1".to_string(),
+            key: "key".to_string(),
+            descriptor: descriptor(),
+            planned_head: oid('d'),
+            repository: "repo".to_string(),
+            refname: "refs/heads/main".to_string(),
+            expected_old: None,
+            source_tree_name: "main".to_string(),
+            status: PublicationStatus::Pending,
+            evidence: None,
+            observed: None,
+        };
+
+        rejects_unknown!(Owner, owner.clone());
+        rejects_unknown!(
+            Identity,
+            Identity {
+                id: "root".to_string(),
+                kind: IdentityKind::Root,
+                owner: Some(owner),
+            }
+        );
+        rejects_unknown!(SourceTreeRecord, SourceTreeRecord { commit: oid('a') });
+        rejects_unknown!(
+            Block,
+            Block::Text {
+                text: "text".to_string(),
+            }
+        );
+        rejects_unknown!(
+            Proposal,
+            Proposal {
+                base: oid('a'),
+                commit: oid('b'),
+                source_tree_name: "main".to_string(),
+            }
+        );
+        rejects_unknown!(MergeInfo, merge.clone());
+        rejects_unknown!(
+            SourceTreeResolution,
+            SourceTreeResolution::Merged {
+                current: oid('b'),
+                merge,
+                output: oid('d'),
+            }
+        );
+        rejects_unknown!(
+            TranscriptEntry,
+            TranscriptEntry {
+                message_id: "message-1".to_string(),
+                session: "session".to_string(),
+                role: Role::User,
+                actor: "user".to_string(),
+                model: None,
+                blocks: Vec::new(),
+                proposal: None,
+                source_tree_resolution: None,
+            }
+        );
+        rejects_unknown!(
+            ToolResult,
+            ToolResult::Cancelled {
+                reason: "stop".to_string(),
+            }
+        );
+        rejects_unknown!(
+            FilesOutcome,
+            FilesOutcome {
+                applied: Vec::new(),
+                conflicted: Vec::new(),
+            }
+        );
+        rejects_unknown!(CallRecord, tool);
+        rejects_unknown!(
+            AsyncRecord,
+            AsyncRecord {
+                task: oid('1'),
+                status: TaskStatus::Pending,
+                target_ref: None,
+                result: None,
+                reason: None,
+            }
+        );
+        rejects_unknown!(SpawnIntent, spawn_intent());
+
+        rejects_unknown!(PublicationRecord, publication);
+    }
+
+    #[test]
+    fn optional_key_nullability_is_exact() {
+        macro_rules! rejects_null {
+            ($type:ty, $value:expr, $key:literal) => {{
+                let mut value = $value.to_value();
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .insert($key.to_string(), Value::Null);
+                assert!(
+                    <$type>::from_value(&value).is_err(),
+                    "{} accepted null for {}",
+                    stringify!($type),
+                    $key
+                );
+            }};
+        }
+        macro_rules! rejects_missing {
+            ($type:ty, $value:expr, $key:literal) => {{
+                let mut value = $value.to_value();
+                value.as_object_mut().unwrap().remove($key);
+                assert!(
+                    <$type>::from_value(&value).is_err(),
+                    "{} accepted missing {}",
+                    stringify!($type),
+                    $key
+                );
+            }};
+        }
+
+        let transcript = TranscriptEntry {
+            message_id: "message-1".to_string(),
+            session: "session".to_string(),
+            role: Role::User,
+            actor: "user".to_string(),
+            model: None,
+            blocks: Vec::new(),
+            proposal: None,
+            source_tree_resolution: None,
+        };
+        rejects_null!(TranscriptEntry, transcript, "model");
+
+        for key in ["target_ref", "result", "error", "reason"] {
+            let mut value = AsyncRecord {
+                task: oid('1'),
+                status: TaskStatus::Pending,
+                target_ref: None,
+                result: None,
+                reason: None,
+            }
+            .to_value();
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert(key.to_string(), Value::Null);
+            assert!(AsyncRecord::from_value(&value).is_err(), "accepted {key}");
+        }
+        rejects_null!(
+            ToolResult,
+            ToolResult::Complete {
+                observation: ".caos/tools/observation".to_string(),
+                proposal: None,
+            },
+            "proposal"
+        );
+        rejects_null!(
+            MergeInfo,
+            MergeInfo {
+                base: oid('a'),
+                ours: oid('b'),
+                theirs: oid('c'),
+                implementation: "merge-v1".to_string(),
+                output: None,
+                conflict_paths: Some(vec!["file".to_string()]),
+            },
+            "output"
+        );
+        rejects_null!(
+            SourceTreeResolution,
+            SourceTreeResolution::AlreadyApplied {
+                current: oid('a'),
+                candidate: None,
+            },
+            "candidate"
+        );
+        rejects_null!(
+            Evidence,
+            Evidence {
+                kind: "push-success".to_string(),
+                diagnostic: None,
+            },
+            "diagnostic"
+        );
+        rejects_null!(ChildRecord, child(TaskStatus::Pending), "terminal_head");
+
+        rejects_missing!(
+            SourceTreeResolution,
+            SourceTreeResolution::Conflict {
+                current: None,
+                candidate: oid('b'),
+                merge: None,
+            },
+            "current"
+        );
+        let started_tool = CallRecord {
+            id: "tool-1".to_string(),
+            name: "shell".to_string(),
+            declaration_message: "message-1".to_string(),
+            source_tree_name: None,
+            input_commit: None,
+            status: CallStatus::Started,
+            task: Some(oid('2')),
+            result: None,
+            source_tree_resolution: None,
+            files: Vec::new(),
+            files_outcome: None,
+        };
+        rejects_missing!(CallRecord, started_tool.clone(), "source_tree_name");
+        rejects_missing!(CallRecord, started_tool, "input_commit");
+        rejects_missing!(SpawnIntent, spawn_intent(), "content");
+        rejects_missing!(ChildRecord, child(TaskStatus::Complete), "terminal_head");
+        let pending_publication = PublicationRecord {
+            id: "publication-1".to_string(),
+            key: "key".to_string(),
+            descriptor: descriptor(),
+            planned_head: oid('d'),
+            repository: "repo".to_string(),
+            refname: "refs/heads/main".to_string(),
+            expected_old: None,
+            source_tree_name: "main".to_string(),
+            status: PublicationStatus::Pending,
+            evidence: None,
+            observed: None,
+        };
+        rejects_missing!(
+            PublicationRecord,
+            pending_publication.clone(),
+            "expected_old"
+        );
+        rejects_missing!(
+            PublicationRecord,
+            PublicationRecord {
+                status: PublicationStatus::Complete,
+                evidence: Some(Evidence {
+                    kind: "push-success".to_string(),
+                    diagnostic: None,
+                }),
+                ..pending_publication
+            },
+            "observed"
+        );
+        rejects_missing!(
+            CallRecord,
+            CallRecord {
+                status: CallStatus::Complete,
+                task: None,
+                result: Some(ToolResult::Complete {
+                    observation: ".caos/tools/observation".to_string(),
+                    proposal: None,
+                }),
+                ..CallRecord {
+                    id: "tool-1".to_string(),
+                    name: "shell".to_string(),
+                    declaration_message: "message-1".to_string(),
+                    source_tree_name: None,
+                    input_commit: None,
+                    status: CallStatus::Started,
+                    task: Some(oid('2')),
+                    result: None,
+                    source_tree_resolution: None,
+                    files: Vec::new(),
+                    files_outcome: None,
+                }
+            },
+            "files_outcome"
+        );
+    }
+
+    #[test]
+    fn tool_status_variants_round_trip() {
+        let base = CallRecord {
+            id: "tool-1".to_string(),
+            name: "shell".to_string(),
+            declaration_message: "message-1".to_string(),
+            source_tree_name: None,
+            input_commit: None,
+            status: CallStatus::Started,
+            task: Some(oid('2')),
+            result: None,
+            source_tree_resolution: None,
+            files: Vec::new(),
+            files_outcome: None,
+        };
+        round_trip!(CallRecord, base.clone());
+        for (status, result) in [
+            (
+                CallStatus::Complete,
+                ToolResult::Complete {
+                    observation: ".caos/tools/observation".to_string(),
+                    proposal: None,
+                },
+            ),
+            (
+                CallStatus::Failed,
+                ToolResult::Failed {
+                    error: ".caos/tools/error".to_string(),
+                },
+            ),
+            (
+                CallStatus::Cancelled,
+                ToolResult::Cancelled {
+                    reason: "stop".to_string(),
+                },
+            ),
+        ] {
+            round_trip!(
+                CallRecord,
+                CallRecord {
+                    status,
+                    result: Some(result),
+                    ..base.clone()
+                }
+            );
+        }
+        round_trip!(
+            CallRecord,
+            CallRecord {
+                source_tree_name: Some("main".to_string()),
+                input_commit: Some(oid('a')),
+                status: CallStatus::Conflict,
+                result: Some(ToolResult::Complete {
+                    observation: ".caos/tools/observation".to_string(),
+                    proposal: Some(oid('b')),
+                }),
+                source_tree_resolution: Some(SourceTreeResolution::Conflict {
+                    current: Some(oid('a')),
+                    candidate: oid('b'),
+                    merge: None,
+                }),
+                ..base
+            }
+        );
+    }
+
+    #[test]
+    fn async_child_and_publication_status_variants_round_trip() {
+        for record in [
+            AsyncRecord {
+                task: oid('1'),
+                status: TaskStatus::Pending,
+                target_ref: None,
+                result: None,
+                reason: None,
+            },
+            AsyncRecord {
+                task: oid('1'),
+                status: TaskStatus::Complete,
+                target_ref: Some("refs/heads/main".to_string()),
+                result: Some(oid('2')),
+                reason: None,
+            },
+            AsyncRecord {
+                task: oid('1'),
+                status: TaskStatus::Failed,
+                target_ref: None,
+                result: Some(oid('2')),
+                reason: None,
+            },
+            AsyncRecord {
+                task: oid('1'),
+                status: TaskStatus::Cancelled,
+                target_ref: None,
+                result: None,
+                reason: Some("stop".to_string()),
+            },
+        ] {
+            round_trip!(AsyncRecord, record);
+        }
+        for status in [
+            TaskStatus::Pending,
+            TaskStatus::Complete,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+        ] {
+            round_trip!(ChildRecord, child(status));
+        }
+        for status in [
+            PublicationStatus::Pending,
+            PublicationStatus::Complete,
+            PublicationStatus::Conflict,
+            PublicationStatus::Uncertain,
+        ] {
+            round_trip!(
+                PublicationRecord,
+                PublicationRecord {
+                    id: "publication-1".to_string(),
+                    key: "key".to_string(),
+                    descriptor: descriptor(),
+                    planned_head: oid('d'),
+                    repository: "repo".to_string(),
+                    refname: "refs/heads/main".to_string(),
+                    expected_old: None,
+                    source_tree_name: "main".to_string(),
+                    status,
+                    evidence: (status != PublicationStatus::Pending).then(|| Evidence {
+                        kind: "push-success".to_string(),
+                        diagnostic: None,
+                    }),
+                    observed: None,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_encodings_and_strict_keys_are_enforced() {
+        assert_eq!(
+            parse_title(&encode_title("Title").unwrap()).unwrap(),
+            "Title"
+        );
+        assert!(encode_title("").is_err());
+        assert!(encode_title("bad\n").is_err());
+        assert!(Owner::from_value(&obj(&[("unknown", Value::Null)])).is_err());
+        assert!(Evidence::from_value(&obj(&[("kind", value_str("push-success"))])).is_ok());
+    }
+}

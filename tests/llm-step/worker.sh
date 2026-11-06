@@ -7,14 +7,14 @@ caos get /cas/args/common || { echo "FAIL: reading worker-common.sh" >&2; exit 1
 source /cas/args/common
 
 assert_parent_dates() {
-  local conversation_head=$1 parents oid kind root="" last="" child_time="" parent_time
-  parents=$($TOOL parents --repo /tmp/repo --head "$conversation_head" --validate) \
-    || fail "walking the conversation spine"
+  local session_head=$1 parents oid kind root="" last="" child_time="" parent_time
+  parents=$($TOOL parents --repo /tmp/repo --head "$session_head" --validate) \
+    || fail "walking the session spine"
   while read -r oid kind; do
     last=$kind
-    if [ "$kind" = conversation.root ]; then root=$oid; fi
+    if [ "$kind" = session.root ]; then root=$oid; fi
   done <<<"$parents"
-  [ "$last" = conversation.root ] || fail "the conversation spine did not end at its root"
+  [ "$last" = session.root ] || fail "the session spine did not end at its root"
 
   while read -r oid parent_time; do
     if [ -n "$child_time" ] && [ "$child_time" != "$parent_time" ]; then
@@ -22,7 +22,7 @@ assert_parent_dates() {
     fi
     if [ "$oid" = "$root" ]; then break; fi
     child_time=$parent_time
-  done < <(git log --first-parent --format='%H %ct' "$conversation_head")
+  done < <(git log --first-parent --format='%H %ct' "$session_head")
 }
 
 stage "source tree and scripted model"
@@ -42,7 +42,7 @@ ws=$(publish_tree /tmp/ws /cas/ws "publishing the source tree")
 
 # `cmd` is relative to the SOURCE TREE the tool's path selected, which is what
 # `@in` buys: the tree is an argument, so the tool sees that tree's root as its
-# working directory rather than the conversation root.
+# working directory rather than the session root.
 R1='[{"signature":"sig-abc","thinking":"I should create the file.","type":"thinking"},{"text":"Creating out.txt.","type":"text"},{"id":"toolu_01","input":{"arguments":{"cmd":"echo hi > out.txt"},"path":"main/tools/sh"},"name":"run_tool","type":"tool_use"}]'
 R2='[{"id":"toolu_03","input":{"arguments":{"cmd":"echo boom >&2; exit 3"},"path":"main/tools/sh"},"name":"run_tool","type":"tool_use"}]'
 EARLY_INTERJECTION_TEXT="also keep the notes subtree"
@@ -62,13 +62,13 @@ printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' \
   "$T2_TEXT" > /tmp/stub/response-5.json
 
 start_stub /tmp/stub
-new_llm_conversation llm-step "$STUB_PORT" "$ws" \
+new_llm_session llm-step "$STUB_PORT" "$ws" \
   "You are a coding agent operating on a git source_tree."
 
 stage "first turn: pre-dispatch interjection and durable tool records"
 admit_turn "create out.txt containing hi, then confirm"
 interject_output=$($TOOL interject --repo /tmp/repo --head "$head" \
-  --actor racer --text "$EARLY_INTERJECTION_TEXT" --ref "$conversation_ref") \
+  --actor racer --text "$EARLY_INTERJECTION_TEXT" --ref "$session_ref") \
   || fail "publishing the pre-dispatch interjection"
 early_head=${interject_output%%$'\n'*}
 early_head=${early_head#head }
@@ -112,7 +112,7 @@ wait_for_file /tmp/stub/request-4.json 150 \
   || fail "second turn never reached the blocked response"
 
 interject_output=$($TOOL interject --repo /tmp/repo \
-  --actor racer --text "$INTERJECTION_TEXT" --ref "$conversation_ref") \
+  --actor racer --text "$INTERJECTION_TEXT" --ref "$session_ref") \
   || fail "publishing the terminal-race interjection"
 interjection=${interject_output%%$'\n'*}
 interjection=${interjection#head }
@@ -166,14 +166,14 @@ echo "hello" > /tmp/ws/greeting.txt
 ws=$(publish_tree /tmp/ws /cas/ws-interrupt "publishing the source tree")
 
 mkfifo /tmp/stub/response-6.json
-new_llm_conversation llm-interrupt "$STUB_PORT" "$ws" \
+new_llm_session llm-interrupt "$STUB_PORT" "$ws" \
   "You are a coding agent operating on a git source_tree."
 
 stage "interrupt a running turn at the model boundary"
 dispatch_turn "this prompt was accidental"
 wait_for_file /tmp/stub/request-6.json || fail "model request never arrived"
 
-interrupt_output=$($TOOL interrupt --repo /tmp/repo --ref "$conversation_ref") \
+interrupt_output=$($TOOL interrupt --repo /tmp/repo --ref "$session_ref") \
   || fail "publishing the interruption"
 interrupt_head=${interrupt_output#head }
 assert_oid "$interrupt_head" "the interruption head"
@@ -185,14 +185,14 @@ printf '%s\n' \
 wait_turn || fail "the interrupted turn never reached a terminal head"
 # Give the step time to see its response land on a moved head and stop.
 sleep 2
-head1=$(remote_tip "$conversation_ref") || fail "reading the interrupted conversation"
+head1=$(remote_tip "$session_ref") || fail "reading the interrupted session"
 
 stage "the turn stops before the stale response is admitted"
 [ "$head1" = "$interrupt_head" ] \
   || fail "the interrupted step appended after the interruption"
 $TOOL tools --repo /tmp/repo --head "$head1" > /tmp/interrupted.tools
 [ ! -s /tmp/interrupted.tools ] \
-  || fail "post-interruption model calls were admitted onto the conversation"
+  || fail "post-interruption model calls were admitted onto the session"
 interrupted_transcript=$(transcript_text "$head1")
 if grep -qF 'I had started this response.' <<<"$interrupted_transcript"; then
   fail "post-interruption model response became canonical"
@@ -202,19 +202,19 @@ fi
 [ ! -e /tmp/stub/request-7.json ] || fail "the interruption allowed another model round"
 
 stage "interrupt a turn before it is dispatched"
-new_llm_conversation llm-interrupt-queued "$STUB_PORT" - \
+new_llm_session llm-interrupt-queued "$STUB_PORT" - \
   "You are a coding agent operating on a git source_tree." "$base" \
   "currying queued-interrupt llm-step"
 admit_turn "cancel this before dispatch"
 queued_prompt=$head
-interrupt_output=$($TOOL interrupt --repo /tmp/repo --head "$head" --ref "$conversation_ref") \
+interrupt_output=$($TOOL interrupt --repo /tmp/repo --head "$head" --ref "$session_ref") \
   || fail "interrupting the undispatched turn"
 queued_interrupt=${interrupt_output#head }
 assert_oid "$queued_interrupt" "the queued interruption head"
 head=$queued_interrupt
 start_turn
 sleep 0.2
-[ "$(remote_tip "$conversation_ref")" = "$queued_interrupt" ] \
+[ "$(remote_tip "$session_ref")" = "$queued_interrupt" ] \
   || fail "dispatching an interrupted turn appended another event"
 [ "$(git rev-parse "$queued_interrupt^1")" = "$queued_prompt" ] \
   || fail "the interruption did not append directly to the prompt"

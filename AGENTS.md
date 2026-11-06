@@ -140,7 +140,7 @@ Every script here runs with it, and two constructs quietly break under it.
   through different URLs (a fork, a mirror, ssh vs https) get different keys for
   identical content. That argument is intact and says nothing about WHO — the
   server resolves at the same point in the same walk. What broke the old
-  arrangement is the agent: a conversation's tree is evaluated server-side, so a
+  arrangement is the agent: a session's tree is evaluated server-side, so a
   client repo that mounts caos through a pin had no client in the loop and
   `eval_path ./caos-std` died on its own root expression. `server::locator` is
   the one resolver now; `caos-cli` and a worker both ask it over
@@ -171,7 +171,7 @@ Every script here runs with it, and two constructs quietly break under it.
   `llm-step`'s `std_tool` read the latter, and since `registry` SKIPPED any
   tool it could not describe, every std tool vanished from the registry: no
   error, no log line, and `caos-build`, `caos-test`, `caos-test-result`,
-  `merge`, `log`, `show` and `diff` simply absent from every conversation the
+  `merge`, `log`, `show` and `diff` simply absent from every session the
   tui ran. **A registry must fail on something it was configured with and
   cannot describe** — the skip is what turned a wrong path into an invisible
   one. `caos-cli run --base:@=std/llm-step --list-tools=1` prints the registry,

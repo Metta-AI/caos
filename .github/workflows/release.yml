@@ -26,9 +26,9 @@ name: release
 # could be tested without minting a version first. A tag names itself; a branch
 # build is named `build-<commit>`, by the commit alone.
 #
-# `caos/**` is excluded deliberately: the tui publishes each conversation to
-# `caos/<conversation-id>` (rust/crates/caos-cli/TUI.md), so building those
-# would fire a job per published conversation.
+# `caos/**` is excluded deliberately: the tui publishes each session to
+# `caos/<session-id>` (rust/crates/caos-cli/TUI.md), so building those
+# would fire a job per published session.
 on:
   push:
     branches-ignore: ["caos/**"]
@@ -153,7 +153,7 @@ jobs:
           #
           # The branch name is deliberately absent. It was in this name once,
           # as `<branch>-<sha>`, and `-` is legal in a branch name, so `cc` and
-          # `cc-conversations` produced tags no parse could tell apart. A
+          # `cc-sessions` produced tags no parse could tell apart. A
           # consumer that wants a branch asks GitHub which commits are on it
           # and looks each one up here; that is an exact question with an exact
           # answer, where parsing a name back apart never was.

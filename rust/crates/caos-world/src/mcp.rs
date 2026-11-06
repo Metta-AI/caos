@@ -32,7 +32,7 @@ ticket; result says pending, or gives the output, or says how it failed.
 - eval-path(path): evaluate a path and get the hash of what it produces. Pass the hash \
 as `in` to read, ls or grep to look inside it.
 
-A tool is a directory of the conversation. The standard ones are under caos-std/: read, \
+A tool is a directory of the session. The standard ones are under caos-std/: read, \
 ls, write, edit, copy, move, remove, grep, log, show, diff, merge, import-source, \
 publish-source, bash-tool, caos-build, caos-test, github and more. caos-std exists only in \
 the EVALUATED tree, so to see what is there: eval-path(\"caos-std\"), then run \
@@ -90,25 +90,25 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "run",
             "description": "Run the caos tool at a path and wait for its output. The path \
-                            names a directory of the conversation, such as caos-std/bash-tool \
+                            names a directory of the session, such as caos-std/bash-tool \
                             or caos-std/read; `help` at a path says what it takes. A tool \
-                            that changes files changes the conversation's own copy, not your \
+                            that changes files changes the session's own copy, not your \
                             local checkout. For a long run use `start`.",
             "inputSchema": path_and_arguments(
-                "Conversation path of the tool, such as caos-std/read or feature/01-change/caos-tools/test."
+                "Session path of the tool, such as caos-std/read or feature/01-change/caos-tools/test."
             ),
         }),
         json!({
             "name": "help",
             "description": "Describe the caos tool at a path: what it does and the arguments \
                             it takes. With no path, say how caos is doing in this session \
-                            (the conversation, its head commit, and diagnostics) -- call this \
+                            (the session, its head commit, and diagnostics) -- call this \
                             and report it verbatim if caos seems missing or broken.",
             "inputSchema": with_injected(json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string",
-                              "description": "Conversation path of the tool. Omit for the session overview." },
+                              "description": "Session path of the tool. Omit for the session overview." },
                 },
                 "required": [],
             })),
@@ -119,7 +119,7 @@ pub fn tools() -> Vec<Value> {
                             ask `result` for it. The same call always has the same ticket, and \
                             starting one that has finished does not run it again.",
             "inputSchema": path_and_arguments(
-                "Conversation path of the tool, such as caos-std/caos-test."
+                "Session path of the tool, such as caos-std/caos-test."
             ),
         }),
         json!({
@@ -136,7 +136,7 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "eval-path",
-            "description": "Evaluate a path in the caos conversation and return the hash of \
+            "description": "Evaluate a path in the caos session and return the hash of \
                             what it produces: the build product of a tree, without having to \
                             know which tool makes it. caos-std exists only this way. Pass the \
                             hash as `in` to read, ls or grep to look inside it.",
@@ -144,9 +144,9 @@ pub fn tools() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string",
-                              "description": "Path to evaluate, such as caos-std. Omit for the conversation root." },
+                              "description": "Path to evaluate, such as caos-std. Omit for the session root." },
                     "root": { "type": "string",
-                              "description": "A tree or commit hash to evaluate within instead of the conversation; `path` is then relative to it." },
+                              "description": "A tree or commit hash to evaluate within instead of the session; `path` is then relative to it." },
                 },
                 "required": [],
             })),

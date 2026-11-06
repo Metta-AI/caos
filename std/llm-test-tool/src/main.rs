@@ -5,17 +5,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
-use conversation_protocol::v3::apply::{apply, client_signature, mint, Transition};
-use conversation_protocol::v3::canonical::canonical_bytes;
-use conversation_protocol::v3::oid::{ensure_genesis, g3, hex_lower};
-use conversation_protocol::v3::paths;
-use conversation_protocol::v3::records::{
+use session_protocol::v3::apply::{apply, client_signature, mint, Transition};
+use session_protocol::v3::canonical::canonical_bytes;
+use session_protocol::v3::oid::{ensure_genesis, g3, hex_lower};
+use session_protocol::v3::paths;
+use session_protocol::v3::records::{
     AsyncRecord, Block, CallStatus, Identity, IdentityKind, Role, TaskStatus, TranscriptEntry,
     INTERRUPT_TEXT,
 };
-use conversation_protocol::v3::refs;
-use conversation_protocol::v3::view::Conversation;
-use conversation_protocol::v3::{
+use session_protocol::v3::refs;
+use session_protocol::v3::view::Session;
+use session_protocol::v3::{
     validate_spine, GitStore, Kind, Mode, ObjectStore, Oid, RefUpdate, TreeEntry,
 };
 
@@ -65,7 +65,7 @@ enum ToolCommand {
         input: String,
         refname: Option<String>,
     },
-    /// Interrupt whatever is driving the conversation: the system message that
+    /// Interrupt whatever is driving the session: the system message that
     /// says so.
     Interrupt {
         repo: PathBuf,
@@ -206,7 +206,7 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
             let title = args.required("--title")?;
             let head = args
                 .take("--head")?
-                .map(|value| parse_oid(&value, "conversation head"))
+                .map(|value| parse_oid(&value, "session head"))
                 .transpose()?;
             let actor = args.required("--actor")?;
             let text = args.required("--text")?;
@@ -230,7 +230,7 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
             repo: args.repo()?,
             head: args
                 .take("--head")?
-                .map(|value| parse_oid(&value, "conversation head"))
+                .map(|value| parse_oid(&value, "session head"))
                 .transpose()?,
             actor: args.required("--actor")?,
             text: args.required("--text")?,
@@ -240,7 +240,7 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
             repo: args.repo()?,
             head: args
                 .take("--head")?
-                .map(|value| parse_oid(&value, "conversation head"))
+                .map(|value| parse_oid(&value, "session head"))
                 .transpose()?,
             actor: args.required("--actor")?,
             id: args.required("--id")?,
@@ -252,7 +252,7 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
             repo: args.repo()?,
             head: args
                 .take("--head")?
-                .map(|value| parse_oid(&value, "conversation head"))
+                .map(|value| parse_oid(&value, "session head"))
                 .transpose()?,
             refname: args.take("--ref")?,
         },
@@ -269,7 +269,7 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
         },
         "read" => ToolCommand::Read {
             repo: args.repo()?,
-            head: args.oid("--head", "conversation head")?,
+            head: args.oid("--head", "session head")?,
             path: args.required("--path")?,
         },
         "wait-terminal" => ToolCommand::WaitTerminal {
@@ -284,25 +284,25 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
         },
         "source-tree" => ToolCommand::SourceTree {
             repo: args.repo()?,
-            head: args.oid("--head", "conversation head")?,
+            head: args.oid("--head", "session head")?,
             name: args.required("--name")?,
         },
         "transcript" => ToolCommand::Transcript {
             repo: args.repo()?,
-            head: args.oid("--head", "conversation head")?,
+            head: args.oid("--head", "session head")?,
         },
         "tools" => ToolCommand::Tools {
             repo: args.repo()?,
-            head: args.oid("--head", "conversation head")?,
+            head: args.oid("--head", "session head")?,
         },
         "tool-observation" => ToolCommand::ToolObservation {
             repo: args.repo()?,
-            head: args.oid("--head", "conversation head")?,
+            head: args.oid("--head", "session head")?,
             id: args.required("--id")?,
         },
         "async" => ToolCommand::Async {
             repo: args.repo()?,
-            head: args.oid("--head", "conversation head")?,
+            head: args.oid("--head", "session head")?,
             task: args
                 .take("--task")?
                 .map(|value| parse_oid(&value, "async task"))
@@ -310,18 +310,18 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
         },
         "async-start" => ToolCommand::AsyncStart {
             repo: args.repo()?,
-            head: args.oid("--head", "conversation head")?,
+            head: args.oid("--head", "session head")?,
             task: args.oid("--task", "async task")?,
             target_ref: args.take("--target-ref")?,
             refname: args.take("--ref")?,
         },
         "children" => ToolCommand::Children {
             repo: args.repo()?,
-            head: args.oid("--head", "conversation head")?,
+            head: args.oid("--head", "session head")?,
         },
         "parents" => {
             let repo = args.repo()?;
-            let head = args.oid("--head", "conversation head")?;
+            let head = args.oid("--head", "session head")?;
             let validate = args.flag("--validate");
             let started_tool = args.take("--started-tool")?;
             ToolCommand::Parents {
@@ -423,7 +423,7 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
     match command {
         ToolCommand::ChildId { parent, tool } => println!(
             "child {}",
-            conversation_protocol::v3::ids::child_id(&parent, &tool)?
+            session_protocol::v3::ids::child_id(&parent, &tool)?
         ),
         ToolCommand::Ref { id } => println!("ref {}", refs::head_ref(&id)?),
         ToolCommand::Root {
@@ -433,7 +433,7 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
             source_trees,
         } => {
             let mut store = open(&repo)?;
-            let head = conversation_root(&mut store, id, title, source_trees)?;
+            let head = session_root(&mut store, id, title, source_trees)?;
             println!("head {head}");
         }
         ToolCommand::Turn {
@@ -468,12 +468,12 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
         } => {
             let mut store = open(&repo)?;
             let head = resolve_head(&store, head, refname.as_ref(), "interject")?;
-            let id = Conversation::open(&store, &head)?.identity()?.id;
+            let id = Session::open(&store, &head)?.identity()?.id;
             let message_id = client_key()?;
             let transition = Transition::MessageAppend {
                 entry: TranscriptEntry {
                     message_id: message_id.clone(),
-                    conversation: id,
+                    session: id,
                     role: Role::User,
                     actor,
                     model: None,
@@ -515,11 +515,11 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
         } => {
             let mut store = open(&repo)?;
             let head = resolve_head(&store, head, refname.as_ref(), "interrupt")?;
-            let id = Conversation::open(&store, &head)?.identity()?.id;
+            let id = Session::open(&store, &head)?.identity()?.id;
             let transition = Transition::MessageAppend {
                 entry: TranscriptEntry {
                     message_id: client_key()?,
-                    conversation: id,
+                    session: id,
                     role: Role::System,
                     actor: "tester".to_string(),
                     model: None,
@@ -576,7 +576,7 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
         ToolCommand::Read { repo, head, path } => {
             let store = open(&repo)?;
             store.ensure_local(&head)?;
-            let view = Conversation::open(&store, &head)?;
+            let view = Session::open(&store, &head)?;
             let bytes = view
                 .snapshot()
                 .read(&path)?
@@ -594,19 +594,19 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
         ToolCommand::SourceTree { repo, head, name } => {
             let store = open(&repo)?;
             store.ensure_local(&head)?;
-            let source_tree = Conversation::open(&store, &head)?
+            let source_tree = Session::open(&store, &head)?
                 .source_tree(&name)?
                 .ok_or_else(|| ToolError::code(4))?;
             println!("commit {}", source_tree.commit);
             println!(
                 "initial {}",
-                Conversation::open(&store, &head)?.reference_start(&name)?
+                Session::open(&store, &head)?.reference_start(&name)?
             );
         }
         ToolCommand::Transcript { repo, head } => {
             let store = open(&repo)?;
             store.ensure_local(&head)?;
-            let view = Conversation::open(&store, &head)?;
+            let view = Session::open(&store, &head)?;
             for (ordinal, message_id, entry) in view.transcript(0, view.transcript_len()?)? {
                 let role = match entry.role {
                     Role::User => "user",
@@ -625,7 +625,7 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
         ToolCommand::Tools { repo, head } => {
             let store = open(&repo)?;
             store.ensure_local(&head)?;
-            for tool in Conversation::open(&store, &head)?.tools()? {
+            for tool in Session::open(&store, &head)?.tools()? {
                 write_record(&tool.encode())?;
             }
         }
@@ -633,7 +633,7 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
             let store = open(&repo)?;
             store.ensure_local(&head)?;
             let path = format!("{}/observation.json", paths::call_payload_dir(&id));
-            let bytes = Conversation::open(&store, &head)?.payload(&path)?;
+            let bytes = Session::open(&store, &head)?.payload(&path)?;
             std::io::stdout().write_all(&bytes).map_err(|error| {
                 ToolError::new(format!("writing observation to standard output: {error}"))
             })?;
@@ -641,7 +641,7 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
         ToolCommand::Async { repo, head, task } => {
             let store = open(&repo)?;
             store.ensure_local(&head)?;
-            let view = Conversation::open(&store, &head)?;
+            let view = Session::open(&store, &head)?;
             if let Some(task) = task {
                 match view.async_task(&task)? {
                     Some(record) => write_record(&record.encode())?,
@@ -683,7 +683,7 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
         ToolCommand::Children { repo, head } => {
             let store = open(&repo)?;
             store.ensure_local(&head)?;
-            for record in Conversation::open(&store, &head)?.children()? {
+            for record in Session::open(&store, &head)?.children()? {
                 write_record(&record.encode())?;
             }
         }
@@ -728,7 +728,7 @@ struct DeclareInput {
     refname: Option<String>,
 }
 
-/// The conversation head a command works at: `--head`, or what `--ref` names.
+/// The session head a command works at: `--head`, or what `--ref` names.
 fn resolve_head(
     store: &GitStore,
     head: Option<Oid>,
@@ -760,8 +760,8 @@ fn declare(input: DeclareInput) -> Result<(), ToolError> {
     let arguments: serde_json::Value = serde_json::from_str(&input.input)
         .map_err(|error| ToolError::new(format!("parsing --input as JSON: {error}")))?;
 
-    let view = Conversation::open(&store, &head)?;
-    let conversation = view.identity()?.id;
+    let view = Session::open(&store, &head)?;
+    let session = view.identity()?.id;
     let ordinal = view.transcript_len()?;
     drop(view);
 
@@ -770,7 +770,7 @@ fn declare(input: DeclareInput) -> Result<(), ToolError> {
     let payload_name = format!("args-{}.json", paths::admit_external_id(&input.id));
     let entry = TranscriptEntry {
         message_id: message_id.clone(),
-        conversation,
+        session,
         role: Role::Assistant,
         actor: input.actor,
         model: Some("test-model".to_string()),
@@ -828,7 +828,7 @@ fn turn(input: TurnInput) -> Result<(), ToolError> {
     let creating = input.head.is_none();
     let prior = match input.head {
         Some(head) => head,
-        None => conversation_root(
+        None => session_root(
             &mut store,
             input.id.clone(),
             input.title,
@@ -882,7 +882,7 @@ fn turn(input: TurnInput) -> Result<(), ToolError> {
     Ok(())
 }
 
-fn conversation_root(
+fn session_root(
     store: &mut GitStore,
     id: String,
     title: String,
@@ -890,7 +890,7 @@ fn conversation_root(
 ) -> Result<Oid, ToolError> {
     let genesis = ensure_genesis(store)?;
     let source_trees = source_trees.into_iter().collect::<BTreeMap<_, _>>();
-    let transition = Transition::ConversationRoot {
+    let transition = Transition::SessionRoot {
         identity: Identity {
             id,
             kind: IdentityKind::Root,
@@ -898,9 +898,9 @@ fn conversation_root(
         },
         title,
         content: Some({
-            let mut content = conversation_protocol::v3::tree::TreeBuilder::from(None);
+            let mut content = session_protocol::v3::tree::TreeBuilder::from(None);
             for (name, commit) in source_trees {
-                content.put_oid(&name, conversation_protocol::v3::Mode::Commit, commit);
+                content.put_oid(&name, session_protocol::v3::Mode::Commit, commit);
             }
             content.build(store)?
         }),
@@ -916,13 +916,13 @@ fn append_user_message(
     text: String,
 ) -> Result<(Oid, String), ToolError> {
     let message_id = client_key()?;
-    let conversation = Conversation::open(store, head)?;
-    let id = conversation.identity()?.id;
-    drop(conversation);
+    let session = Session::open(store, head)?;
+    let id = session.identity()?.id;
+    drop(session);
     let transition = Transition::MessageAppend {
         entry: TranscriptEntry {
             message_id: message_id.clone(),
-            conversation: id,
+            session: id,
             role: Role::User,
             actor,
             model: None,
@@ -1201,7 +1201,7 @@ fn open(repo: &Path) -> Result<GitStore, ToolError> {
     GitStore::open(repo, Some("caos")).map_err(ToolError::new)
 }
 
-fn signature() -> conversation_protocol::v3::Signature {
+fn signature() -> session_protocol::v3::Signature {
     client_signature("caos", "caos@caos", 1_700_000_000)
 }
 
@@ -1265,8 +1265,8 @@ fn wait_terminal(
                     continue;
                 };
                 seen = Some(head.clone());
-                let prompt = Conversation::open(&store, &prompt_head)?.transcript_len()?;
-                match turn_outcome(&Conversation::open(&store, &head)?, prompt)? {
+                let prompt = Session::open(&store, &prompt_head)?.transcript_len()?;
+                match turn_outcome(&Session::open(&store, &head)?, prompt)? {
                     Some(Ok(())) => {
                         println!("head {head}");
                         println!("status idle");
@@ -1290,7 +1290,7 @@ fn wait_terminal(
 /// How the turn whose entries start at `from` ended, if it has: `Ok` for an
 /// answer or an interruption, `Err` with the step's failure message.
 fn turn_outcome(
-    view: &Conversation<'_>,
+    view: &Session<'_>,
     from: u64,
 ) -> Result<Option<Result<(), String>>, ToolError> {
     for ordinal in (from..view.transcript_len()?).rev() {
@@ -1320,37 +1320,37 @@ fn parents(
     loop {
         if current == g3() {
             return Err(ToolError::new(
-                "conversation spine reached G3 without a root",
+                "session spine reached G3 without a root",
             ));
         }
         let info = store.read_commit(&current).map_err(String::from)?;
         let kind = Kind::parse_message(&info.message)?;
         // The first parent is the spine; only a fork that merged content in
         // has a second.
-        let allowed = if kind == Kind::ConversationFork { 2 } else { 1 };
+        let allowed = if kind == Kind::SessionFork { 2 } else { 1 };
         if info.parents.is_empty() || info.parents.len() > allowed {
             return Err(ToolError::new(format!(
-                "conversation commit {current} has {} parents",
+                "session commit {current} has {} parents",
                 info.parents.len()
             )));
         }
         println!("{current} {}", kind.as_str());
         if !found_started_tool && kind == Kind::ToolStart {
             let id = started_tool.expect("checked as present");
-            found_started_tool = Conversation::open(store, &current)?
+            found_started_tool = Session::open(store, &current)?
                 .tool(id)?
                 .is_some_and(|tool| tool.status == CallStatus::Started);
         }
         let parent = info.parents[0].clone();
-        if kind == Kind::ConversationRoot {
+        if kind == Kind::SessionRoot {
             // G3, or the commit the root's content came from: anything but a
-            // conversation commit.
+            // session commit.
             if parent != g3()
                 && Kind::parse_message(&store.read_commit(&parent).map_err(String::from)?.message)
                     .is_ok()
             {
                 return Err(ToolError::new(format!(
-                    "conversation root {current} parents a conversation commit"
+                    "session root {current} parents a session commit"
                 )));
             }
             return if found_started_tool {
@@ -1358,7 +1358,7 @@ fn parents(
             } else {
                 let id = started_tool.expect("checked as present");
                 Err(ToolError::new(format!(
-                    "tool {id:?} has no started record on the conversation spine"
+                    "tool {id:?} has no started record on the session spine"
                 )))
             };
         }
@@ -1377,7 +1377,7 @@ mod tests {
             "--repo".to_string(),
             "/repo".to_string(),
             "--id".to_string(),
-            "conversation".to_string(),
+            "session".to_string(),
             "--title".to_string(),
             "Title".to_string(),
             "--source-tree".to_string(),
@@ -1414,7 +1414,7 @@ mod tests {
             "--repo".to_string(),
             "/repo".to_string(),
             "--id".to_string(),
-            "conversation".to_string(),
+            "session".to_string(),
             "--user".to_string(),
             "tester".to_string(),
             "--title".to_string(),

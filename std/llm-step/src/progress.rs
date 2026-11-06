@@ -1,13 +1,13 @@
-//! V3 conversation storage and exact-head append/retry.
+//! V3 session storage and exact-head append/retry.
 
 use std::fs;
 use std::process::{Command, Stdio};
 
-use conversation_protocol::v3::apply::{apply, inherited_signature, mint, Transition};
-use conversation_protocol::v3::paths;
-use conversation_protocol::v3::tree::encode_commit_bytes;
-use conversation_protocol::v3::view::Conversation;
-use conversation_protocol::v3::{
+use session_protocol::v3::apply::{apply, inherited_signature, mint, Transition};
+use session_protocol::v3::paths;
+use session_protocol::v3::tree::encode_commit_bytes;
+use session_protocol::v3::view::Session;
+use session_protocol::v3::{
     Block, ChildRecord, GitStore, ObjectStore, Oid, RefUpdate, TranscriptEntry,
 };
 use worker_common::{path, scratch};
@@ -67,18 +67,18 @@ pub struct State<S: RefStore = GitStore> {
 }
 
 impl State<GitStore> {
-    pub fn open(conversation: &str) -> Result<Self, String> {
-        Self::open_if_present(conversation)?.ok_or_else(|| {
-            let refname = conversation_protocol::v3::refs::head_ref(conversation)
-                .unwrap_or_else(|_| conversation.to_string());
-            format!("conversation ref {refname} does not exist")
+    pub fn open(session: &str) -> Result<Self, String> {
+        Self::open_if_present(session)?.ok_or_else(|| {
+            let refname = session_protocol::v3::refs::head_ref(session)
+                .unwrap_or_else(|_| session.to_string());
+            format!("session ref {refname} does not exist")
         })
     }
 
-    /// [`State::open`], or `None` when the conversation has no ref yet: the one
+    /// [`State::open`], or `None` when the session has no ref yet: the one
     /// case a caller may create it, which is a first prompt's.
-    pub fn open_if_present(conversation: &str) -> Result<Option<Self>, String> {
-        let refname = conversation_protocol::v3::refs::head_ref(conversation)?;
+    pub fn open_if_present(session: &str) -> Result<Option<Self>, String> {
+        let refname = session_protocol::v3::refs::head_ref(session)?;
         let store = Self::scratch_store()?;
         match store.fetch_ref(&refname)? {
             Some(head) => Self::from_store(store, refname, head).map(Some),
@@ -126,7 +126,7 @@ impl State<GitStore> {
         Ok(())
     }
 
-    /// Publish a code commit before a conversation record names it. The ref is
+    /// Publish a code commit before a session record names it. The ref is
     /// content-addressed, so an existing equal value is the same publication.
     pub fn push_code(&mut self, commit: &Oid) -> Result<(), String> {
         self.store.ensure_local(commit)?;
@@ -179,7 +179,7 @@ impl State<GitStore> {
             transition.kind(),
             &signature,
         )?;
-        let child_ref = conversation_protocol::v3::refs::head_ref(&child.id)?;
+        let child_ref = session_protocol::v3::refs::head_ref(&child.id)?;
         let updates = [
             RefUpdate {
                 refname: self.refname.clone(),
@@ -224,7 +224,7 @@ impl State<GitStore> {
         };
         self.head = observed_parent.clone();
         self.fresh_after_append = false;
-        let observed_record = self.conversation()?.child(&child.id)?;
+        let observed_record = self.session()?.child(&child.id)?;
         match (observed_record, observed_child) {
             (Some(record), Some(child_head)) => {
                 if !same_spawn(&record, child) {
@@ -311,19 +311,19 @@ impl<S: RefStore> State<S> {
         self.store
     }
 
-    pub fn conversation(&self) -> Result<Conversation<'_>, String> {
-        Conversation::open(&self.store, &self.head)
+    pub fn session(&self) -> Result<Session<'_>, String> {
+        Session::open(&self.store, &self.head)
     }
 
-    pub fn conversation_at(&self, head: &Oid) -> Result<Conversation<'_>, String> {
-        Conversation::open(&self.store, head)
+    pub fn session_at(&self, head: &Oid) -> Result<Session<'_>, String> {
+        Session::open(&self.store, head)
     }
 
     pub fn reload(&mut self) -> Result<Oid, String> {
         let head = self
             .store
             .fetch_ref_value(&self.refname)?
-            .ok_or_else(|| format!("conversation ref {} disappeared", self.refname))?;
+            .ok_or_else(|| format!("session ref {} disappeared", self.refname))?;
         self.head = head.clone();
         self.fresh_after_append = false;
         Ok(head)
@@ -345,7 +345,7 @@ impl<S: RefStore> State<S> {
                 }
             }
         }
-        Err("conversation kept changing while appending a transition".to_string())
+        Err("session kept changing while appending a transition".to_string())
     }
 
     pub fn try_append_at(
@@ -431,7 +431,7 @@ impl<S: RefStore> State<S> {
                     self.refname
                 )
             })?
-            .ok_or_else(|| format!("conversation ref {} disappeared", self.refname))?;
+            .ok_or_else(|| format!("session ref {} disappeared", self.refname))?;
         self.head = observed.clone();
         self.fresh_after_append = false;
         if observed == candidate || parent_chain_contains(&self.store, &observed, &candidate)? {
@@ -449,7 +449,7 @@ impl<S: RefStore> State<S> {
     }
 
     fn joined(&self, transition: &Transition) -> Result<Option<Appended>, String> {
-        let view = self.conversation()?;
+        let view = self.session()?;
         let ordinal = match transition_entry(transition) {
             Some(entry) => crate::message_ordinal(&view, &entry.message_id)?,
             None => None,
@@ -507,7 +507,7 @@ fn retarget_transcript_transition(
     parent_tree: &Oid,
     mut transition: Transition,
 ) -> Result<Transition, String> {
-    let ordinal = Conversation::open_tree(store, parent_tree)?.transcript_len()?;
+    let ordinal = Session::open_tree(store, parent_tree)?.transcript_len()?;
     if let Transition::MessageAppend { entry, payloads } = &mut transition {
         retarget_entry(entry, payloads, ordinal);
     }
@@ -547,16 +547,16 @@ fn parent_chain_contains(store: &dyn ObjectStore, tip: &Oid, needle: &Oid) -> Re
         current = parent.clone();
     }
     Err(format!(
-        "conversation recovery walk from {tip} exceeded {MAX_RECOVERY_WALK} commits"
+        "session recovery walk from {tip} exceeded {MAX_RECOVERY_WALK} commits"
     ))
 }
 
 #[cfg(test)]
 mod tests {
 
-    use conversation_protocol::v3::apply::{client_signature, mint};
-    use conversation_protocol::v3::oid::ensure_genesis;
-    use conversation_protocol::v3::{Identity, IdentityKind, MemoryStore};
+    use session_protocol::v3::apply::{client_signature, mint};
+    use session_protocol::v3::oid::ensure_genesis;
+    use session_protocol::v3::{Identity, IdentityKind, MemoryStore};
 
     use super::*;
 
@@ -568,7 +568,7 @@ mod tests {
         pushes: usize,
     }
 
-    conversation_protocol::delegate_object_store!(RacingStore, objects);
+    session_protocol::delegate_object_store!(RacingStore, objects);
 
     impl RefStore for RacingStore {
         fn fetch_ref_value(&mut self, _refname: &str) -> Result<Option<Oid>, String> {
@@ -612,8 +612,8 @@ mod tests {
     fn entry(message_id: &str, text: &str) -> TranscriptEntry {
         TranscriptEntry {
             message_id: message_id.to_string(),
-            conversation: "conversation".to_string(),
-            role: conversation_protocol::v3::Role::System,
+            session: "session".to_string(),
+            role: session_protocol::v3::Role::System,
             actor: "test".to_string(),
             model: None,
             blocks: vec![Block::Text {
@@ -636,9 +636,9 @@ mod tests {
 
     fn root(store: &mut MemoryStore) -> Result<Oid, String> {
         let genesis = ensure_genesis(store)?;
-        let transition = Transition::ConversationRoot {
+        let transition = Transition::SessionRoot {
             identity: Identity {
-                id: "conversation".to_string(),
+                id: "session".to_string(),
                 kind: IdentityKind::Root,
                 owner: None,
             },
@@ -668,7 +668,7 @@ mod tests {
         };
         let mut state = State::from_store(
             store,
-            "refs/caos/v3/conversations/conversation/head".to_string(),
+            "refs/caos/v4/sessions/session/head".to_string(),
             root,
         )
         .unwrap();
@@ -680,7 +680,7 @@ mod tests {
             })
             .unwrap();
 
-        let view = state.conversation().unwrap();
+        let view = state.session().unwrap();
         assert_eq!(view.transcript_len().unwrap(), 2);
         assert_eq!(
             view.transcript_entry(0).unwrap().unwrap().1.blocks,
@@ -706,7 +706,7 @@ mod tests {
             };
             let mut state = State::from_store(
                 store,
-                "refs/caos/v3/conversations/conversation/head".to_string(),
+                "refs/caos/v4/sessions/session/head".to_string(),
                 root.clone(),
             )
             .unwrap();
@@ -738,7 +738,7 @@ mod tests {
                 state.store().read_commit(first).unwrap().parents,
                 vec![root]
             );
-            assert_eq!(state.conversation().unwrap().transcript_len().unwrap(), 2);
+            assert_eq!(state.session().unwrap().transcript_len().unwrap(), 2);
             assert_eq!(state.take_fresh_after_append(), !lost_ack);
             assert!(!state.take_fresh_after_append());
         }

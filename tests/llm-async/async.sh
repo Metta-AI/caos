@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # An independently dispatched worker with a deterministic release barrier.
 # The second llm-stub records this request, then blocks reading its response
-# FIFO until the outer test has proved the primary conversation is idle.
+# FIFO until the outer test has proved the primary session is idle.
 set -euo pipefail
 
 caos get /cas/args/gate-host

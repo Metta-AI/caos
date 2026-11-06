@@ -34,11 +34,11 @@
 # READING THE ANSWER: `start` and `send` return at once. The model's reply is
 # not printed anywhere; `info` shows the session's `summary` once its turn has
 # finished (empty while it is still running -- call `info` again with a new
-# `at`). `conv` reads the conversation from $CAOS_SERVER_URL, which is the HOST
+# `at`). `conv` reads the session from $CAOS_SERVER_URL, which is the HOST
 # server, so for a session driven at a `caos-stack` test stack it reports "head
-# not found": the conversation is recorded in the stack, not here.
+# not found": the session is recorded in the stack, not here.
 #
-# No `@writer` and no `@in`: nothing here advances the conversation tree.
+# No `@writer` and no `@in`: nothing here advances the session tree.
 HELP=<<END
 Start and inspect Claude Code cloud sessions. A session runs in a named cloud
 environment, on a named GitHub repository, and answers prompts. `verb` chooses
@@ -47,7 +47,7 @@ repo and prompt and returns a session id; `send` takes session and prompt;
 `list` takes nothing and returns recent sessions with their status and
 environment; `info` takes session and returns its environment, its source and
 its provisioning trace, read from outside the container; `conv` takes session
-and locates the caos conversation it records into; `archive` takes session and
+and locates the caos session it records into; `archive` takes the Claude Code session and
 ends it, freeing its container; `probe` asks a session to dump what it can see
 of its own container, into its transcript rather than into this result, and
 takes either a session or an env and repo to start a fresh one. Environments

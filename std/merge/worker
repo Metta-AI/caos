@@ -90,7 +90,7 @@ caos put "$work" /cas/merged
 mtree=$(caos hash /cas/merged)
 
 # Mint M = (merged tree, parents [ours, theirs]). Inheriting ours' timestamp
-# keeps a merge of the same two commits a pure value while giving conversation
+# keeps a merge of the same two commits a pure value while giving session
 # merges a useful date. put-commit at /cas/out makes `commit <hash>` the result.
 commit=/tmp/merge-commit
 {

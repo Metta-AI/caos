@@ -23,7 +23,7 @@ mkfifo /tmp/stub/response-2.json /tmp/stub/response-3.json \
   /tmp/stub/response-4.json /tmp/stub/response-5.json
 start_stub /tmp/stub
 
-new_llm_conversation llm-subagent "$STUB_PORT" "$ws" \
+new_llm_session llm-subagent "$STUB_PORT" "$ws" \
   "You are a coding agent operating on a git source_tree."
 
 stage "atomic spawn and independent child work"
@@ -34,14 +34,14 @@ start_turn
 
 # The parent and child race for the next model slot. The stub is sequential, so
 # inspect each blocked request and release its FIFO with the response belonging
-# to that conversation. Both conversations receive identical terminal text.
+# to that session. Both sessions receive identical terminal text.
 child_write_sent=0
 parent_wait_sent=0
 parent_terminal_sent=0
 child_terminal_sent=0
 for request_number in 2 3 4 5; do
   if ! wait_for_file "/tmp/stub/request-$request_number.json"; then
-    dump_conversation "$conversation_ref" "$request1"
+    dump_session "$session_ref" "$request1"
     fail "parent/child API request $request_number never arrived"
   fi
   if jq -e '.system | contains("You are a focused subagent")' \
@@ -62,8 +62,8 @@ for request_number in 2 3 4 5; do
         "$TERMINAL_TEXT" > "/tmp/stub/response-$request_number.json"
       parent_terminal_sent=1
     else
-      wait_head=$(remote_tip "$conversation_ref") \
-        || fail "parent wait response could not read the conversation head"
+      wait_head=$(remote_tip "$session_ref") \
+        || fail "parent wait response could not read the session head"
       wait_child=$($TOOL children --repo /tmp/repo --head "$wait_head" \
         | jq -r '.id')
       wait_child=${wait_child%%$'\n'*}
@@ -148,7 +148,7 @@ git merge-base --is-ancestor "$initial_head" "$child_tip" \
   || fail "child ref does not descend from its recorded initial head"
 initial_kinds=$($TOOL parents --repo /tmp/repo --head "$initial_head" --validate \
   | while read -r _ kind; do printf '%s\n' "$kind"; done | paste -sd,)
-[ "$initial_kinds" = message.append,conversation.root ] \
+[ "$initial_kinds" = message.append,session.root ] \
   || fail "child initial chain is not prompt -> root: $initial_kinds"
 record "$initial_head" .caos/identity.json > /tmp/child-identity.json
 [ "$(jq -r '.id' /tmp/child-identity.json)" = "$child" ] \
@@ -162,7 +162,7 @@ record "$initial_head" .caos/identity.json > /tmp/child-identity.json
 
 child_key=$(printf '%s' "$child" | od -An -tx1 | tr -d ' \n')
 membership=$(git ls-remote --refs caos \
-  "refs/caos/v3/users/*/conversations/*/$child_key") \
+  "refs/caos/v4/users/*/sessions/*/$child_key") \
   || fail "checking child membership refs"
 [ -z "$membership" ] || fail "child unexpectedly has a user membership ref"
 
@@ -170,7 +170,7 @@ stage "relay terminal checkpoint"
 terminal_record=""
 seen=""
 for _ in $(seq 1 300); do
-  if remote=$(remote_tip "$conversation_ref") && [ "$remote" != "$seen" ]; then
+  if remote=$(remote_tip "$session_ref") && [ "$remote" != "$seen" ]; then
     seen=$remote
     candidate=$remote
     terminal_record=$($TOOL children --repo /tmp/repo --head "$candidate" \
@@ -210,7 +210,7 @@ admit_turn "apply the child result"
 start_turn
 wait_for_file /tmp/stub/request-6.json || fail "harvest model request never arrived"
 # Promotion mounts a NEW source tree beside the existing one, so its shell has
-# to run over the CONVERSATION tree: the tool's path lies outside every source
+# to run over the SESSION tree: the tool's path lies outside every source
 # tree, which is what selects that scope. `write` stages the tool first -- a
 # directory whose `.caos-expr` names std/bash-tool's image, which nothing
 # registers.
@@ -225,7 +225,7 @@ fetch_code "$parent_after" "fetching harvested parent source_tree"
 [ "$(git show "$parent_after:child-output.txt")" = "written by child" ] \
   || fail "harvested parent tree lacks the child's file"
 [ "$(git show "$head2:memories/child.md")" = "remember this" ] \
-  || fail "harvest omitted ordinary conversation content"
+  || fail "harvest omitted ordinary session content"
 $TOOL tools --repo /tmp/repo --head "$head2" \
   | jq -e 'select(.id == "toolu_harvest") | .files_outcome.applied | index("memories/child.md") != null' >/dev/null \
   || fail "harvest did not use file application"

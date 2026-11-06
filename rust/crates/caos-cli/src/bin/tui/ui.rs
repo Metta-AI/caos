@@ -14,7 +14,7 @@ use ratatui_widgets::paragraph::{Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
-    short_hash, ActivityState, App, Command, ConversationState, EntryRole, Focus, ScrollState,
+    short_hash, ActivityState, App, Command, EntryRole, Focus, ScrollState, SessionState,
     TranscriptPoint, View, COMMANDS, PALETTE_COMMANDS,
 };
 use caos_cli::TurnPhase;
@@ -30,12 +30,12 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
     let areas = layout(state, app.view == View::Chat, frame.area());
 
     render_header(app, state, frame, areas.header);
-    render_conversations(app, frame, areas.sidebar);
+    render_sessions(app, frame, areas.sidebar);
     match app.view {
         View::Chat => render_chat(
             state,
             app.animation_frame,
-            app.focus() == Focus::Conversation,
+            app.focus() == Focus::Session,
             frame,
             areas.content,
         ),
@@ -49,7 +49,7 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
     render_composer(
         state,
         app.view,
-        !app.selection_locked && app.palette.is_none() && app.focus() == Focus::Conversation,
+        !app.selection_locked && app.palette.is_none() && app.focus() == Focus::Session,
         frame,
         areas.composer,
     );
@@ -161,11 +161,11 @@ struct Areas {
     footer: Rect,
 }
 
-pub(super) fn composer_width(state: &ConversationState, area: Rect) -> u16 {
+pub(super) fn composer_width(state: &SessionState, area: Rect) -> u16 {
     layout(state, false, area).composer.width.saturating_sub(2)
 }
 
-fn layout(state: &ConversationState, show_commands: bool, area: Rect) -> Areas {
+fn layout(state: &SessionState, show_commands: bool, area: Rect) -> Areas {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -195,7 +195,7 @@ fn layout(state: &ConversationState, show_commands: bool, area: Rect) -> Areas {
     } else {
         0
     };
-    let conversation = Layout::default()
+    let session = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(6),
@@ -206,14 +206,14 @@ fn layout(state: &ConversationState, show_commands: bool, area: Rect) -> Areas {
     Areas {
         header: outer[0],
         sidebar: body[0],
-        content: conversation[0],
-        notice: (notice_height > 0).then_some(conversation[1]),
-        composer: conversation[2],
+        content: session[0],
+        notice: (notice_height > 0).then_some(session[1]),
+        composer: session[2],
         footer: outer[2],
     }
 }
 
-fn render_notice(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
+fn render_notice(state: &SessionState, frame: &mut Frame<'_>, area: Rect) {
     if let Some(error) = state.command_error.as_deref() {
         frame.render_widget(
             Paragraph::new(error)
@@ -243,7 +243,7 @@ fn render_notice(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
             ])
             .block(
                 Block::default()
-                    .title(" Conversation reference — click a row to copy ")
+                    .title(" Session reference — click a row to copy ")
                     .border_style(Style::default().fg(Color::Cyan))
                     .borders(Borders::ALL),
             ),
@@ -276,18 +276,13 @@ pub(super) fn reference_copy_at(
     }
 }
 
-pub(super) fn content_contains(
-    state: &ConversationState,
-    area: Rect,
-    column: u16,
-    row: u16,
-) -> bool {
+pub(super) fn content_contains(state: &SessionState, area: Rect, column: u16, row: u16) -> bool {
     layout(state, false, area)
         .content
         .contains(Position::new(column, row))
 }
 
-fn conversation_list_offset(selected: usize, count: usize, height: u16) -> usize {
+fn session_list_offset(selected: usize, count: usize, height: u16) -> usize {
     let visible = (height as usize / 2).max(1);
     selected
         .saturating_add(1)
@@ -295,19 +290,19 @@ fn conversation_list_offset(selected: usize, count: usize, height: u16) -> usize
         .min(count.saturating_sub(visible))
 }
 
-pub(super) fn conversation_at(app: &App, terminal: Rect, column: u16, row: u16) -> Option<usize> {
+pub(super) fn session_at(app: &App, terminal: Rect, column: u16, row: u16) -> Option<usize> {
     let areas = layout(app.selected(), app.view == View::Chat, terminal);
     let inner = Block::default().borders(Borders::ALL).inner(areas.sidebar);
     let position = Position::new(column, row);
     if !inner.contains(position) {
         return None;
     }
-    let offset = conversation_list_offset(app.selected, app.conversations.len(), inner.height);
+    let offset = session_list_offset(app.selected, app.sessions.len(), inner.height);
     let index = offset + ((row - inner.y) / 2) as usize;
-    (index < app.conversations.len()).then_some(index)
+    (index < app.sessions.len()).then_some(index)
 }
 
-fn chat_areas(state: &ConversationState, area: Rect) -> (Rect, Option<Rect>) {
+fn chat_areas(state: &SessionState, area: Rect) -> (Rect, Option<Rect>) {
     if !state.running && !state.source_tree_operation {
         return (area, None);
     }
@@ -319,7 +314,7 @@ fn chat_areas(state: &ConversationState, area: Rect) -> (Rect, Option<Rect>) {
 }
 
 pub(super) fn transcript_contains(
-    state: &ConversationState,
+    state: &SessionState,
     terminal: Rect,
     column: u16,
     row: u16,
@@ -328,11 +323,11 @@ pub(super) fn transcript_contains(
     transcript.contains(Position::new(column, row))
 }
 
-fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
+fn render_header(app: &App, state: &SessionState, frame: &mut Frame<'_>, area: Rect) {
     let active = app
-        .conversations
+        .sessions
         .iter()
-        .filter(|conversation| conversation.is_busy())
+        .filter(|session| session.is_busy())
         .count();
     let left = Line::from(vec![
         Span::styled(" caos ", Style::default().fg(Color::Black).bg(Color::Cyan)),
@@ -405,7 +400,7 @@ fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, ar
                     .as_deref()
                     .map(|hash| format!("from {}", short_hash(hash)))
             })
-            .unwrap_or_else(|| "new conversation".to_string()),
+            .unwrap_or_else(|| "new session".to_string()),
         Style::default().fg(Color::DarkGray),
     );
     if active > 0 {
@@ -431,60 +426,58 @@ fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, ar
     );
 }
 
-fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
+fn render_sessions(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let inner = Block::default().borders(Borders::ALL).inner(area);
     // The list's two-cell highlight symbol and our two-cell status prefix are
     // both inside the border, even for unselected rows.
     let detail_width = inner.width.saturating_sub(4);
-    let items: Vec<ListItem<'_>> = app
-        .conversations
-        .iter()
-        .map(|state| {
-            let is_child = state.parent.as_ref().is_some_and(|parent| {
-                app.conversations
-                    .iter()
-                    .any(|candidate| candidate.id == *parent)
-            });
-            let indent = if is_child { "  " } else { "" };
-            let (mark, color) = if state.running {
-                ("*", Color::Yellow)
-            } else if state.generating_title {
-                ("~", Color::Magenta)
-            } else {
-                (" ", Color::DarkGray)
-            };
-            let (title, detail) = state.sidebar_text(
-                detail_width.saturating_sub(u16::try_from(indent.len()).unwrap_or(u16::MAX)),
-            );
-            ListItem::new(vec![
-                Line::from(vec![
-                    Span::raw(indent),
-                    Span::styled(format!("{mark} "), Style::default().fg(color)),
-                    Span::styled(
-                        title,
-                        if state.has_placeholder_title() {
+    let items: Vec<ListItem<'_>> =
+        app.sessions
+            .iter()
+            .map(|state| {
+                let is_child = state.parent.as_ref().is_some_and(|parent| {
+                    app.sessions.iter().any(|candidate| candidate.id == *parent)
+                });
+                let indent = if is_child { "  " } else { "" };
+                let (mark, color) = if state.running {
+                    ("*", Color::Yellow)
+                } else if state.generating_title {
+                    ("~", Color::Magenta)
+                } else {
+                    (" ", Color::DarkGray)
+                };
+                let (title, detail) = state.sidebar_text(
+                    detail_width.saturating_sub(u16::try_from(indent.len()).unwrap_or(u16::MAX)),
+                );
+                ListItem::new(vec![
+                    Line::from(vec![
+                        Span::raw(indent),
+                        Span::styled(format!("{mark} "), Style::default().fg(color)),
+                        Span::styled(
+                            title,
+                            if state.has_placeholder_title() {
+                                Style::default()
+                                    .fg(Color::DarkGray)
+                                    .add_modifier(Modifier::DIM)
+                            } else {
+                                Style::default()
+                            },
+                        ),
+                    ]),
+                    Line::from(vec![
+                        Span::raw(format!("{indent}  ")),
+                        Span::styled(
+                            detail,
                             Style::default()
                                 .fg(Color::DarkGray)
-                                .add_modifier(Modifier::DIM)
-                        } else {
-                            Style::default()
-                        },
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::raw(format!("{indent}  ")),
-                    Span::styled(
-                        detail,
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::DIM),
-                    ),
-                ]),
-            ])
-        })
-        .collect();
+                                .add_modifier(Modifier::DIM),
+                        ),
+                    ]),
+                ])
+            })
+            .collect();
     let inner_height = inner.height;
-    let offset = conversation_list_offset(app.selected, app.conversations.len(), inner_height);
+    let offset = session_list_offset(app.selected, app.sessions.len(), inner_height);
     let mut selected = ListState::default()
         .with_offset(offset)
         .with_selected(Some(app.selected));
@@ -498,7 +491,7 @@ fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
         List::new(items)
             .block(
                 Block::default()
-                    .title(" Conversations ")
+                    .title(" Sessions ")
                     .border_style(border_style)
                     .borders(Borders::ALL),
             )
@@ -514,7 +507,7 @@ fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn render_chat(
-    state: &ConversationState,
+    state: &SessionState,
     animation_frame: usize,
     focused: bool,
     frame: &mut Frame<'_>,
@@ -528,7 +521,7 @@ fn render_chat(
 }
 
 fn render_live_activity(
-    state: &ConversationState,
+    state: &SessionState,
     animation_frame: usize,
     frame: &mut Frame<'_>,
     area: Rect,
@@ -562,7 +555,7 @@ fn render_live_activity(
     );
 }
 
-fn render_transcript(state: &ConversationState, focused: bool, frame: &mut Frame<'_>, area: Rect) {
+fn render_transcript(state: &SessionState, focused: bool, frame: &mut Frame<'_>, area: Rect) {
     let paragraph = transcript_paragraph(state, transcript_inner(area).width);
     let scroll = paragraph_scroll(&paragraph, area, &state.scroll);
     let rows_below = state
@@ -576,7 +569,7 @@ fn render_transcript(state: &ConversationState, focused: bool, frame: &mut Frame
         Style::default()
     };
     let mut block = Block::default()
-        .title(" Conversation ")
+        .title(" Session ")
         .border_style(border_style)
         .borders(Borders::ALL);
     if rows_below > 0 {
@@ -599,7 +592,7 @@ fn render_transcript(state: &ConversationState, focused: bool, frame: &mut Frame
     render_transcript_selection(state, frame, area);
 }
 
-fn transcript_paragraph(state: &ConversationState, width: u16) -> Paragraph<'static> {
+fn transcript_paragraph(state: &SessionState, width: u16) -> Paragraph<'static> {
     let mut lines = Vec::new();
     if state.transcript.is_empty() {
         lines.push(Line::styled(
@@ -1069,7 +1062,7 @@ fn transcript_inner(area: Rect) -> Rect {
     Block::default().borders(Borders::ALL).inner(area)
 }
 
-fn transcript_scroll(state: &ConversationState, area: Rect) -> u16 {
+fn transcript_scroll(state: &SessionState, area: Rect) -> u16 {
     paragraph_scroll(
         &transcript_paragraph(state, transcript_inner(area).width),
         area,
@@ -1078,7 +1071,7 @@ fn transcript_scroll(state: &ConversationState, area: Rect) -> u16 {
 }
 
 pub(super) fn transcript_point(
-    state: &ConversationState,
+    state: &SessionState,
     terminal: Rect,
     column: u16,
     row: u16,
@@ -1098,10 +1091,7 @@ pub(super) fn transcript_point(
     ((absolute_row as usize) < line_count).then_some(point)
 }
 
-pub(super) fn transcript_selection_text(
-    state: &ConversationState,
-    terminal: Rect,
-) -> Option<String> {
+pub(super) fn transcript_selection_text(state: &SessionState, terminal: Rect) -> Option<String> {
     let selection = state.transcript_selection?;
     let area = layout(state, true, terminal).content;
     let inner = transcript_inner(area);
@@ -1143,7 +1133,7 @@ pub(super) fn transcript_selection_text(
     (!text.is_empty()).then_some(text)
 }
 
-fn render_transcript_selection(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
+fn render_transcript_selection(state: &SessionState, frame: &mut Frame<'_>, area: Rect) {
     let Some(selection) = state.transcript_selection else {
         return;
     };
@@ -1167,7 +1157,7 @@ fn render_transcript_selection(state: &ConversationState, frame: &mut Frame<'_>,
     }
 }
 
-fn render_activity_browser(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
+fn render_activity_browser(state: &SessionState, frame: &mut Frame<'_>, area: Rect) {
     let panes = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
@@ -1270,7 +1260,7 @@ fn activity_mark(state: ActivityState) -> (&'static str, Color) {
     }
 }
 
-fn render_tools(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
+fn render_tools(state: &SessionState, frame: &mut Frame<'_>, area: Rect) {
     let mut lines = vec![
         Line::styled(
             "Always available",
@@ -1383,8 +1373,8 @@ fn render_help(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Line::raw("  Ctrl+K          delete to the end of the line"),
         Line::raw("  Ctrl+D          delete the character to the right"),
         Line::raw("  Esc             stop a running agent or dismiss the current layer"),
-        Line::raw("  Ctrl+Up/Down    switch conversations"),
-        Line::raw("  Ctrl+1..9       jump to the Nth conversation"),
+        Line::raw("  Ctrl+Up/Down    switch sessions"),
+        Line::raw("  Ctrl+1..9       jump to the Nth session"),
         Line::raw("  Ctrl+C          clear the prompt, then quit"),
     ];
     lines.extend(PALETTE_COMMANDS.iter().map(|command| {
@@ -1427,7 +1417,7 @@ fn tool_image_label(image: &str) -> &str {
 }
 
 fn render_composer(
-    state: &ConversationState,
+    state: &SessionState,
     view: View,
     show_cursor: bool,
     frame: &mut Frame<'_>,
@@ -1618,7 +1608,7 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
             Style::default().fg(Color::Black).bg(Color::Cyan),
         )
     } else if app.selected().running
-        && (app.focus() != Focus::Conversation || app.view != View::Chat || app.palette.is_some())
+        && (app.focus() != Focus::Session || app.view != View::Chat || app.palette.is_some())
     {
         let send_shortcut = if app.enhanced_keyboard() {
             "^Enter"
@@ -1632,7 +1622,7 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Line::raw(" Command palette: type to filter  Up/Dn select  Enter runs  Esc closes")
     } else if app.focus() == Focus::List {
         Line::raw(
-            " Conversations: Up/Dn select  Enter opens  ^N new  ^Shift+P commands  ^Up/Dn switch  ^C quit",
+            " Sessions: Up/Dn select  Enter opens  ^N new  ^Shift+P commands  ^Up/Dn switch  ^C quit",
         )
     } else if app.view == View::Activity {
         Line::raw(

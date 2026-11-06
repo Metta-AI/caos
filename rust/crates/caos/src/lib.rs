@@ -9,7 +9,7 @@
 //! Everything that doesn't depend on *how* objects move — the object model,
 //! currying, args-tree assembly, CAS materialization, image import — lives here,
 //! written against the [`Transport`] trait. The worker picks [`HttpTransport`];
-//! host clients use [`GitTransport`]. Conversation semantics and presentation
+//! host clients use [`GitTransport`]. Session semantics and presentation
 //! live in the separate `caos-cli` crate.
 //!
 //! Every materialized path is tagged with the git hash it came from in the
@@ -275,12 +275,12 @@ pub fn cli_watch(t: &dyn Transport, ticket: &str) -> Result<(), String> {
 pub const SERVER_ENV: &str = "CAOS_SERVER_URL";
 
 /// What a request presents for secrets (SPEC, "Secrets"): SecretReaderKeys,
-/// and the conversation it is for. Sent as headers, never in an ArgTree — a
+/// and the session it is for. Sent as headers, never in an ArgTree — a
 /// key is a credential.
 #[derive(Clone, Debug, Default)]
 pub struct Secrets {
     readers: Vec<String>,
-    conversation: Option<String>,
+    session: Option<String>,
 }
 
 static SECRET_READERS: OnceLock<Vec<String>> = OnceLock::new();
@@ -292,19 +292,19 @@ pub fn set_secret_readers(keys: Vec<String>) {
 }
 
 impl Secrets {
-    /// This process's SecretReaderKeys, for no particular conversation.
+    /// This process's SecretReaderKeys, for no particular session.
     pub fn current() -> Secrets {
         Secrets {
             readers: SECRET_READERS.get().cloned().unwrap_or_default(),
-            conversation: None,
+            session: None,
         }
     }
 
-    /// The same keys, for conversation `id`.
-    pub fn for_conversation(&self, id: &str) -> Secrets {
+    /// The same keys, for session `id`.
+    pub fn for_session(&self, id: &str) -> Secrets {
         Secrets {
             readers: self.readers.clone(),
-            conversation: Some(id.to_string()),
+            session: Some(id.to_string()),
         }
     }
 
@@ -317,11 +317,9 @@ impl Secrets {
         if !self.readers.is_empty() {
             headers.push((caos_world::secrets::READERS_HEADER, self.readers.join(" ")));
         }
-        if let Some(conversation) = &self.conversation {
-            headers.push((
-                caos_world::secrets::CONVERSATION_HEADER,
-                conversation.clone(),
-            ));
+        if let Some(session) = &self.session {
+            headers.push((caos_world::secrets::SESSION_HEADER, session.clone()));
+            headers.push((caos_world::secrets::LEGACY_SESSION_HEADER, session.clone()));
         }
         headers
     }
@@ -3244,7 +3242,7 @@ pub use git_locator::{parse_git_ref, GitRef};
 /// ssh-vs-https key identical content differently. That is still exactly where
 /// this happens; only the process doing the fetching moved. What moving it buys
 /// is the case that had no client at all: an agent's tree is evaluated
-/// server-side, so a conversation whose root expression pins caos used to die on
+/// server-side, so a session whose root expression pins caos used to die on
 /// its own repository (`eval_path ./caos-std`), and `caos mcp serve` had to
 /// pre-resolve tool paths on the session's disk to work around it.
 ///
@@ -3559,7 +3557,7 @@ pub fn prepare_client_request_granted(
 /// Prepare and synchronously run one host-side request presenting `secrets`.
 /// This is the non-streaming client equivalent of [`cli_run`], for callers
 /// that need the result identity rather than CLI output handling. Durable
-/// conversation turns deliberately use the split prepare and compute APIs
+/// session turns deliberately use the split prepare and compute APIs
 /// instead so they can record the request before dispatching it.
 pub fn run_client_request_with_secrets(
     t: &dyn Transport,
@@ -4290,7 +4288,7 @@ pub fn eval_cli_image_arg(
 }
 
 /// [`eval_cli_image`] presenting `secrets`, so the image comes back marked
-/// wherever a grant matches (SPEC, "Secrets"). Conversation setup uses this
+/// wherever a grant matches (SPEC, "Secrets"). Session setup uses this
 /// form: the step it resolves is what the model key is granted to.
 pub fn eval_cli_image_with(
     t: &dyn Transport,
@@ -4962,8 +4960,8 @@ fn parse_line_result(text: &str) -> Result<LineResult, String> {
 }
 
 /// The blob entries of the tree `hash`, by name, with their contents. Entries
-/// that are not blobs (subtrees, a conversation's gitlink) are left out, so a
-/// result that names a conversation can be read without fetching it.
+/// that are not blobs (subtrees, a session's gitlink) are left out, so a
+/// result that names a session can be read without fetching it.
 pub fn tree_blobs(
     t: &dyn Transport,
     hash: &str,
@@ -5110,7 +5108,7 @@ gpgsig -----BEGIN PGP SIGNATURE-----
         std::fs::create_dir_all(&cas).unwrap();
         let original = cas.join("original");
         get_hash(&t, &base, original.to_str().unwrap()).unwrap();
-        let root = dir.path().join("conversation");
+        let root = dir.path().join("session");
         std::fs::create_dir(&root).unwrap();
         std::os::unix::fs::symlink(&original, root.join("dirty")).unwrap();
         std::fs::write(root.join("memory"), "remember").unwrap();
@@ -5237,7 +5235,7 @@ gpgsig -----BEGIN PGP SIGNATURE-----
             merge
         );
 
-        // Ordinary conversation files are outside this cleanup rule.
+        // Ordinary session files are outside this cleanup rule.
         std::fs::create_dir(projection.join(".caos")).unwrap();
         std::fs::write(projection.join(".caos/conflicts"), "").unwrap();
         for remove_ledger in [false, true] {

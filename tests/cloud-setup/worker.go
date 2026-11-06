@@ -242,8 +242,8 @@ func main() {
 
 		settings := readJSON("/tmp/home/.claude/settings.json")
 		prompt := hookCommand(settings, "UserPromptSubmit")
-		// THE HOOK CREATES THE CONVERSATION, so it is the hook that must carry
-		// the seed. Putting --base only on `mcp serve` left every conversation
+		// THE HOOK CREATES THE SESSION, so it is the hook that must carry
+		// the seed. Putting --base only on `mcp serve` left every session
 		// seeded from HEAD while everything else about dev mode worked.
 		w.True(strings.Contains(prompt, "'"+step+"'"),
 			"the prompt hook does not name the step as a quoted shell word: %s", prompt)
@@ -254,24 +254,24 @@ func main() {
 		w.True(hookCommand(settings, "SessionStart") == "caos-cloud-session-start",
 			"nothing runs the session hook")
 		// Claude Code's 60s default kills a resume over iroh, and a killed prompt
-		// hook lets the prompt through with no conversation and no reason.
+		// hook lets the prompt through with no session and no reason.
 		promptHook := settings["hooks"].(map[string]any)["UserPromptSubmit"].([]any)[0].(map[string]any)["hooks"].([]any)[0].(map[string]any)
 		timeout, _ := promptHook["timeout"].(float64)
 		w.True(timeout >= 300, "the prompt hook's timeout is %v, not the 300s a resume over iroh needs", promptHook["timeout"])
 
-		// The slash command that starts a session from a recorded conversation.
+		// The slash command that starts a Claude Code session from a recorded caos session.
 		// The marker line is what the prompt hook keys on if it is handed the
 		// expansion rather than what was typed, so it is asserted, not just the
 		// file.
 		for name, mode := range map[string]string{
-			"fork-caos-conversation.md": "fork",
+			"fork-caos-session.md": "fork",
 		} {
 			body, err := os.ReadFile("/tmp/home/.claude/commands/" + name)
 			w.Must(err)
-			w.True(strings.Contains(string(body), "caos-conversation-command: "+mode+" $ARGUMENTS"),
+			w.True(strings.Contains(string(body), "caos-session-command: "+mode+" $ARGUMENTS"),
 				"%s does not carry the marker line the hook keys on:\n%s", name, body)
-			w.True(strings.Contains(string(body), `"caos-std/caos-conversation"`),
-				"%s does not send the model to std/caos-conversation for the history:\n%s", name, body)
+			w.True(strings.Contains(string(body), `"caos-std/caos-session"`),
+				"%s does not send the model to std/caos-session for the history:\n%s", name, body)
 		}
 
 		permissions, _ := settings["permissions"].(map[string]any)
@@ -291,7 +291,7 @@ func main() {
 			"the tool server is not told the server, the content and the readers, each as its own argument: %v", args)
 
 		// -------------------------------------------------------------------
-		w.Step("stage 1 in dev mode seeds a conversation and leaves the checkout clean")
+		w.Step("stage 1 in dev mode seeds a session and leaves the checkout clean")
 		// -------------------------------------------------------------------
 		repo := fixtureRepo("/tmp/repo")
 		readers := strings.Repeat("ab", 32)
@@ -328,7 +328,7 @@ func main() {
 		w.True(stamp("/tmp/share/setup-stamp")["client"] == "dev-"+devRev[:12],
 			"the setup stamp does not say the client came from the dev server")
 
-		w.Step("the conversation's seed commit carries the dev pin, and is unreferenced")
+		w.Step("the session's seed commit carries the dev pin, and is unreferenced")
 		seedCommit := dev["seed"]
 		w.True(len(seedCommit) == 40, "the dev stamp carries no seed commit: %q", seedCommit)
 		w.True(git(repo, "rev-parse", seedCommit+"^") == head,
@@ -438,7 +438,7 @@ func main() {
 		hookOut, marked = hook("/tmp/share-dev", "Metta-AI/caos@"+otherRev, devRev)
 		w.True(!marked, "the hook failed a dev install over the checkout's pin:\n%s", hookOut)
 
-		// The conversation base setup computed is a commit; a checkout now at another
+		// The session base setup computed is a commit; a checkout now at another
 		// one is told so, without failing the session.
 		write("/tmp/share-content/setup-stamp",
 			"pin=Metta-AI/caos@"+pinRev+"\ncontent=github:o/r?rev="+otherRev+"\n", 0o644)
@@ -447,10 +447,10 @@ func main() {
 		contentCmd.Dir = "/tmp"
 		contentOut, err := contentCmd.Output()
 		w.True(err == nil, "the session hook failed on a stale content commit: %v", err)
-		w.True(strings.Contains(string(contentOut), "new conversations start from "+otherRev[:12]),
-			"the hook did not say the conversation base is behind the checkout:\n%s", contentOut)
+		w.True(strings.Contains(string(contentOut), "new sessions start from "+otherRev[:12]),
+			"the hook did not say the session base is behind the checkout:\n%s", contentOut)
 		_, statErr := os.Stat("/tmp/share-content/stale-install")
-		w.True(statErr != nil, "a stale conversation base failed the session; it should only be noted")
+		w.True(statErr != nil, "a stale session base failed the session; it should only be noted")
 
 		w.Report(fmt.Sprintf("cloud-setup: stage 2 installed and configured; stage 1 repointed a\n"+
 			"checkout at %s and seeded %s\n", devRev[:12], seedCommit[:12]))

@@ -35,7 +35,7 @@ git config user.name tester
 git config user.email tester@example.com
 base=$(mkcommit "HEAD:ws" "base")
 
-TALK_TEXT="remote conversation reply"
+TALK_TEXT="remote session reply"
 mkdir stub
 mkfifo stub/response-1.json
 
@@ -78,7 +78,7 @@ bad_conv="${test_id}-bad-chat"
 bad_ref=$($TOOL ref --id "$bad_conv")
 bad_ref=${bad_ref#ref }
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
-# The step this conversation runs, named in the invocation rather than looked
+# The step this session runs, named in the invocation rather than looked
 # up under a path this client decided on. dev/cli-test stages the test's DEPS
 # at ./DEEP-DEPS, so that is where this repo keeps it; `caos-std/llm-step` in a
 # repo that mounted caos, `std/llm-step` in caos itself. `--llm-call` is not
@@ -98,7 +98,7 @@ grep -qF "$CAOS_CLI secrets-init" key.err \
 grep -qF "$CAOS_CLI secrets-push" key.err \
   || fail "missing-key error does not explain pushing it"
 if remote_tip "$queued_ref" >/dev/null; then
-  fail "request-preparation failure partially admitted a conversation"
+  fail "request-preparation failure partially admitted a session"
 fi
 [ ! -e stub/request-1.json ] || fail "missing-key failure reached the LLM"
 
@@ -125,10 +125,10 @@ for dir in std/removed-llm-step DEEP-DEPS/llm-test-tool; do
   if "$CAOS_CLI" chat "$queued_conv" -m "hello" --base "$base" "${opts[@]}" 2>reader.err; then
     fail "chat admitted a model key granted to $dir"
   fi
-  grep -qF 'is not granted to this conversation' reader.err || fail "reader error is unclear"
+  grep -qF 'is not granted to this session' reader.err || fail "reader error is unclear"
   grep -qF 'reader:@=DEEP-DEPS/llm-step' reader.err || fail "reader error omits the selected image"
   if remote_tip "$queued_ref" >/dev/null; then
-    fail "reader failure partially admitted a conversation"
+    fail "reader failure partially admitted a session"
   fi
   [ ! -e stub/request-1.json ] || fail "reader failure reached the LLM"
 done
@@ -139,17 +139,17 @@ printf '%s\n' \
   "reader:@@=$step_at" > "$STORE/anthropic-api-key"
 push || fail "secrets-push failed"
 
-echo "== a conversation-shaped base is refused ==" >&2
+echo "== a session-shaped base is refused ==" >&2
 fake_output=$($TOOL root --repo "$PWD" --id "${test_id}-fake-base" --title fake)
 fake_base=${fake_output#head }
 if "$CAOS_CLI" chat "$bad_conv" -m "hello" --base "$fake_base" "${opts[@]}" 2>base.err; then
   fail "chat accepted a base descending from G3"
 fi
-grep -Eq 'G3|conversation' base.err || fail "conversation-base error is unclear"
+grep -Eq 'G3|session' base.err || fail "session-base error is unclear"
 if remote_tip "$bad_ref" >/dev/null; then
-  fail "conversation-base failure created a conversation"
+  fail "session-base failure created a session"
 fi
-[ ! -e stub/request-1.json ] || fail "conversation-base failure reached the LLM"
+[ ! -e stub/request-1.json ] || fail "session-base failure reached the LLM"
 
 # THE TWO WAITS BELOW BOUND A QUEUE, NOT A LATENCY. The `talk` this starts
 # dispatches a real llm-step job, and under `--test-salt` that job is COLD — the
@@ -194,7 +194,7 @@ for _ in $(seq 1 480); do
   if remote=$(remote_tip "$ref") && [ "$remote" != "$seen" ]; then
     seen=$remote
     fetch_output=$($TOOL fetch --repo "$PWD" --ref "$ref") \
-      || fail "fetching the changed conversation ref"
+      || fail "fetching the changed session ref"
     tip=${fetch_output#head }
     transcript=$($TOOL transcript --repo "$PWD" --head "$tip")
     if grep -qF "$TALK_TEXT" <<<"$transcript"; then
@@ -207,44 +207,44 @@ done
 [ "$recovered" -eq 1 ] || fail "worker did not finish after client disconnect"
 
 echo "== canonical refs, title, spine, source_tree, and request isolation ==" >&2
-conversation_prefix=${ref%/head}
-git ls-remote --refs caos "$conversation_prefix/*" > conversation.refs
-[ "$(wc -l < conversation.refs)" -eq 1 ] \
-  || fail "conversation does not have exactly one canonical ref"
-conversation_key=$(printf '%s' "$conv" | od -An -v -tx1 | tr -d '[:space:]')
+session_prefix=${ref%/head}
+git ls-remote --refs caos "$session_prefix/*" > session.refs
+[ "$(wc -l < session.refs)" -eq 1 ] \
+  || fail "session does not have exactly one canonical ref"
+session_key=$(printf '%s' "$conv" | od -An -v -tx1 | tr -d '[:space:]')
 git ls-remote --refs caos \
-  "refs/caos/v3/users/*/conversations/active/$conversation_key" > membership.refs
+  "refs/caos/v4/users/*/sessions/active/$session_key" > membership.refs
 [ "$(wc -l < membership.refs)" -eq 1 ] \
-  || fail "conversation does not have exactly one active creator membership"
+  || fail "session does not have exactly one active creator membership"
 [ "$($TOOL read --repo "$PWD" --head "$tip" --path .caos/title)" = "fresh start" ] \
-  || fail "conversation title is wrong"
+  || fail "session title is wrong"
 
 $TOOL parents --repo "$PWD" --head "$tip" --validate > talk.parents \
-  || fail "invalid conversation spine"
+  || fail "invalid session spine"
 last_kind=""
 while read -r _spine_commit spine_kind; do
   last_kind=$spine_kind
 done < talk.parents
-[ "$last_kind" = conversation.root ] || fail "conversation spine did not end at its root"
+[ "$last_kind" = session.root ] || fail "session spine did not end at its root"
 [ "$(git rev-list --first-parent "$tip" | tail -1)" = a2519b3360c5b1ded9a8cb7e5869d32901eae743 ] \
-  || fail "conversation spine did not end at G3"
+  || fail "session spine did not end at G3"
 
-# THE BASE IS THE CONVERSATION'S OWN CONTENT, at the root -- not a source tree
+# THE BASE IS THE SESSION'S OWN CONTENT, at the root -- not a source tree
 # at `code/dirty`, which is what this asserted before. A session starts from a
 # caos CLIENT repo (SPEC, "Agent/harness integration"): a pin and an `AGENTS.md`.
-# That is conversation content, so it lands where
+# That is session content, so it lands where
 # the agent's file tools land, and `--base` seeds it directly.
 #
 # Read the same way `.caos/title` is read above, which is the point: there is
 # no source tree to resolve and fetch, because there is no source tree until
 # something is imported.
 [ "$($TOOL read --repo "$PWD" --head "$tip" --path notes/todo.txt)" = "hello notes" ] \
-  || fail "completed conversation lost its base content"
+  || fail "completed session lost its base content"
 if $TOOL source-tree --repo "$PWD" --head "$tip" --name code/dirty >/dev/null 2>&1; then
-  fail "conversation still carries a code/dirty source tree; --base seeds the root now"
+  fail "session still carries a code/dirty source tree; --base seeds the root now"
 fi
 
-# Nothing in the conversation records the request that answered it; the
+# Nothing in the session records the request that answered it; the
 # client that started it says which.
 request=$(grep -o '^\[request [0-9a-f]\{40\}\]$' talk.err | head -1) || true
 request=${request#"[request "}
@@ -258,12 +258,12 @@ curl -fsS "$CAOS_SERVER_URL/object/$request" \
   || fail "reading the request's ArgTree from the server"
 request_args=$(git ls-tree --name-only "$request")
 grep -qx 'secret-hash' <<<"$request_args" \
-  || fail "conversation request is not isolated by its model secret"
+  || fail "session request is not isolated by its model secret"
 if grep -qx 'api-key' <<<"$request_args"; then
-  fail "conversation request still contains a curried API key"
+  fail "session request still contains a curried API key"
 fi
 
-echo "== a fresh client fetches and replays the conversation closure ==" >&2
+echo "== a fresh client fetches and replays the session closure ==" >&2
 server_url=$(git remote get-url caos)
 mkdir fresh-reader
 git -C fresh-reader init -q
@@ -273,8 +273,8 @@ git -C fresh-reader remote add caos "$server_url"
   "$CAOS_CLI" talk -c "$conv" --log > ../fresh-reader.log
 )
 grep -qF "tester: fresh start" fresh-reader.log \
-  || fail "fresh client did not replay the selected conversation"
+  || fail "fresh client did not replay the selected session"
 grep -qF "assistant: $TALK_TEXT" fresh-reader.log \
-  || fail "fresh client could not fetch the selected conversation closure"
+  || fail "fresh client could not fetch the selected session closure"
 
 echo "chat-offline: ALL PASS" >&2

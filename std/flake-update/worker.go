@@ -46,7 +46,7 @@ func main() {
 		// where a uid-0 lookup can fail, so point it at the /tmp it owns.
 		w.Must(os.Setenv("HOME", "/tmp"))
 
-		// `in` may be a tree or a commit (a source tree in the conversation):
+		// `in` may be a tree or a commit (a source tree in the session):
 		// resolve to the tree either way, fetch one level, then the two files.
 		const root = "/cas/flake-root"
 		w.Caos("resolve", w.Hash(args+"/in"), ".", root)

@@ -28,7 +28,7 @@ pub struct GitRef {
     pub dir: Option<String>,
     /// `raw=1`: name the pinned tree itself, UNEVALUATED. Without it a root that
     /// carries a `.caos-expr` evaluates to whatever that says; with it the caller
-    /// gets the commit's own tree, which is what a conversation's content wants.
+    /// gets the commit's own tree, which is what a session's content wants.
     pub raw: bool,
 }
 

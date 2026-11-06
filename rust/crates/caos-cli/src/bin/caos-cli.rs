@@ -11,7 +11,7 @@
 //! (compute, with the result checked out to any host path, or a file result
 //! streamed to stdout when no path is given), `curry` (bind args to an image,
 //! printing the curried ref), `import-image` (get a docker image into caos,
-//! printing its hash), and `talk`/`tui`/`chat` (agent conversations — see
+//! printing its hash), and `talk`/`tui`/`chat` (agent sessions — see
 //! design/agent-harness.md; `talk` is the everyday surface, `chat` the
 //! explicit one-turn form). The object-level commands (`get`/`put`/…) live
 //! only in the worker `caos`, which runs inside a sandbox with a real `/cas`.
@@ -73,19 +73,19 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             _ => Err(usage(args)),
         },
-        // `talk [<prompt>] [flags]` — agent conversation, everyday surface:
-        // continues the repo's most recent conversation (`-c` picks one,
+        // `talk [<prompt>] [flags]` — agent session, everyday surface:
+        // continues the repo's most recent session (`-c` picks one,
         // `--new` starts another); with no prompt on a terminal it loops, one
-        // turn per line. Flag parsing and usage live in the conversation client.
+        // turn per line. Flag parsing and usage live in the session client.
         Some("talk") => caos_cli::cli_talk(&transport()?, &args[2..]),
         // `mcp hook` / `mcp serve` — record a Claude Code session as an ordinary
-        // conversation. Its transport is not this one: the process is started
+        // session. Its transport is not this one: the process is started
         // by Claude Code, not by a person standing in the repository.
         Some("mcp") => caos_cli::cli_mcp(&args[2..]),
         Some("tui") => tui::run(&args[2..]).map_err(|error| format!("tui: {error}")),
         // `chat <name> [-m <message>] [flags]` — one explicit turn of a named
-        // conversation on its shared canonical head. Flag parsing (and the
-        // chat-specific usage) lives in the conversation client.
+        // session on its shared canonical head. Flag parsing (and the
+        // chat-specific usage) lives in the session client.
         Some("chat") => caos_cli::cli_chat(&transport()?, &args[2..]),
         // `run-tool <script | name> [--name=value ...]` — run a caos-tool (a
         // directory with a `.caos-expr`, `caos-tools/<name>` for a bare name) as a caos
@@ -168,10 +168,10 @@ fn usage(args: &[String]) -> String {
          (an image is --base:@=<dir>, --base:docker=<ref> or --base:hash=<oid>)\n  \
          {prog} prepare-request --base:<type>=<image-or-arg tree> [--name=value | --name:@=path ...]\n  \
          {prog} import-image [--base docker://<ref>] <docker-archive>\n  \
-         {prog} talk [<prompt>] [-c <name>] [--new] [--log] [--username <name>] [conversation options]\n  \
-         {prog} tui [-c <name>] [--new] [--username <name>] [conversation options]\n  \
-         {prog} chat <name> [-m <message>] [--base <revspec>] [--log] [--username <name>] [conversation options]\n    \
-         (a conversation names its two workers: --llm-step:@=<path> --llm-call:@=<path>,\n     \
+         {prog} talk [<prompt>] [-c <name>] [--new] [--log] [--username <name>] [session options]\n  \
+         {prog} tui [-c <name>] [--new] [--username <name>] [session options]\n  \
+         {prog} chat <name> [-m <message>] [--base <revspec>] [--log] [--username <name>] [session options]\n    \
+         (a session names its two workers: --llm-step:@=<path> --llm-call:@=<path>,\n     \
          typed like any image arg — caos-std/<name> in a repo that mounted caos)\n  \
          {prog} mcp <hook | serve | diag> --server=<url> --llm-step:@@=<locator> [--base:@@=<locator>]\n    \
          (Claude Code: the hook that records a session, and the MCP tool server it spawns)\n  \

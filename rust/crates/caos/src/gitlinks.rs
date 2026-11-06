@@ -48,7 +48,7 @@ pub(super) fn commit(cas: Option<&Path>, path: &Path, mut tree: Hashed) -> Resul
 }
 
 // Only edited commit projections use this rule. Plain trees (including the
-// conversation protocol), untouched commits, and lazy CAS references are exact.
+// session protocol), untouched commits, and lazy CAS references are exact.
 fn clean_merge_metadata(tree: &mut Hashed, source_root: bool) -> Result<(), String> {
     use gix::objs::tree::{Entry, EntryKind};
     let Body::Dir(bytes, children) = &mut tree.body else {

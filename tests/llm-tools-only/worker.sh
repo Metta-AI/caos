@@ -13,11 +13,11 @@ declare_call() {
   local call=$1 tool=$2 input=$3 output key value
   output=$($TOOL declare --repo /tmp/repo --head "$head" \
     --actor tester --id "$call" --tool "$tool" --input "$input" \
-    --ref "$conversation_ref") || fail "declaring $call"
+    --ref "$session_ref") || fail "declaring $call"
   while read -r key value; do
     if [ "$key" = head ]; then head=$value; fi
   done <<<"$output"
-  assert_oid "$head" "the declared conversation head"
+  assert_oid "$head" "the declared session head"
 }
 
 # Run the step for one declared call. A FRESH ARG TREE each time, naming the
@@ -34,10 +34,10 @@ run_tools_only() {
     || fail "preparing the tools-only run for $call"
   caos sub-run "$arg_tree" >/dev/null || fail "dispatching the tools-only step for $call"
   for ((attempt = 0; attempt < 600; attempt++)); do
-    head=$($TOOL fetch --repo /tmp/repo --ref "$conversation_ref") \
-      || fail "fetching the conversation after $call"
+    head=$($TOOL fetch --repo /tmp/repo --ref "$session_ref") \
+      || fail "fetching the session after $call"
     head=${head#head }
-    assert_oid "$head" "the conversation head after $call"
+    assert_oid "$head" "the session head after $call"
     status=$($TOOL tools --repo /tmp/repo --head "$head" \
       | jq -r --arg id "$call" 'select(.id == $id) | .status') || status=""
     case "$status" in
@@ -69,7 +69,7 @@ rm -rf /tmp/stub
 mkdir -p /tmp/stub
 start_stub /tmp/stub
 
-new_llm_conversation tools-only "$STUB_PORT" "$ws" \
+new_llm_session tools-only "$STUB_PORT" "$ws" \
   "You are a coding agent operating on a git workspace."
 admit_turn "read the greeting, then write a file"
 

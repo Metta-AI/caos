@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-conversation-protocol = { path = "DEEP-DEPS/conversation-protocol", features = ["git-cli"] }
+session-protocol = { path = "DEEP-DEPS/session-protocol", features = ["git-cli"] }
 serde_json = "1"
 
 [[bin]]

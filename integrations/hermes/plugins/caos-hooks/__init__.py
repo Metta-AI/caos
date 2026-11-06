@@ -6,25 +6,30 @@ Three events, three jobs, matching serve.rs/mod.rs exactly:
    caos_tool_use_id, caos_prompt_id as optional string properties on every
    tool's schema ("Supplied automatically by the caos PreToolUse hook; do
    not set it.") and *requires* caos_session to attribute a call to a
-   conversation (serve.rs:968, "the PreToolUse hook that supplies it is
+   session (serve.rs:968, "the PreToolUse hook that supplies it is
    not installed"). This hook merges them into the call's args directly in
    Python -- no subprocess, no git/server contact, exactly what
    on_pre_tool_use() in mod.rs does for Claude Code, just without needing to
    shell out to `caos mcp hook` for this one event.
 
 2. pre_llm_call -- the UserPromptSubmit job. Only the Rust binary can create
-   or extend a caos conversation (git transitions live in the client, not
+   or extend a caos session (git transitions live in the client, not
    here), so this shells out to `caos mcp hook` with a payload shaped like
    Claude Code's own UserPromptSubmit hook event. Fires once per turn,
    before the tool loop -- the same ordering guarantee
-   rust/crates/caos-cli/src/mcp/mod.rs's wait_for_conversation() tolerates a
+   rust/crates/caos-cli/src/mcp/mod.rs's wait_for_session() tolerates a
    near-miss on (serve.rs: "the first tool call can beat it"). On the turn
-   that creates the conversation it also injects the conversation's
+   that creates the session it also injects the session's
    AGENTS.md (`--agents-md`), which Hermes would otherwise read from the
    gateway's launch directory.
 
 3. post_llm_call -- the Stop job. Same subprocess shape, firing once per
    turn after a *successful* turn.
+
+4. transform_llm_output -- what Claude Code shows from UserPromptSubmit's
+   `systemMessage`: the session's ref, on the turn that created or
+   forked it. Hermes has no user-only channel, so it becomes the last line of
+   that turn's reply, which the model also sees in later turns.
 
 Deliberately NOT wired for v1: StopFailure. post_llm_call does not fire on
 an interrupted/errored turn, and Hermes has no exact equivalent hook in the
@@ -32,7 +37,7 @@ current catalog. This is a known gap, not a silent one -- but it is also
 not a correctness gap: std/llm-step/src/settle.rs's `settle()`
 already exists specifically to close a request a dead session left open
 (cancelled calls, interrupted request) the next time anything forks/resumes
-that conversation. A Hermes crash mid-turn behaves exactly like a killed
+that session. A Hermes crash mid-turn behaves exactly like a killed
 Claude Code process did before StopFailure existed -- a slightly messier
 log, not a stuck or corrupted one.
 
@@ -76,7 +81,7 @@ def _read_profile_env() -> dict[str, str]:
     CAOS_MCP_DEFAULT_SERVER, CAOS_REPO, CAOS_HERMES_DIST_DIR. Before this,
     `_caos_bin()` always returned None here (the `_REPO_ROOT/result/bin/caos`
     fallback never existing in a bundled deploy either), so `_run_hook` was a
-    silent no-op for EVERY UserPromptSubmit/Stop call -- no conversation was
+    silent no-op for EVERY UserPromptSubmit/Stop call -- no session was
     ever created, which is why the overview reported having none.
     `_DIST_ROOT` is the installed profile's own directory (see above), the
     same place `.env` lives, so read it from there instead.
@@ -191,7 +196,7 @@ def _llm_step_arg(profile_env: dict[str, str]) -> Optional[str]:
     caos-session's `.caos-expr` chain -- no local checkout needed, since
     `:@@=` is "exactly right for an image locator" like this one
     (session_base.rs's own words; it was only wrong for THAT module's
-    different purpose, resolving a conversation's raw content commit, not
+    different purpose, resolving a session's raw content commit, not
     an image). No CAOS_LLM_STEP_REV/CAOS_REPO fallback anymore -- those
     were the only options for a deploy with no refs/caos/dev to ask, and a
     bundled gateway deploy never has either set, so this always fell
@@ -211,7 +216,7 @@ def _llm_step_arg(profile_env: dict[str, str]) -> Optional[str]:
 
 
 def _base_args() -> list[str]:
-    """What a NEW conversation starts from, as `--base:@@=<locator>`:
+    """What a NEW session starts from, as `--base:@@=<locator>`:
     Metta-AI/caos-session at its current main tip. `caos mcp` reads no
     checkout, so the server fetches this commit itself; a prompt can still
     name another with a leading `/caos-session-start-from <locator>` line."""
@@ -240,7 +245,7 @@ def _run_hook(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
     server = _env("CAOS_MCP_DEFAULT_SERVER", profile_env)
     if not server or _unsubstituted(server):
         return None
-    # The hook runs the step that creates the conversation, so it presents the
+    # The hook runs the step that creates the session, so it presents the
     # same reader keys as the tool server, from the same place.
     readers = _env("CAOS_SECRET_READERS", profile_env)
     reader_args = [] if not readers or _unsubstituted(readers) else [f"--secret-readers={readers}"]
@@ -254,8 +259,8 @@ def _run_hook(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
                 step,
                 *_base_args(),
                 # Hermes reads AGENTS.md from where `hermes serve` was started,
-                # which is not the conversation; the hook hands over the
-                # conversation's own with the prompt that creates it.
+                # which is not the session; the hook hands over the
+                # session's own with the prompt that creates it.
                 "--agents-md",
                 *reader_args,
             ],
@@ -318,7 +323,13 @@ def on_pre_llm_call(
             "prompt": user_message,
         }
     )
-    # The conversation's AGENTS.md, on the prompt that created it. Hermes
+    # The session's ref, on the prompt that created or forked it. Claude
+    # Code shows this `systemMessage` to the user; Hermes has no such channel,
+    # so it is appended to the reply (on_transform_llm_output).
+    ref = (answer or {}).get("systemMessage")
+    if ref:
+        _pending_refs[session_id] = ref
+    # The session's AGENTS.md, on the prompt that created it. Hermes
     # appends it to this turn's user message and replays it on later turns.
     context = ((answer or {}).get("hookSpecificOutput") or {}).get("additionalContext")
     if context:
@@ -326,11 +337,36 @@ def on_pre_llm_call(
     return None
 
 
+# A ref waiting for the session's next reply, and what was appended to it. The
+# ref waits for a reply with text: transform_llm_output does not fire on an
+# empty one.
+_pending_refs: dict[str, str] = {}
+_appended: dict[str, str] = {}
+
+
+def on_transform_llm_output(
+    response_text: str = "",
+    session_id: str = "",
+    **_kwargs: Any,
+) -> Optional[str]:
+    ref = _pending_refs.pop(session_id, None)
+    if not ref:
+        return None
+    suffix = f"\n\n{ref}"
+    _appended[session_id] = suffix
+    return response_text + suffix
+
+
 def on_post_llm_call(
     session_id: str = "",
     assistant_response: str = "",
     **_kwargs: Any,
 ) -> None:
+    # Hermes hands over the transformed reply; the ref is not the model's words,
+    # so the session records the reply without it.
+    suffix = _appended.pop(session_id, "")
+    if suffix and assistant_response.endswith(suffix):
+        assistant_response = assistant_response[: -len(suffix)]
     _run_hook(
         {
             "hook_event_name": "Stop",
@@ -344,4 +380,5 @@ def on_post_llm_call(
 def register(ctx) -> None:
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
     ctx.register_hook("pre_llm_call", on_pre_llm_call)
+    ctx.register_hook("transform_llm_output", on_transform_llm_output)
     ctx.register_hook("post_llm_call", on_post_llm_call)
