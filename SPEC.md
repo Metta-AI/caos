@@ -199,10 +199,10 @@ semantics. Thus a root expression may generate a `tools/check` directory absent
 from the stored tree: both tools can reach and evaluate it.
 
 Resolution uses the current session snapshot on every call. The
-definition's evaluated tree is separate from the input: what invocation binds as
-`in` is the original selected source tree — or the original session tree
-when no source-tree prefix was selected — and it binds it ONLY for a tool that
-declared `@in`.
+definition's evaluated tree is separate from the input: where a tool sits
+decides which definition runs, never what it runs over. A tool that declared
+`@root` is given the object at its `root` path and nothing else of the session;
+one that did not is given only its arguments.
 
 Resolution is the SERVER's. `caos mcp` records the call and hands it to the
 step, which asks for the tool's path exactly as `eval_path` does — an
