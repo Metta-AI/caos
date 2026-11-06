@@ -466,25 +466,22 @@ fn block_tag(line: &str) -> Option<&str> {
 
 /// Parse a tool's `help` string as a JAVADOC comment (SPEC, "CaosTools"): the
 /// free text before the first block tag is the description, `@param <name>` /
-/// `@param [<name>]` tags declare the parameters, and the bare tags `@git` and
-/// `@writer` set flags.
+/// `@param [<name>]` tags declare the parameters, the bare tags `@writer`,
+/// `@root` and `@request-id` set flags, and `@op <name>` names an operation of
+/// the step.
 ///
 /// **An unrecognized tag is reported, never absorbed.** A misspelled `@writer`
 /// would otherwise leave a writer silently read-only — and then its proposal is
 /// discarded as a value, so the edit simply does not happen, with no error
 /// anywhere. Same reasoning as the `@param` message below: a tag this parser
 /// cannot act on is a defect in the tool, and the only place it can be noticed
-/// is here.
+/// is here. A tag that was removed is reported with what replaced it.
 fn parse_help(ctx: &str, text: &str) -> Help {
     let mut doc: Vec<&str> = Vec::new();
     let mut args = Vec::new();
-    let mut git = false;
     let mut writer = false;
-    let mut wants_in = false;
-    let mut call = false;
     let mut request_id = false;
     let mut root = false;
-    let mut scope: Option<String> = None;
     let mut op: Option<String> = None;
     let mut in_tags = false;
     for line in text.lines() {
@@ -501,35 +498,15 @@ fn parse_help(ctx: &str, text: &str) -> Help {
                 Some(a) => args.push(a),
                 None => eprintln!("{ctx}: unusable @param tag: {line}"),
             }
-        } else if trimmed == "@git" {
-            in_tags = true;
-            git = true;
         } else if trimmed == "@writer" {
             in_tags = true;
             writer = true;
-        } else if trimmed == "@in" {
-            in_tags = true;
-            wants_in = true;
-        } else if trimmed == "@call" {
-            in_tags = true;
-            call = true;
         } else if trimmed == "@request-id" {
             in_tags = true;
             request_id = true;
         } else if trimmed == "@root" {
             in_tags = true;
             root = true;
-        } else if let Some(rest) = trimmed
-            .strip_prefix("@scope")
-            .filter(|rest| rest.starts_with(char::is_whitespace))
-        {
-            in_tags = true;
-            let name = rest.trim();
-            if name.is_empty() || name.contains(char::is_whitespace) {
-                eprintln!("{ctx}: @scope names one parameter, got {rest:?} — ignored");
-            } else {
-                scope = Some(name.to_string());
-            }
         } else if let Some(rest) = trimmed
             .strip_prefix("@op")
             .filter(|rest| rest.starts_with(char::is_whitespace))
@@ -543,54 +520,39 @@ fn parse_help(ctx: &str, text: &str) -> Help {
             }
         } else if let Some(tag) = block_tag(trimmed) {
             in_tags = true;
-            eprintln!(
-                "{ctx}: unknown block tag @{tag} — ignored \
-                 (known: @param, @root, @writer, @request-id, @git, @in, @call, @scope, @op)"
-            );
+            match REMOVED_TAGS.iter().find(|(removed, _)| *removed == tag) {
+                Some((_, instead)) => eprintln!(
+                    "{ctx}: @{tag} was removed — ignored; {instead} \
+                     (design/tool-contract.md, \"Tags\")"
+                ),
+                None => eprintln!(
+                    "{ctx}: unknown block tag @{tag} — ignored \
+                     (known: @param, @root, @writer, @request-id, @op)"
+                ),
+            }
         } else if !in_tags {
             // Description text — everything before the first block tag.
             doc.push(trimmed);
         }
     }
-    // A scope that names no declared parameter would select nothing, silently:
-    // report it where the author can see it, and do not obey it.
-    if let Some(name) = &scope {
-        if !args.iter().any(|declared| &declared.name == name) {
-            eprintln!("{ctx}: @scope names {name:?}, which no @param declares — ignored");
-            scope = None;
-        }
-    }
-    // `@root` replaces the three ways a tool used to learn its tree. Declaring
-    // one of them as well would ask for two inputs at once: reported, and the
-    // old one not obeyed.
-    if root {
-        for (declared, tag) in [
-            (wants_in, "@in"),
-            (git, "@git"),
-            (scope.is_some(), "@scope"),
-        ] {
-            if declared {
-                eprintln!("{ctx}: {tag} cannot be declared with @root — ignored");
-            }
-        }
-        wants_in = false;
-        git = false;
-        scope = None;
-    }
     Help {
         doc: doc.join(" ").trim().to_string(),
         args,
-        // A scoped tool is handed its tree's commit, which is what `@git` is.
-        git: git || scope.is_some(),
         writer,
-        wants_in,
-        call,
         request_id,
         root,
-        scope,
         op,
     }
 }
+
+/// The tags design/tool-contract.md removed, each with what a tool declares
+/// instead.
+const REMOVED_TAGS: &[(&str, &str)] = &[
+    ("in", "declare @root and take the path to work on as `root`"),
+    ("git", "declare @root: a gitlink `root` gives the commit"),
+    ("scope", "declare @root: the source tree is the `root` path"),
+    ("call", "declare @request-id"),
+];
 
 /// The `help` string a tool's `.caos-expr` binds, read from the EXPRESSION'S
 /// OWN TEXT: a `HELP=<<END … END` here-string whose variable the value line
