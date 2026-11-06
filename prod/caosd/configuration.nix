@@ -68,7 +68,7 @@ in
       description = ''
         The bulk volume for docker images, the registry, redis and the server repo.
         By label, because EBS device enumeration order is not stable. Label it once:
-          mkfs.ext4 -L caos-data /dev/nvme1n1
+          mkfs.btrfs -L caos-data /dev/nvme1n1
       '';
     };
     advertiseAddress = lib.mkOption {
@@ -189,6 +189,12 @@ in
       package = pkgs.docker_29;
       daemon.settings = {
         data-root = "/data/docker";
+        # Pinned, not detected: on a btrfs data root dockerd would pick its
+        # btrfs snapshotter, and every image already under /data/docker (the
+        # containerd store, overlayfs snapshots) would vanish from view.
+        # With the containerd image store, storage-driver names the snapshotter.
+        features.containerd-snapshotter = true;
+        storage-driver = "overlayfs";
         # Docker's built-in pool is 172.17.0.0/12 in /16s, spanning
         # 172.16-172.31 -- so its 16th network is 172.31.0.0/16, exactly the
         # CIDR of every EC2 *default* VPC. caos's runner pool can allocate that
@@ -203,16 +209,36 @@ in
       };
     };
 
+    # btrfs with zstd, for the server repo above all: it holds every object
+    # loose and uncompressed (design/loose-object-store.md), and the
+    # filesystem does the compressing. Plain `compress`, not `compress-force`:
+    # registry blobs and image layers are already gzipped, and a level-0 object
+    # always compresses.
     fileSystems."/data" = {
       device = cfg.dataDevice;
-      fsType = "ext4";
-      autoResize = true;
+      fsType = "btrfs";
       # nofail: a missing data disk should degrade to a bootable machine with a
       # shell, not a brick nobody can log in to fix.
       options = [
+        "noatime"
+        "compress=zstd:3"
         "nofail"
         "x-systemd.device-timeout=60"
       ];
+    };
+
+    # What autoResize did for ext4, which is all it knows: a volume grown in
+    # EBS is grown here at the next boot.
+    systemd.services.data-resize = {
+      description = "grow the /data filesystem to fill its volume";
+      wantedBy = [ "data.mount" ];
+      after = [ "data.mount" ];
+      requires = [ "data.mount" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${pkgs.btrfs-progs}/bin/btrfs filesystem resize max /data";
+      };
     };
 
     # data-root lives under /data, so dockerd must not start first and build its
@@ -225,6 +251,15 @@ in
     systemd.tmpfiles.rules = [
       "d /data      0755 root root -"
       "d /data/caos 0755 caos caos -"
+      # Redis rewrites and syncs its append-only file constantly, which
+      # fragments badly under copy-on-write. +C (which also drops compression
+      # and checksums there, fine for a cache) applies only to files created
+      # after it is set, so it goes on while the directory is empty. The
+      # ownership is what the stack container creates them with; the top of
+      # the stack tree belongs to caos (see prod/README.md).
+      "d /data/caos/stack       0755 caos caos -"
+      "d /data/caos/stack/redis 0755 root root -"
+      "h /data/caos/stack/redis -    -    -    - +C"
     ];
 
     users.groups.caos = { };
@@ -333,6 +368,9 @@ in
     # person holding the shell.
     environment.variables.CAOS_DATA = dataDir;
 
-    environment.systemPackages = [ cfg.package ];
+    environment.systemPackages = [
+      cfg.package
+      pkgs.btrfs-progs
+    ];
   };
 }

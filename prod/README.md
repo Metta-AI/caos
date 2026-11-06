@@ -52,14 +52,16 @@ advertises a private address and makes every client fall back to an iroh relay
 * **A NixOS EC2 instance.** Any recent NixOS AMI.
 * **A data volume labeled `caos-data`.** It carries docker's `data-root`, the
   registry, redis and the server's git repo; without it they land on the small
-  root disk. Label it once — this **erases** that disk:
+  root disk. It must be btrfs (the server's loose objects rely on its
+  compression; see `design/loose-object-store.md`). Label it once — this
+  **erases** that disk:
 
   ```sh
-  sudo mkfs.ext4 -L caos-data /dev/nvme1n1
+  sudo mkfs.btrfs -L caos-data /dev/nvme1n1
   ```
 
-  To adopt a volume that already holds a filesystem, relabel instead:
-  `sudo e2label /dev/nvme1n1 caos-data`.
+  To adopt a btrfs volume that already holds data, relabel instead:
+  `sudo btrfs filesystem label /dev/nvme1n1 caos-data`.
 * **A public IPv4, ideally an Elastic IP.** It goes into the iroh ticket, so it
   should not change under clients. The driver refuses if there is none.
 * **Inbound UDP 11204**, the iroh transport's fixed port. Nothing else needs to

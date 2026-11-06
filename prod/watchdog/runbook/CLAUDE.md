@@ -113,9 +113,11 @@ action to fix and how to verify it afterwards.
    `thread 'ticket-...' has overflowed its stack`: a deep promise chain
    (~13 KB per hop). Known; caos#370 mitigates. Restart `caosd` and report
    the request that triggered it if the log names one.
-5. **Slow tests.** Pack count in `/data/caos/stack/git`: hundreds of packs
-   make every fetch slow. `git -C /data/caos/stack/git count-objects -v`.
-   Repacking is a human's call (it touches stack state); report the count.
+5. **A pack in the store.** The server keeps every object loose and never
+   writes a pack (`design/loose-object-store.md`), so ANY file in
+   `/data/caos/stack/git/objects/pack` is a bug: some path still writes
+   packs. `ls -la /data/caos/stack/git/objects/pack`. Report the files and
+   their times; never repack or delete them (that touches stack state).
 6. **ls-remote failing with the host otherwise fine.** Check `iroh-relay` is
    active and that the ticket on disk matches
    `caos-watchdog ticket --refresh`; a stack wipe re-keys the server and
