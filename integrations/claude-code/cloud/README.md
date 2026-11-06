@@ -53,7 +53,7 @@ The repository a session opens is a **caos client repo** — a handful of text
 files that pin a caos and mount its `std/`. `Metta-AI/caos-session` is the one
 to fork; its shape is spelled out under *Configuring the environment* below,
 so this does not depend on being able to open it. The code to work on is
-**imported into the session** by the agent's `import_source` tool — the
+**imported into the session** by the agent's `caos-std/import-source` tool — the
 server fetches it from GitHub directly, so nothing is cloned into the container
 and nothing is pushed out of it.
 
