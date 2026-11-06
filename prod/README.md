@@ -50,7 +50,7 @@ advertises a private address and makes every client fall back to an iroh relay
 ## What the machine needs first
 
 * **A NixOS EC2 instance.** Any recent NixOS AMI.
-* **A data volume labelled `caos-data`.** It carries docker's `data-root`, the
+* **A data volume labeled `caos-data`.** It carries docker's `data-root`, the
   registry, redis and the server's git repo; without it they land on the small
   root disk. Label it once — this **erases** that disk:
 

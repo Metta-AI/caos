@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// the work — not the watching — is what the server is busy with.
 const POLL: Duration = Duration::from_millis(400);
 
-/// Most nodes drawn before the rest are summarised. A wide map (the suite's
+/// Most nodes drawn before the rest are summarized. A wide map (the suite's
 /// 46-way fan-out) would otherwise scroll the display off the screen, which
 /// makes it worse than no display.
 ///

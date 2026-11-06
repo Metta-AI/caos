@@ -41,7 +41,7 @@ codegen-units = 1
 # recompiles the ~176 dependencies — they are baked into the builder image once
 # — so this buys speed where it costs nothing.
 #
-# It is not a micro-optimisation here. Every hash caos takes goes through
+# It is not a micro-optimization here. Every hash caos takes goes through
 # `sha1-checked` (git's collision-detecting SHA-1, a hard dependency of
 # gix-hash), and unoptimized it ran at 43 MB/s: `caos put` of the 218 MB stack
 # image spent 5.0 of its 5.3s hashing pass in SHA-1 alone, against 0.27s for
