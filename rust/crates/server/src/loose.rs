@@ -623,9 +623,8 @@ mod tests {
         tree.extend_from_slice(b"100644 file\0");
         tree.extend_from_slice(blob.as_bytes());
         let tree = staging.add(Kind::Tree, &tree).unwrap();
-        let commit = format!(
-            "tree {tree}\nauthor a <a@a> 0 +0000\ncommitter a <a@a> 0 +0000\n\nm\n"
-        );
+        let commit =
+            format!("tree {tree}\nauthor a <a@a> 0 +0000\ncommitter a <a@a> 0 +0000\n\nm\n");
         let commit = staging.add(Kind::Commit, commit.as_bytes()).unwrap();
         assert_eq!(staging.len(), 3);
         assert_eq!(staging.publish(&objects).unwrap(), 3);
