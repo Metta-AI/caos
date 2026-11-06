@@ -969,8 +969,9 @@ revision (and made the history tools' hashes readable the same way).
 ## Publication
 
 The agent publishes (design/agent-github.md, "PRs"); the client has no publish
-command. `publish_source` pushes one named gitlink's exact commit to an explicit
-repository and branch, sent by the server from its own store, and
+command. `caos-std/stack-publish` pushes every layer of a stack and opens or
+updates its PRs; `caos-std/publish-source` pushes one gitlink's exact commit to
+an explicit repository and branch, sent by the server from its own store, and
 `caos-std/github` opens or updates the PR. A stack is squashed to one commit
 per layer and published bottom to top, each layer's PR based on the branch
 below ([Stacks](design/stacks.md)). No snapshot has a special working or
