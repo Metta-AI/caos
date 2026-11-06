@@ -3931,6 +3931,7 @@ mod continuation_shape_tests {
             false,
             false,
             true,
+            false,
             has_then,
             catch,
         )
