@@ -230,47 +230,6 @@ fn validate_tree_dependencies(
     Ok(())
 }
 
-/// Force a just-written loose object to disk, returning the id unchanged.
-///
-/// gix publishes a loose object by `rename()`ing a temp file into place and
-/// never fsyncs it (`gix-odb`'s loose store calls `persist` and stops there; it
-/// honours no `core.fsync`, so the repo config `main` sets covers git's writes
-/// and not these). That is the pattern that hands ext4 a zero-length file after
-/// an unclean shutdown, which is worse than a lost object — see [`crate::repair`].
-///
-/// The rename has already happened by the time we are called, so this cannot
-/// make the publish atomic; a crash in the microseconds between the two still
-/// leaves an empty file. What it does is shrink the exposure from ext4's ~30s
-/// writeback delay to that gap, and `repair` sweeps whatever still slips through.
-/// Fixing it properly means writing loose objects ourselves — temp file, fsync,
-/// rename, fsync the directory — rather than borrowing gix's writer.
-///
-/// Best-effort: a failed fsync is a durability problem, not a correctness one
-/// (the object is stored and readable right now), so it warns rather than
-/// failing a request that otherwise succeeded.
-fn sync_loose_object(config: &Config, id: gix::ObjectId) -> gix::ObjectId {
-    let hex = id.to_string();
-    let dir = std::path::Path::new(&config.git_dir)
-        .join("objects")
-        .join(&hex[..2]);
-    let path = dir.join(&hex[2..]);
-    // No loose file means the object was already packed, and a pack is the
-    // business of whoever wrote it.
-    if !path.exists() {
-        return id;
-    }
-    // Through a read-only handle: loose objects are mode 0444, so there is no
-    // writable one to be had, and fsync(2) flushes the file whatever the open
-    // mode. The directory too — otherwise the data is durable but the name that
-    // reaches it is not.
-    for target in [path.as_path(), dir.as_path()] {
-        if let Err(err) = std::fs::File::open(target).and_then(|file| file.sync_all()) {
-            eprintln!("warning: cannot fsync {}: {err}", target.display());
-        }
-    }
-    id
-}
-
 /// Split a posted serialized object into its type and content, validating the
 /// header (`<type> <size>\0`).
 fn parse_posted_object(body: &[u8]) -> Result<(gix::object::Kind, &[u8]), HttpError> {
