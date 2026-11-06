@@ -1716,7 +1716,7 @@ fn launch_resolved_tool(
     }
     let task = (|| {
         let curried = caos_curry(Arg::Hash(&tool_tree), &args)?;
-        let task_text = prepare_request(Arg::Hash(&curried), &input)?;
+        let task_text = prepare_request(Arg::Hash(&curried), &[])?;
         Oid::parse(&task_text, "tree tool task")
     })();
     let task = match task {
