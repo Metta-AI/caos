@@ -2,10 +2,10 @@
 // llm-step's real tool loop with a scripted model, in one turn: build a stack
 // with the shell, write a plan, run create-squashed-stack into publish/mystack,
 // reword one message in the plan and run it again (a republish over what the
-// first run wrote), then call publish_source.
+// first run wrote), then run publish-source.
 //
 // It checks that create-squashed-stack leaves publish/mystack/01-feature as a
-// source tree that publish_source accepts. The repository is a `.invalid`
+// source tree that publish-source accepts. The repository is a `.invalid`
 // host, so no push happens: the call must get past the source-tree check and
 // fail reading the remote. The same call on publish/mystack, a plain folder,
 // must be refused at that check.
