@@ -1296,8 +1296,8 @@ mod tests {
         assert!(installed.contains(crate::loose::HOOK_ARG));
         // Idempotent, and a stale managed copy is rewritten.
         install_publish_hook(git_dir).unwrap();
-        std::fs::write(&hook, format!("#!/bin/sh\n{}\nexit 0\n", crate::loose::HOOK_MARKER))
-            .unwrap();
+        let stale = format!("#!/bin/sh\n{}\nexit 0\n", crate::loose::HOOK_MARKER);
+        std::fs::write(&hook, stale).unwrap();
         install_publish_hook(git_dir).unwrap();
         assert_eq!(std::fs::read_to_string(&hook).unwrap(), installed);
 
