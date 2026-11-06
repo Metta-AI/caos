@@ -3014,7 +3014,7 @@ fn read_reply_line(reader: &mut impl BufRead) -> Result<String, String> {
 }
 
 /// Find `name` in an `a=b&c=d` query string and percent-decode its value.
-fn query_param(query: &str, name: &str) -> Option<String> {
+pub(crate) fn query_param(query: &str, name: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
         (k == name).then(|| percent_decode(v))
