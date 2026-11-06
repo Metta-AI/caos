@@ -603,7 +603,7 @@ mod tests {
                         title: "concurrent title".to_string(),
                     },
                 )?;
-                return Err("simulated lost push acknowledgement".to_string());
+                return Err("simulated lost push acknowledgment".to_string());
             }
             Ok(())
         }

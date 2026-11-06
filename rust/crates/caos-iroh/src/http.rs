@@ -310,7 +310,7 @@ fn decode_head(head: &[u8]) -> Result<Head, String> {
         reason,
         chunked,
         // Chunked wins, as HTTP requires: a body framed twice is a body framed
-        // wrong, and honouring a length alongside it would cut it short.
+        // wrong, and honoring a length alongside it would cut it short.
         content_length: if chunked { None } else { content_length },
     })
 }

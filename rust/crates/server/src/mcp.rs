@@ -255,7 +255,7 @@ fn tool_result(config: &Arc<Config>, ticket: &str, limit: usize) -> Result<Value
             true,
         ));
     }
-    Err(format!("unrecognised ticket state {state:?}"))
+    Err(format!("unrecognized ticket state {state:?}"))
 }
 
 /// What a tools-only run answered, as the model reads it: the call's `status`
