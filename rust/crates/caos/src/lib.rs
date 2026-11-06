@@ -4006,7 +4006,7 @@ pub fn caos_ref_set(t: &dyn Transport, args: &[String]) -> Result<(), String> {
             }
         } else if arg == "--force" {
             force = true;
-        } else if arg.starts_with("--") || name.replace(arg).is_some() {
+        } else if arg.starts_with("--") || name.replace(arg.as_str()).is_some() {
             return Err(format!("`ref-set` does not take {arg:?}\n{REF_SET_USAGE}"));
         }
     }
