@@ -1798,18 +1798,20 @@ fn validate_continuation_shape(
     has_run: bool,
     has_request: bool,
     has_eval: bool,
+    has_ref: bool,
     has_then: bool,
     catch: bool,
 ) -> Result<(), HttpError> {
     let middle_count = usize::from(has_map)
         + usize::from(has_run)
         + usize::from(has_request)
-        + usize::from(has_eval);
+        + usize::from(has_eval)
+        + usize::from(has_ref);
     if middle_count > 1 {
         return Err(HttpError::new(
             500,
             format!(
-                "continuation {cont} has more than one of 'map', 'run', 'request', and 'eval' (they are mutually exclusive)"
+                "continuation {cont} has more than one of 'map', 'run', 'request', 'eval' and 'ref' (they are mutually exclusive)"
             ),
         ));
     }
@@ -1819,7 +1821,14 @@ fn validate_continuation_shape(
             format!("continuation {cont} has both 'request' and 'in'"),
         ));
     }
-    if !has_request && !has_input {
+    // `ref-then` waits on a named ref: there is no data node to carry.
+    if has_ref && has_input {
+        return Err(HttpError::new(
+            500,
+            format!("continuation {cont} has both 'ref' and 'in'"),
+        ));
+    }
+    if !has_request && !has_ref && !has_input {
         return Err(HttpError::new(
             500,
             format!("continuation {cont} missing 'in'"),
