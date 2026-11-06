@@ -206,14 +206,9 @@ fn usage(args: &[String]) -> String {
          {prog} eval-path-then <in-cas-path> --eval=<path> [--then:<type>=<image>] [--catch]\n  \
          {prog} run-request-then <arg-tree-hash|cas-path> [--then:<type>=<image>] [--catch]\n  \
          {prog} sub-run <arg-tree-hash>\n  \
-<<<<<<< 6b22c112b780b0f444971467724c246cfd65a4a9
-         {prog} ref-get <ref>\n  \
-         {prog} ref-set <ref> <hash|absent> (--expected=<hash|absent> | --force)\n  \
-         {prog} ref-then <ref> [--expected=<hash|absent>] [--timeout=<secs>]\n      [--then:<type>=<image>] [--catch]\n  \
-=======
          {prog} ref-get <ref> <cas-path>   (exit 2: no such ref)\n  \
          {prog} ref-set <ref> (--new=<hash> | --new:@=<cas-path> | --delete)\n      (--expected=<hash|absent> | --expected:@=<cas-path> | --force)\n  \
->>>>>>> d2619d0d327701e934194fdda87b595433a5519c
+         {prog} ref-then <ref> [--expected=<hash|absent> | --expected:@=<cas-path>]\n      [--timeout=<secs>] [--then:<type>=<image>] [--catch]\n  \
          {prog} trace-child <name> <arg-tree-hash>\n  \
          {prog} prepare-request --base:<type>=<image-or-arg tree> [--name=value | --name:@=path ...]\n  \
          {prog} resolve-image <hex hash | docker://<ref>>\n  \
