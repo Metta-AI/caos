@@ -158,7 +158,20 @@ returned the right commits.
   ext4 too, with more waste per small object; at dev's size that does not
   matter. btrfs is a prod setting.
 
-Server config, set unconditionally at start (`main.rs`) like the rest:
+Server settings. All of them, these and the ones the server already had, are
+passed to git in the server's own environment (`GIT_CONFIG_COUNT`, from
+`main::git_settings`) on `http-backend` and the server's other git commands
+against the store, and are NEVER written into the repository's config.
+Several servers of different builds share one repository (every test stack
+shares its host stack's), so a setting or hook written into the repo would
+apply to all of them; an earlier draft of this change did exactly that and
+broke pushes on the host. A repository the server creates itself gets the
+settings written in once, and its config left read-only (0444) as a marker.
+The mode does not stop git, which rewrites a config by lock and rename
+whatever its mode; `chattr +i` would, but servers before this change rewrite
+the config at every start and fail when they cannot, so that is a step for
+the host once every server sharing it runs this build.
+
 
 | setting | value | why |
 | --- | --- | --- |
