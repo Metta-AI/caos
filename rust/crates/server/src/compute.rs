@@ -1507,9 +1507,16 @@ fn resolve_promise(
         run.is_some(),
         request.is_some(),
         eval.is_some(),
+        ref_name.is_some(),
         then.is_some(),
         catch,
     )?;
+    if (ref_expected.is_some() || ref_timeout.is_some()) && ref_name.is_none() {
+        return Err(HttpError::new(
+            500,
+            format!("continuation {cont} has 'expected' or 'timeout' without 'ref'"),
+        ));
+    }
 
     // The middle step, if any: `map` fans out over `in`'s children and yields a
     // `children` tree; `run` builds one request from its image + `in`; `request`
