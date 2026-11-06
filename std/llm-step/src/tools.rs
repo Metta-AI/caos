@@ -42,8 +42,6 @@ pub fn is_inline(name: &str) -> bool {
             | "copy"
             | "move"
             | "remove"
-            | "import_source"
-            | "publish_source"
     )
 }
 
@@ -116,7 +114,6 @@ pub fn declarations() -> Vec<Value> {
         ("copy", COPY_HELP),
         ("move", MOVE_HELP),
         ("remove", REMOVE_HELP),
-        ("import_source", crate::import_source::HELP),
         ("tool_help", TOOL_HELP_HELP),
         (EVAL_PATH, EVAL_PATH_HELP),
     ]
@@ -1514,7 +1511,7 @@ fn resolve_failure(rooted: bool, relative: &str, stderr: &str) -> String {
     if !rooted && stderr.contains("no such path") {
         format!(
             "{relative} is not in the session tree. Check the path first: `ls` its \
-             parent, and note an import lives where `import_source` put it (e.g. \
+             parent, and note an import lives where `caos-std/import-source` put it (e.g. \
              sources/<repo>/00-base). Only if an expression produces it (a mount \
              such as caos-std/ exists only in the evaluated tree) call eval_path with \
              that path or a parent of it, then pass the hash it prints as `root` with \
@@ -1758,7 +1755,7 @@ fn copy_entry(ws: &str, from: &[String], to: &[String]) -> Result<String, Fail> 
     // THE ENTRY ITSELF, NOT WHAT `resolve` MAKES OF IT. Resolving `from` walks
     // THROUGH a source tree (a commit entry) to its code tree, and a link to
     // that would copy the files but not the commit: the copy would not be a
-    // source tree, and `log`, `diff` and `publish_source` would not know it.
+    // source tree, and `log`, `diff` and `caos-std/publish-source` would not know it.
     // The child of the parent directory is the entry as stored -- which is
     // also how `ls` tells a commit from a directory.
     resolve(None, ws, from)?; // a path that is not there is the model's mistake
@@ -2268,7 +2265,7 @@ mod tests {
     fn read_and_ls_are_inline_and_declared() {
         // Routed in-process (no sub-run). A repository tool cannot shadow them:
         // it is named by path, never by name.
-        for t in ["read", "ls", "copy", "move", "remove", "import_source"] {
+        for t in ["read", "ls", "copy", "move", "remove"] {
             assert!(is_inline(t));
             assert!(declarations().iter().any(|d| d["name"] == t));
         }
@@ -2343,7 +2340,7 @@ mod tests {
             "input": {"file-path": "a", "caos_session": "s", "source_tree": "main"}});
         assert!(unknown_argument(&plumbing, "read").is_none());
         // A tool that is not a file tool is not this check's business.
-        assert!(unknown_argument(&json!({"input": {"x": 1}}), "import_source").is_none());
+        assert!(unknown_argument(&json!({"input": {"x": 1}}), "run_tool").is_none());
     }
 
     #[test]
