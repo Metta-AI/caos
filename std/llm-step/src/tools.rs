@@ -1890,6 +1890,19 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_without_root_reads_only_its_arguments() {
+        // Nothing binds the tree for it, so it is not in the cache key of a tool
+        // whose whole input is its arguments.
+        let reader = TreeTool::new(
+            "caos-test-result",
+            parse_help("t", "Print a record.\n@param hash The hash."),
+        );
+        assert_eq!(reader.args.len(), 1);
+        let text = describe(&reader, "std/caos-test-result");
+        assert!(text.contains("Does not read the tree"), "{text}");
+    }
+
+    #[test]
     fn a_declared_type_reaches_the_schema_and_the_binding() {
         let h = parse_help(
             "t",
