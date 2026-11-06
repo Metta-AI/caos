@@ -1,4 +1,4 @@
-# Named refs for workers: `ref-get`, `ref-set`
+# Named refs for workers: `ref-get`, `ref-set`, `ref-then`
 
 Everything a worker handles is addressed by content, with one deliberate
 exception: a **named, mutable ref**. Some state has to outlive a request
