@@ -170,75 +170,39 @@ fn main() {
     let addr = std::env::var("SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
     let git_dir = env_or("CAOS_GIT_DIR", DEFAULT_GIT_DIR);
 
-    // Self-bootstrap the bare repo on first run (e.g. a fresh fly Volume), the
-    // same setup `caosd up` does by hand: `http.receivepack` lets clients
-    // `git push`, `allowAnySHA1InWant` lets them fetch a result by bare hash.
-    // `git init --bare` is idempotent, so this is a no-op once seeded.
-    let git = |args: &[&str]| {
-        run_required_git(args).unwrap_or_else(|error| {
+    // This server's git settings live in ITS OWN ENVIRONMENT, never in the
+    // repository's config (see `git_settings`). Several servers, of different
+    // builds, share one repository (every test stack shares its host stack's),
+    // so a setting written into the repo would apply to all of them. The one
+    // exception is a repository this process creates (e.g. a fresh fly
+    // Volume): nobody else uses it yet, and the protective settings written
+    // into it also protect a person who runs git there by hand.
+    if gix::open(&git_dir).is_err() {
+        initialize_repo(&git_dir).unwrap_or_else(|error| {
             eprintln!("fatal: {error}");
             std::process::exit(1);
         });
-    };
-    if gix::open(&git_dir).is_err() {
-        git(&["init", "-q", "--bare", &git_dir]);
     }
-    // UNCONDITIONALLY, not just on a repo this process created. These two are
-    // the server's own protocol requirements, so it owns them wherever the repo
-    // came from — and a repo can arrive from anywhere: a test stack seeds one by
-    // `git init --bare` plus a fetch of the deps it was handed
-    // (devbox/worker), and a plain `init` sets neither. That cost a suite
-    // where every push came back `403` from the inner server, which reads as an
-    // auth problem and is really a missing config.
-    git(&["-C", &git_dir, "config", "http.receivepack", "true"]);
-    // Validate every incoming object in Git's quarantine, including objects
-    // outside the updated refs.
-    git(&["-C", &git_dir, "config", "receive.fsckObjects", "true"]);
-    git(&["-C", &git_dir, "config", "receive.shallowUpdate", "false"]);
-    // The store is loose objects only and is never packed
-    // (design/loose-object-store.md, `mod loose`). Every transfer into this
-    // repo unpacks into loose objects, however small or large; a push lands in
-    // git's quarantine and the managed `pre-receive` hook publishes it children
-    // first. Objects are written at zlib level 0: the filesystem compresses.
-    for key in [
-        "receive.unpackLimit",
-        "transfer.unpackLimit",
-        "fetch.unpackLimit",
-    ] {
-        git(&["-C", &git_dir, "config", key, UNPACK_ALWAYS]);
+    let hooks = std::env::temp_dir().join(format!("caos-server-hooks-{}", std::process::id()));
+    let hooks = loose::install_hooks(&hooks).unwrap_or_else(|error| {
+        eprintln!("fatal: installing this server's git hooks: {error}");
+        std::process::exit(1);
+    });
+    // Still single-threaded and with no child yet, so every git this process
+    // runs against the store sees the settings from the start.
+    let _ = GIT_ENV.set(settings_env(&git_settings(Some(&hooks))));
+
+    // Clear what a previous crash left behind BEFORE opening the repo: gix
+    // answers "is this object stored?" for a loose object with a path-exists
+    // check, so an empty file has to be gone from disk before anything asks.
+    let swept = repair::sweep_empty_loose_objects(&git_dir);
+    let temporaries = loose::sweep_temporaries(&std::path::Path::new(&git_dir).join("objects"));
+    if temporaries > 0 {
+        eprintln!(
+            "repair: {git_dir} had {temporaries} temporary object file(s) from a crash; removed"
+        );
     }
-    git(&["-C", &git_dir, "config", "core.looseCompression", "0"]);
-    git(&[
-        "-C",
-        &git_dir,
-        "config",
-        "uploadpack.allowAnySHA1InWant",
-        "true",
-    ]);
-    // Request refs are transient negotiation anchors and result refs are a
-    // server-written durability index. Neither belongs in repository-wide fetch
-    // advertisements. Both remain visible to receive-pack negotiation: a client
-    // can form its next request from a result object that exists only on the
-    // server, so hiding that result makes send-pack try (and fail) to read it
-    // locally.
-    configure_ref_advertisements(&git_dir).unwrap_or_else(|error| {
-        eprintln!("fatal: {error}");
-        std::process::exit(1);
-    });
-    remove_managed_pre_receive_hook(&git_dir).unwrap_or_else(|error| {
-        eprintln!("fatal: {error}");
-        std::process::exit(1);
-    });
-    install_publish_hook(&git_dir).unwrap_or_else(|error| {
-        eprintln!("fatal: {error}");
-        std::process::exit(1);
-    });
-    // Serve partial-clone (`--filter`) fetches: the std/merge worker fetches
-    // the commit GRAPH only (`--filter=tree:0`) and lazily faults in just the
-    // three trees `git merge-tree` needs, rather than the whole history's
-    // trees and blobs. Same class of flag as the two above — a protocol
-    // capability the server owns.
-    git(&["-C", &git_dir, "config", "uploadpack.allowFilter", "true"]);
+    MOVED_SETTINGS_PLACEHOLDER
     // Never let git rewrite this repo's object store behind our back.
     // `git-receive-pack` (which http-backend spawns on every push) forks a
     // background repack; that rewrites the object store while a concurrent
