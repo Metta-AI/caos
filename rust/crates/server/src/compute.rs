@@ -1715,11 +1715,12 @@ fn resolve_promise(
     // The promise type, for the record. A continuation with only a `then` has
     // no middle step at all (a plain tail call), which is a shape in its own
     // right and not a missing one.
-    let kind = match (&map, &run, &request, &eval) {
-        (Some(_), _, _, _) => "map",
-        (_, Some(_), _, _) => "run",
-        (_, _, Some(_), _) => "request",
-        (_, _, _, Some(_)) => "eval",
+    let kind = match (&map, &run, &request, &eval, &ref_name) {
+        (Some(_), _, _, _, _) => "map",
+        (_, Some(_), _, _, _) => "run",
+        (_, _, Some(_), _, _) => "request",
+        (_, _, _, Some(_), _) => "eval",
+        (_, _, _, _, Some(_)) => "ref",
         _ => "then",
     };
 
