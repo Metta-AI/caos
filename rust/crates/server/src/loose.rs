@@ -592,7 +592,7 @@ mod tests {
 
     #[test]
     fn order_puts_references_first() {
-        let id = |n: u8| Id::from_bytes_or_panic(&[n; 20]);
+        let id = |n: u8| Id::from_hex(format!("{n:02x}").repeat(20).as_bytes()).unwrap();
         // commit 1 -> tree 2 -> tree 3 -> blob 4; tree 2 -> blob 4; commit 1 -> parent 5 (not staged)
         let mut children = HashMap::new();
         children.insert(id(1), vec![id(2), id(5)]);
