@@ -1,0 +1,8 @@
+100644 bcede99af0a289d3e38d07e5804e25723a6cde8d 1	rust/crates/caos/src/bin/caos.rs
+100644 500c207385af96e02eb0b60171a4a3cc2914c4be 2	rust/crates/caos/src/bin/caos.rs
+100644 b2af559d884f7dc792e81831f8cdbbb943fd80c3 3	rust/crates/caos/src/bin/caos.rs
+
+Auto-merging design/refs.md
+Auto-merging rust/crates/caos/src/bin/caos.rs
+CONFLICT (content): Merge conflict in rust/crates/caos/src/bin/caos.rs
+Auto-merging rust/crates/caos/src/lib.rs

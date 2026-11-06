@@ -46,6 +46,23 @@ func Read(path string) string {
 // its recorded hash, without being read.
 func Put(src, dst string) { Caos("put", src, dst) }
 
+// RefGet records the commit ref names at the CAS path and reports true, or
+// reports false if there is no such ref (`caos ref-get` exits 2 and writes
+// nothing). Any other failure ends the script.
+func RefGet(ref, path string) bool {
+	cmd := exec.Command("caos", "ref-get", ref, path)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 2 {
+		return false
+	}
+	if err != nil {
+		panic(failed{fmt.Sprintf("caos ref-get %s %s: %v: %s", ref, path, err, strings.TrimSpace(stderr.String()))})
+	}
+	return true
+}
+
 // Hash is the git object id recorded on a CAS path.
 func Hash(path string) string { return Caos("hash", path) }
 

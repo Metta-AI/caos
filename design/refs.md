@@ -10,19 +10,36 @@ same thing as one command each.
 ## The verbs
 
 ```text
-caos ref-get <ref>
-caos ref-set <ref> <hash|absent> (--expected=<hash|absent> | --force)
+caos ref-get <ref> <cas-path>
+caos ref-set <ref> (--new=<hash> | --new:@=<cas-path> | --delete)
+                   (--expected=<hash|absent> | --expected:@=<cas-path> | --force)
 ```
 
-- `ref-get` prints the ref's value: the commit it names, or `absent`. It never
-  waits.
-- `ref-set` moves the ref to a commit, or deletes it with `absent`. It is a
-  **compare-and-swap by default**: `--expected` names the value being
-  replaced, `absent` meaning create-only, and the server checks it under the
-  ref's lock. A stale expectation fails with the value the ref actually holds.
-  An unconditional write must say `--force`; leaving both out is an error, so
-  an overwrite is never an accident.
-- `absent` is the same word `caos push-git --expected=absent` uses.
+- `ref-get` records the commit the ref names at `<cas-path>`, kind-tagged
+  `commit` exactly as `put-commit` records one, and exits 0. From there it is
+  an ordinary CAS value: `caos hash` gives its id, and `--name:@=` passes it
+  on. **A missing ref exits 2 and writes nothing**; a real failure exits 1, so
+  absent and broken stay apart (AGENTS.md). Go workers use `w.RefGet`, which
+  answers false for 2. It never waits.
+- `ref-set` moves the ref to a commit, or deletes it with `--delete`. **A
+  commit is given either way**: as a hash with `=`, or as the CAS path it is
+  recorded at with `:@=`, the spellings `run` and `curry` use. So the commit
+  `put-commit` just minted and the head `ref-get` just read pass straight
+  through, and a script never has to handle a hash:
+
+  ```sh
+  caos ref-get R /cas/old                      # exit 2: no such ref
+  caos put-commit /tmp/commit /cas/new         # its parent is $(caos hash /cas/old)
+  caos ref-set R --new:@=/cas/new --expected:@=/cas/old
+  ```
+
+- `ref-set` is a **compare-and-swap by default**: `--expected` names the value
+  being replaced, `absent` meaning create-only, and the server checks it under
+  the ref's lock. A stale expectation fails with the value the ref actually
+  holds. An unconditional write must say `--force`; leaving both out is an
+  error, so an overwrite is never an accident.
+- `absent` appears only in `--expected`, the same word `caos push-git
+  --expected=absent` uses. Deleting is its own flag rather than a magic value.
 
 ## Rules
 

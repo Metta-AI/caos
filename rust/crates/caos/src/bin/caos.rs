@@ -37,6 +37,18 @@ fn main() -> ExitCode {
             }
         };
     }
+    // Neither is `ref-get`'s "the ref does not exist": nothing was written,
+    // and nothing broke.
+    if args.get(1).map(String::as_str) == Some("ref-get") {
+        return match http().and_then(|t| caos::caos_ref_get(&t, &args[2..])) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::from(caos::REF_ABSENT_EXIT),
+            Err(err) => {
+                eprintln!("{}: {err}", prog_name(&args));
+                ExitCode::FAILURE
+            }
+        };
+    }
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -130,10 +142,10 @@ fn run(args: &[String]) -> Result<(), String> {
             (Some(name), Some(arg_tree), None) => caos::caos_trace_child(&http()?, name, arg_tree),
             _ => Err(usage(args)),
         },
-        // `ref-get <ref>` / `ref-set <ref> <hash|absent> (--expected=<v> |
-        // --force)` — read or compare-and-swap a named mutable ref under
-        // refs/heads/ (design/refs.md).
-        Some("ref-get") => caos::caos_ref_get(&http()?, &args[2..]),
+        // `ref-set <ref> (--new[:@]=<v> | --delete) (--expected[:@]=<v> |
+        // --force)` — compare-and-swap a named mutable ref under refs/heads/
+        // (design/refs.md). `ref-get` is dispatched in `main`, for its exit
+        // status.
         Some("ref-set") => caos::caos_ref_set(&http()?, &args[2..]),
         // `ref-then <ref> [--expected=<hash|absent>] [--timeout=<secs>]
         // [--then:<type>=<image>] [--catch]` — a continuation: the server waits
@@ -194,9 +206,14 @@ fn usage(args: &[String]) -> String {
          {prog} eval-path-then <in-cas-path> --eval=<path> [--then:<type>=<image>] [--catch]\n  \
          {prog} run-request-then <arg-tree-hash|cas-path> [--then:<type>=<image>] [--catch]\n  \
          {prog} sub-run <arg-tree-hash>\n  \
+<<<<<<< 6b22c112b780b0f444971467724c246cfd65a4a9
          {prog} ref-get <ref>\n  \
          {prog} ref-set <ref> <hash|absent> (--expected=<hash|absent> | --force)\n  \
          {prog} ref-then <ref> [--expected=<hash|absent>] [--timeout=<secs>]\n      [--then:<type>=<image>] [--catch]\n  \
+=======
+         {prog} ref-get <ref> <cas-path>   (exit 2: no such ref)\n  \
+         {prog} ref-set <ref> (--new=<hash> | --new:@=<cas-path> | --delete)\n      (--expected=<hash|absent> | --expected:@=<cas-path> | --force)\n  \
+>>>>>>> d2619d0d327701e934194fdda87b595433a5519c
          {prog} trace-child <name> <arg-tree-hash>\n  \
          {prog} prepare-request --base:<type>=<image-or-arg tree> [--name=value | --name:@=path ...]\n  \
          {prog} resolve-image <hex hash | docker://<ref>>\n  \
