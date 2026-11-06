@@ -27,7 +27,7 @@
   # had to be self-contained. The price was a second compile of the same ~176
   # dependencies the root flake had already built. Taking `src`, `toolchain`
   # and the built `workerCargo` from the caller collapses that to one build
-  # and deletes the synchronisation apparatus with it.
+  # and deletes the synchronization apparatus with it.
   description = "caos std/cargo — the cargo worker: pinned toolchain + baked deps + worker-cargo";
 
   inputs = {

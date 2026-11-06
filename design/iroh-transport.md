@@ -197,7 +197,7 @@ with the same shape: a small answer works, a real one hangs.
   reached anything. The caos-net gateway moves when that bridge is recreated, so
   a ticket for a server whose identity had not changed changed with it;
   `127.0.0.1` names the client's own machine; a client on a colliding 10.x range
-  probes its neighbours; and every holder of a ticket learned the internal
+  probes its neighbors; and every holder of a ticket learned the internal
   addressing.
 
   An endpoint's own discovered addresses are not used either, for the same

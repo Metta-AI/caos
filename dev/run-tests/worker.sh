@@ -147,7 +147,7 @@ fanout)
     # A check here can only SKIP, and a skipped test is invisible: `--only`
     # then reports "matched no tests" for a name that is right there, blaming
     # the name rather than the filter a hundred lines away. dev/run-test
-    # already makes the judgement properly — it evaluates each tree and runs
+    # already makes the judgment properly — it evaluates each tree and runs
     # the result in SEPARATE stages so a broken entry is caught at `launch`
     # and says so, with `--catch` making that one test's FAIL rather than the
     # suite's. A directory that is not a runnable entry belongs in the report
@@ -168,7 +168,7 @@ fanout)
   # AN EMPTY SELECTION IS A USER ERROR, said here. `--only` is SPACE-separated
   # (the match above is `*" $t "*`), so the comma form everyone reaches for first
   # selects nothing — and an empty map has no children, which surfaced two
-  # containers later as the summariser's `/cas/args/children/*: No such file or
+  # containers later as the summarizer's `/cas/args/children/*: No such file or
   # directory`, a message about neither `--only` nor the names it was given.
   if [ -z "$(ls -A /tmp/sel)" ]; then
     # The two usual causes, named: a `tests/` prefix (the names are the
@@ -188,7 +188,7 @@ fanout)
   # from the tests themselves: a test's start and end are files in its RESULT,
   # so a cache hit replays the pair from whenever it last ran.
   #
-  # A timestamp in args means the summariser never caches. That is the point: it
+  # A timestamp in args means the summarizer never caches. That is the point: it
   # is one cheap container, and it only runs at all when this stage does.
   then_img=$(caos curry --base:@=/cas/args/base \
     "--worker1:@=/cas/args/worker1" --stage=summarize \
@@ -241,7 +241,7 @@ summarize)
     done
 
     echo "tests ($(($(date +%s) - start_time))s)"
-    # A mark rather than a word, and no colour: this report is a VALUE in a git
+    # A mark rather than a word, and no color: this report is a VALUE in a git
     # tree, so a worker cannot know whether whoever reads it is a terminal, and
     # ANSI escapes would be baked into the artifact and every log that shows it.
     for i in "${!names[@]}"; do

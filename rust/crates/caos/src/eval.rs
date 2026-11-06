@@ -23,7 +23,7 @@ pub(crate) use caos_eval::mode_of_kind;
 ///
 /// Every key stored through this is built from object hashes — a tree and a path
 /// within it, a commit sha — so an entry cannot go stale: the same key names the
-/// same bytes for the life of the world. That is the whole licence for a global
+/// same bytes for the life of the world. That is the whole license for a global
 /// here. A cache keyed on a NAME would need invalidation; this one has nothing
 /// to invalidate, and a long-lived process (the TUI) accumulates one small entry
 /// per distinct object it evaluated.

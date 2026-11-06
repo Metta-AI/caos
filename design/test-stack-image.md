@@ -169,7 +169,7 @@ trade. What changes is who gets the socket. Today `CAOS_RUNNER_SOCKET` grants
 it to **every** worker in the pool, which the compose file flags as coarse.
 Now there is exactly one image that hosts a stack, so the grant is a property
 that image declares in its own env — `CAOS_GRANT_ENGINE_SOCKET=1`, the same
-shape as the existing `CAOS_WORKER_UID=0` — and runnerd honours it per-image.
+shape as the existing `CAOS_WORKER_UID=0` — and runnerd honors it per-image.
 That closes phase 4's "refine the socket grant from pool-wide to per-image".
 
 runnerd reads it from the IMAGE's config, never from the job or its args, so a
