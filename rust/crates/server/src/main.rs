@@ -187,11 +187,22 @@ fn main() {
     // auth problem and is really a missing config.
     git(&["-C", &git_dir, "config", "http.receivepack", "true"]);
     // Validate every incoming object in Git's quarantine, including objects
-    // outside the updated refs. Keep even small pushes packed so migration
-    // exposes a complete pack at once, not unordered loose commits.
+    // outside the updated refs.
     git(&["-C", &git_dir, "config", "receive.fsckObjects", "true"]);
     git(&["-C", &git_dir, "config", "receive.shallowUpdate", "false"]);
-    git(&["-C", &git_dir, "config", "receive.unpackLimit", "1"]);
+    // The store is loose objects only and is never packed
+    // (design/loose-object-store.md, `mod loose`). Every transfer into this
+    // repo unpacks into loose objects, however small or large; a push lands in
+    // git's quarantine and the managed `pre-receive` hook publishes it children
+    // first. Objects are written at zlib level 0: the filesystem compresses.
+    for key in [
+        "receive.unpackLimit",
+        "transfer.unpackLimit",
+        "fetch.unpackLimit",
+    ] {
+        git(&["-C", &git_dir, "config", key, UNPACK_ALWAYS]);
+    }
+    git(&["-C", &git_dir, "config", "core.looseCompression", "0"]);
     git(&[
         "-C",
         &git_dir,
