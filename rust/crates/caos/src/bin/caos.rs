@@ -142,10 +142,10 @@ fn run(args: &[String]) -> Result<(), String> {
             (Some(name), Some(arg_tree), None) => caos::caos_trace_child(&http()?, name, arg_tree),
             _ => Err(usage(args)),
         },
-        // `ref-get <ref>` / `ref-set <ref> <hash|absent> (--expected=<v> |
-        // --force)` — read or compare-and-swap a named mutable ref under
-        // refs/heads/ (design/refs.md).
-        Some("ref-get") => caos::caos_ref_get(&http()?, &args[2..]),
+        // `ref-set <ref> (--new[:@]=<v> | --delete) (--expected[:@]=<v> |
+        // --force)` — compare-and-swap a named mutable ref under refs/heads/
+        // (design/refs.md). `ref-get` is dispatched in `main`, for its exit
+        // status.
         Some("ref-set") => caos::caos_ref_set(&http()?, &args[2..]),
         // Start an already-stored ArgTree without waiting, preserving this
         // job's server-side run stack and secret store.
