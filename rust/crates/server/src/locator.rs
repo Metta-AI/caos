@@ -249,8 +249,10 @@ fn fetch_tree(
         .map_err(|e| format!("staging the locator tree: {e}"))?;
     let mut read = git(&check);
     read.args(["cat-file", "--batch", "--batch-all-objects"]);
-    crate::loose::read_objects(read, None, |_, kind, data| loose.add(kind, &data).map(|_| ()))
-        .map_err(|e| format!("staging the locator tree: {e}"))?;
+    crate::loose::read_objects(read, None, |_, kind, data| {
+        loose.add(kind, &data).map(|_| ())
+    })
+    .map_err(|e| format!("staging the locator tree: {e}"))?;
     loose
         .publish(&Path::new(&config.git_dir).join("objects"))
         .map_err(|e| format!("storing the locator tree: {e}"))?;
