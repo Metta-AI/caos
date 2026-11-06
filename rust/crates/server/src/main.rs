@@ -162,7 +162,7 @@ fn install_termination_handlers() {
 
 fn main() {
     // Run as the repository's `pre-receive` hook (see `loose::publish_quarantine`).
-    if std::env::args().nth(1).as_deref() == Some(loose::HOOK_ARG) {
+    if loose::is_hook_invocation() {
         std::process::exit(loose::publish_quarantine());
     }
     install_termination_handlers();
