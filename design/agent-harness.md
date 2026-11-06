@@ -287,7 +287,7 @@ call id for that reason as much as for the check.
 
 The point is that there is exactly one implementation of `edit`. A harness
 that reimplemented the tools client-side would give a model a second
-description and a second behaviour for every one of them, and `caos mcp` used
+description and a second behavior for every one of them, and `caos mcp` used
 to. `tests/llm-tools-only` covers the mode, with an EMPTY stub fixture so a
 run that reaches the model fails rather than passing.
 
@@ -401,7 +401,7 @@ points is the caller's tree's business, not this client's (`design/chat.md`,
   GitHub PR back into the canonical server-side session. Imports preserve
   the ID and event spine, allow only first-parent advancement, and reject
   divergent ID collisions. Progress remains one completed API round at a time,
-  and a running turn is not cancellable until the server/runner protocol grows
+  and a running turn is not cancelable until the server/runner protocol grows
   cancellation.
 
 ### Superseded protocol detail

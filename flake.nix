@@ -83,7 +83,7 @@
         # musl std are the SAME component derivations in every profile, and the
         # aggregate is a link farm that cannot influence codegen.
         #
-        # Parameterised on the package set because the cargo worker image is
+        # Parameterized on the package set because the cargo worker image is
         # Linux (linuxPkgs) while the host build is the host's. On Linux those
         # are one derivation, which is what collapses the bake and
         # cargoArtifacts into a single compile.
@@ -539,7 +539,7 @@
             # 99 MB, so this is not the expensive part of a 160 MB userland.
             linuxPkgs.nix
             # mount(8) for the bind that swaps that store over this image's
-            # own, and flock(1) to serialise the copy that precedes it —
+            # own, and flock(1) to serialize the copy that precedes it —
             # several containers seed one volume (see stack/bootstrap).
             linuxPkgs.util-linux
             (if pkgs.stdenv.hostPlatform.isLinux then
@@ -674,7 +674,7 @@ sandbox = false''
           # records each as a distinct failure before it was a line:
           #
           #   /tmp, /var/tmp   a writable TMPDIR for every derivation nix
-          #                    realises, and for the nix-DB dump bootstrap
+          #                    realizes, and for the nix-DB dump bootstrap
           #                    takes before binding the store over /nix.
           #                    Absent, that bind fails with a bare
           #                    `/tmp/image-db.dump: No such file or directory`
@@ -1375,7 +1375,7 @@ sandbox = false''
               # bridge is recreated, so a ticket for a server whose identity has
               # not changed does; 127.0.0.1 points a client at its own machine,
               # which is a trap for anyone running a stack on the same port; a
-              # client on a colliding 10.x range probes its own neighbours; and
+              # client on a colliding 10.x range probes its own neighbors; and
               # all of it tells whoever holds the ticket what the internal
               # addressing is.
               #

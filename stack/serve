@@ -41,7 +41,7 @@
 #                             someone else's. The host placement runs one; the
 #                             test placement deliberately does not — a
 #                             content-addressed registry shared across tests
-#                             cannot leak behaviour, only work, and sharing it
+#                             cannot leak behavior, only work, and sharing it
 #                             is what stops every test rebaking the toolchain.
 #   CAOS_STACK_REDIS          "yes" to run redis in the group, "no" to use
 #                             someone else at CAOS_STACK_REDIS_ADDR. Two redis
