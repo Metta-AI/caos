@@ -160,6 +160,10 @@ fn install_termination_handlers() {
 }
 
 fn main() {
+    // Run as the repository's `pre-receive` hook (see `loose::publish_quarantine`).
+    if std::env::args().nth(1).as_deref() == Some(loose::HOOK_ARG) {
+        std::process::exit(loose::publish_quarantine());
+    }
     install_termination_handlers();
 
     let addr = std::env::var("SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
