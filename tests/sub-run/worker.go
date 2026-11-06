@@ -193,7 +193,7 @@ func detached() {
 	}
 	seen := delivered(ref(nonce, "go"))
 	// What was delivered is what the ref holds, read back the same way.
-	w.True(w.RefGet(ref(nonce, "go"), "/cas/go"), "%s vanished after ref-then saw it", ref(nonce, "go"))
+	w.True(refGet(ref(nonce, "go"), "/cas/go"), "%s vanished after ref-then saw it", ref(nonce, "go"))
 	w.True(w.Hash("/cas/go") == seen, "ref-then delivered %s, but %s holds %s", seen, ref(nonce, "go"), w.Hash("/cas/go"))
 	create(nonce, "done", "done")
 	w.Report("detached: saw go at " + seen + ", answered on done\n")
@@ -258,7 +258,7 @@ func test() {
 		b := arg("detached")
 		if has("error") {
 			why := arg("error")
-			alive := w.RefGet(ref(nonce, "alive"), "/cas/alive")
+			alive := refGet(ref(nonce, "alive"), "/cas/alive")
 			cleanup(nonce)
 			w.True(alive, "the detached request %s never ran: it never set %s (%s)",
 				b, ref(nonce, "alive"), why)
