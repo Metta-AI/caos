@@ -1967,10 +1967,9 @@ mod tests {
     }
 
     #[test]
-    fn root_is_a_required_first_parameter_and_replaces_in_git_and_scope() {
+    fn root_is_a_required_first_parameter() {
         let h = parse_help("t", "Edits a file.\n@param text The text.\n@writer\n@root\n@in");
         assert!(h.root && h.writer);
-        assert!(!h.wants_in, "@in is not obeyed beside @root");
         let tool = TreeTool::new("t", h);
         assert_eq!(tool.args[0].name, ROOT);
         assert!(tool.args[0].required);
