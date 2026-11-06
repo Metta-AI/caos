@@ -960,10 +960,7 @@ mod tests {
         assert_eq!(join_params("", ""), "");
     }
 
-    use super::{
-        configure_ref_advertisements, install_publish_hook, remove_managed_pre_receive_hook,
-        run_required_git, MANAGED_HOOK_MARKERS,
-    };
+    use super::{git_settings, initialize_repo, run_required_git, settings_env};
     use std::process::Command;
 
     #[test]
