@@ -1823,17 +1823,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_help_git_tag_and_no_params() {
-        let h = parse_help("t", "Just a description.\n@git");
-        assert_eq!(h.doc, "Just a description.");
-        assert!(h.git);
-        assert!(h.args.is_empty());
+    fn removed_tags_are_ignored_and_no_params() {
+        // `@in`, `@git`, `@scope` and `@call` are gone (design/tool-contract.md,
+        // "Tags"): reported, and they add neither a flag nor a parameter.
+        for tag in ["@in", "@git", "@scope src", "@call"] {
+            let h = parse_help("t", &format!("Just a description.\n{tag}"));
+            assert_eq!(h.doc, "Just a description.");
+            assert!(h.args.is_empty(), "{tag}");
+            assert!(!h.root && !h.writer && !h.request_id, "{tag}");
+        }
+        assert!(REMOVED_TAGS.iter().any(|(tag, _)| *tag == "in"));
 
         // Empty help → empty description (the caller placeholders it) and no args.
         let h = parse_help("t", "");
         assert!(h.doc.is_empty());
         assert!(h.args.is_empty());
-        assert!(!h.git);
         assert!(!h.writer);
     }
 
