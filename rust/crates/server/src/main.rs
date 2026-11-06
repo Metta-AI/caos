@@ -1120,8 +1120,8 @@ mod tests {
     }
 
     use super::{
-        configure_ref_advertisements, remove_managed_pre_receive_hook, run_required_git,
-        MANAGED_HOOK_MARKERS,
+        configure_ref_advertisements, install_publish_hook, remove_managed_pre_receive_hook,
+        run_required_git, MANAGED_HOOK_MARKERS,
     };
     use std::process::Command;
 
