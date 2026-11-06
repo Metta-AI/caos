@@ -265,16 +265,30 @@ each request is answered only after its sync.
 
 ## 6. Migration
 
-One downtime of roughly 10 minutes, rehearsed first on a copy as in section 2.
+All of `/data` moves to a new btrfs volume; the old ext4 volume stays
+attached read-only, then detached, as the rollback. What is on it
+(2026-11-06, 202 GB used of 1 TB):
 
-1. Attach and format the volume (`prod/caosd/configuration.nix`:
-   `fileSystems."/data/caos/stack/git"`, btrfs by label, the options above,
-   `nofail`). Mount it first at a temporary path, e.g. `/data/caos-git-new`.
-2. Stop `caosd`.
-3. Copy everything except `objects/` from the old repo: config, `HEAD`,
-   `refs/`, `packed-refs`, `logs/` (repair restores refs from reflogs),
-   `hooks/`, `caos-imports/`, `caos-commit-checks/`, `caos-locators/`,
-   `secrets.git` if it lives there.
+| path | size | in the move |
+| --- | --- | --- |
+| `/data/caos` (repo, registry, redis, iroh state) | 21 GB | copied; the repo's objects exploded (step 4) |
+| `/data/docker` (containerd image snapshots) | 183 GB | not copied if its images can be pulled or rebuilt; the rehearsal confirms which |
+| `/data/exp`, `/data/caos-store-test` | 2.4 GB | copied or dropped |
+
+One downtime, rehearsed first on a copy as in section 2. The copy of
+`/data/caos` and the explode (2 min 16 s measured) set its length, well under
+an hour if `/data/docker` is rebuilt rather than copied.
+
+1. Attach a new volume, format it btrfs with the data disk's label
+   (`prod/caosd/configuration.nix` finds the disk by label), mount it at a
+   temporary path, `chattr +C` an empty `caos/stack/redis` on it.
+2. Stop `caosd` and dockerd.
+3. Copy everything under `/data` but `caos/stack/git/objects` (and
+   `/data/docker` if it is to be rebuilt) with `rsync -aHAX --numeric-ids`.
+   In the repo that includes config, `HEAD`, `refs/`, `packed-refs`, `logs/`
+   (repair restores refs from reflogs), `hooks/`, `caos-imports/`,
+   `caos-commit-checks/`, `caos-locators/`, and `secrets.git` if it lives
+   there.
 4. Explode every object into the new `objects/`:
    `git cat-file --batch-all-objects --batch-check='%(objectname)'` in the old
    repo, piped as names to `pack-objects --stdout --window=0`, piped to
@@ -282,11 +296,12 @@ One downtime of roughly 10 minutes, rehearsed first on a copy as in section 2.
    not matter: the server is down, and a failure means start again.
 5. Verify: the object count matches, 2,000 sampled objects are
    byte-identical through `cat-file --batch`, and the closure check passes.
-6. Move the old repo aside (`git.pre-loose`), mount the volume at
-   `/data/caos/stack/git`, start the new server version.
-7. Keep `git.pre-loose` for two weeks. Rollback: stop, copy the new volume's
-   loose objects into the old repo's `objects/` (old servers read loose
-   objects fine), swap back, start the old version.
+6. Deploy the configuration with the new volume as `/data` and a server
+   with this change; start.
+7. Keep the old volume for two weeks. Rollback: stop, copy the new repo's
+   loose objects into the old volume's `objects/` (old servers read loose
+   objects fine), swap the volumes back, deploy the old configuration and
+   server.
 
 The side repos' `objects/info/alternates` hold the canonical path of the
 server's `objects/`, which is the same after the swap.
