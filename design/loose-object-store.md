@@ -258,8 +258,9 @@ each request is answered only after its sync.
 | btrfs reorders renames across a crash | power-cut test before prod; closure check at every start |
 | a path still writes a pack | startup warning; watchdog alert on any file in `objects/pack` |
 | btrfs metadata ENOSPC on a full volume | size generously; alert at 70% used, from `btrfs filesystem usage` |
-| the bind mount does not show the submount inside the container | check during migration: docker bind mounts are recursive by default, but confirm the container sees btrfs at `$CAOS_STACK_STATE/git` |
-| backups miss the new volume | add it to whatever snapshots `/data` |
+| dockerd picks its btrfs storage driver on the new data root | `storage-driver = "overlay2"` pinned in `daemon.settings` |
+| redis's append-only file fragments under copy-on-write | its directory is `chattr +C` |
+| backups or snapshots of `/data` assume ext4 | check whatever snapshots the data disk before the swap |
 | large fetches cost more CPU | accepted; a pack cache for immutable roots is the fix if it ever matters |
 
 ## 6. Migration
