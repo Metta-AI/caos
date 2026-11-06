@@ -143,14 +143,17 @@ pub(crate) fn endpoint(
                     .nth(1)
                     .filter(|oid| git_locator::import::commit(oid))
                     .ok_or_else(|| failure("invalid imported pack index"))?;
-                crate::storage::get_object(&staged, oid)
+                let (kind, data) = crate::storage::fetch_object(&staged, oid)
                     .map_err(|_| failure("imported object not readable in staging"))?;
+                let kind = gix::object::Kind::from_bytes(kind.as_bytes())
+                    .map_err(|_| failure("imported object has an unknown type"))?;
+                loose.add(kind, &data)?;
             }
         }
         crate::storage::get_object(&staged, &input.commit)
             .map_err(|_| failure("imported commit not readable in staging"))?;
-        incoming.publish(&config.git_dir)?;
-        // Exercise the live handle after pack publication, before certifying H.
+        loose.publish(&Path::new(&config.git_dir).join("objects"))?;
+        // Exercise the live handle after publication, before certifying H.
         crate::storage::get_object(config, &input.commit)
             .map_err(|_| failure("imported commit not visible through object storage"))?;
         // GC is disabled on the server. This records verified closure, not a
