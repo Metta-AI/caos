@@ -302,6 +302,10 @@ fn main() {
     // answers "is this object stored?" for a loose object with a path-exists
     // check, so an empty file has to be gone from disk before anything asks.
     let swept = repair::sweep_empty_loose_objects(&git_dir);
+    let temporaries = loose::sweep_temporaries(&std::path::Path::new(&git_dir).join("objects"));
+    if temporaries > 0 {
+        eprintln!("repair: {git_dir} had {temporaries} temporary object file(s) from a crash; removed");
+    }
 
     // Open the object database once as a thread-safe handle; each request thread
     // takes a cheap local handle from it (see `handle`).
