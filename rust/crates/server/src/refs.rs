@@ -274,40 +274,6 @@ fn notify() {
     CHANGED.notify_all();
 }
 
-/// Block until `name` holds something other than `from`, and return what it
-/// holds; fail once `timeout` has passed with it unchanged.
-///
-/// The generation is taken BEFORE each read, so a write landing between the
-/// read and the sleep moves it and the sleep returns at once: there is no
-/// window in which a change can be missed until the next recheck.
-pub(crate) fn wait_for_change(
-    git_dir: &str,
-    name: &str,
-    from: &Value,
-    timeout: Duration,
-) -> Result<Value, String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let seen = *GENERATION.lock().unwrap_or_else(|e| e.into_inner());
-        let now = read(git_dir, name).map_err(|e| e.message().to_string())?;
-        if now != *from {
-            return Ok(now);
-        }
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(format!(
-                "ref {name} was still {} after {}s",
-                from.text(),
-                timeout.as_secs()
-            ));
-        }
-        let guard = GENERATION.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = CHANGED
-            .wait_timeout_while(guard, left.min(RECHECK), |generation| *generation == seen)
-            .unwrap_or_else(|e| e.into_inner());
-    }
-}
-
 /// `GET /ref?name=<ref>` — the ref's value, `<oid>` or `absent`, and a newline.
 pub(crate) fn get_endpoint(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
     let name = crate::compute::query_param(query, "name")
