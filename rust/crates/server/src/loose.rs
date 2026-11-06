@@ -188,8 +188,7 @@ pub(crate) fn sweep_temporaries(objects: &Path) -> usize {
     let mut removed = 0;
     for entry in entries.filter_map(Result::ok) {
         let name = entry.file_name();
-        if name.to_string_lossy().starts_with(TEMP_PREFIX)
-            && fs::remove_file(entry.path()).is_ok()
+        if name.to_string_lossy().starts_with(TEMP_PREFIX) && fs::remove_file(entry.path()).is_ok()
         {
             removed += 1;
         }
