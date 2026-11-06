@@ -3937,7 +3937,9 @@ pub fn caos_ref_set(t: &dyn Transport, args: &[String]) -> Result<(), String> {
         } else if arg == "--force" {
             force = true;
         } else if arg.starts_with("--") {
-            return Err(format!("`ref-set` takes --expected=<hash|absent> or --force, got {arg}"));
+            return Err(format!(
+                "`ref-set` takes --expected=<hash|absent> or --force, got {arg}"
+            ));
         } else {
             positional.push(arg.as_str());
         }
