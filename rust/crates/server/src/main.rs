@@ -681,7 +681,9 @@ fn install_publish_hook(git_dir: &str) -> Result<(), String> {
         .output()
         .map_err(|error| format!("reading core.hooksPath: {error}"))?;
     if configured.status.success() {
-        let value = String::from_utf8_lossy(&configured.stdout).trim().to_string();
+        let value = String::from_utf8_lossy(&configured.stdout)
+            .trim()
+            .to_string();
         let path = Path::new(&value);
         let path: PathBuf = if path.is_absolute() {
             path.to_path_buf()
