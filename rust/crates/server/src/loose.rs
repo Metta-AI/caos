@@ -670,7 +670,12 @@ mod tests {
         assert!(list_loose(&quarantine).unwrap().is_empty());
         let walk = git(
             &dir,
-            &["rev-list", "--objects", "--missing=error", &tree.to_string()],
+            &[
+                "rev-list",
+                "--objects",
+                "--missing=error",
+                &tree.to_string(),
+            ],
         );
         assert!(
             walk.status.success(),
