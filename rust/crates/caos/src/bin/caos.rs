@@ -37,6 +37,18 @@ fn main() -> ExitCode {
             }
         };
     }
+    // Neither is `ref-get`'s "the ref does not exist": nothing was written,
+    // and nothing broke.
+    if args.get(1).map(String::as_str) == Some("ref-get") {
+        return match http().and_then(|t| caos::caos_ref_get(&t, &args[2..])) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::from(caos::REF_ABSENT_EXIT),
+            Err(err) => {
+                eprintln!("{}: {err}", prog_name(&args));
+                ExitCode::FAILURE
+            }
+        };
+    }
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
