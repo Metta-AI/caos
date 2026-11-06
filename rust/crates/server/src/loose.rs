@@ -29,30 +29,32 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub(crate) type Kind = gix::object::Kind;
 pub(crate) type Id = gix::ObjectId;
 
-/// The argument the server binary is run with as the repository's
-/// `pre-receive` hook (see [`publish_quarantine`]).
-pub(crate) const HOOK_ARG: &str = "publish-quarantine";
+/// The hook this server runs as: git names it, and the server knows it was run
+/// as the hook by its own invocation name (see [`is_hook_invocation`]).
+const HOOK_NAME: &str = "pre-receive";
 
-/// Proves the `pre-receive` hook is ours, so a restart may rewrite it.
-pub(crate) const HOOK_MARKER: &str =
-    "# managed by caos-server: publish pushed objects in dependency order";
+/// Make `dir` this server's own hooks directory and return it: a
+/// `pre-receive` that is a symlink to this very binary. The server hands git
+/// `core.hooksPath = dir` in the environment of the `http-backend` it spawns
+/// (`main::git_settings`), so the hook runs for pushes through THIS server and
+/// nothing is written into the repository, which other servers, of other
+/// builds, share. `dir` must belong to this process (not the shared volume).
+pub(crate) fn install_hooks(dir: &Path) -> io::Result<PathBuf> {
+    fs::create_dir_all(dir)?;
+    let exe = std::env::current_exe()?;
+    let temp = dir.join(format!(".{HOOK_NAME}.{}", std::process::id()));
+    let _ = fs::remove_file(&temp);
+    std::os::unix::fs::symlink(&exe, &temp)?;
+    fs::rename(&temp, dir.join(HOOK_NAME))?;
+    Ok(dir.to_path_buf())
+}
 
-/// The hook's environment variable naming the server binary. `git.rs` sets it
-/// on every `http-backend` it spawns; the hook passes it nothing else.
-pub(crate) const SERVER_EXE_ENV: &str = "CAOS_SERVER_EXE";
-
-/// The `pre-receive` hook. It is the same for every server sharing the
-/// repository: each request's own server names itself in the environment, so
-/// two builds on one repo never fight over the file's contents.
-pub(crate) fn hook_script() -> String {
-    format!(
-        "#!/bin/sh\n{HOOK_MARKER}\n\
-         if [ -z \"${SERVER_EXE_ENV}\" ]; then\n\
-         \x20 echo \"caos: push through the caos server, which publishes pushed objects in dependency order\" >&2\n\
-         \x20 exit 1\n\
-         fi\n\
-         exec \"${SERVER_EXE_ENV}\" {HOOK_ARG}\n"
-    )
+/// Whether this process was started by git as the `pre-receive` hook: git runs
+/// the symlink [`install_hooks`] made, so the invocation name is the hook's.
+pub(crate) fn is_hook_invocation() -> bool {
+    std::env::args_os()
+        .next()
+        .is_some_and(|arg0| Path::new(&arg0).file_name() == Some(HOOK_NAME.as_ref()))
 }
 
 fn other(message: impl Into<String>) -> io::Error {
