@@ -62,6 +62,7 @@ mod import;
 mod locator;
 mod mcp;
 mod push;
+mod refs;
 mod remote_git;
 mod repair;
 mod runner;
