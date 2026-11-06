@@ -3900,20 +3900,79 @@ fn check_ref_value(verb: &str, what: &str, value: &str) -> Result<(), String> {
     }
 }
 
-/// `ref-get <ref>` — print the ref's value: the commit it names, or
-/// [`REF_ABSENT`]. Reading never waits; `ref-then` is how a worker waits for a
+/// The commit recorded at a CAS path (a `put-commit` or `ref-get` result, a
+/// commit-valued arg), as a hash. How `ref-set` and `ref-then` read a
+/// `--<flag>:@=<cas path>`; a path holding anything but a commit is refused.
+fn cas_commit(verb: &str, flag: &str, path: &str) -> Result<String, String> {
+    let target = validate_descendant(&cas_dir(), path)
+        .map_err(|e| format!("`{verb}` --{flag}:@={path}: {e}"))?;
+    let kind = result_kind(&target)?;
+    if kind != "commit" {
+        return Err(format!(
+            "`{verb}` --{flag}:@={path} is a {kind}, but a ref names a commit (`put-commit` mints one, `ref-get` reads one)"
+        ));
+    }
+    read_hash(&target)
+}
+
+/// One of a ref verb's commit-valued flags, `--<flag>=<hash>` or
+/// `--<flag>:@=<cas path>` (the spellings `run` and `curry` use), as the value
+/// the server takes. `--<flag>=absent` is accepted only where `absent_ok`.
+/// `None` if `arg` is some other flag.
+fn ref_flag(
+    verb: &str,
+    flag: &str,
+    absent_ok: bool,
+    arg: &str,
+) -> Option<Result<String, String>> {
+    let rest = arg.strip_prefix("--")?.strip_prefix(flag)?;
+    if let Some(path) = rest.strip_prefix(":@=") {
+        return Some(cas_commit(verb, flag, path));
+    }
+    let value = rest.strip_prefix('=')?;
+    Some(
+        check_ref_value(verb, &format!("--{flag}"), value).and_then(|()| {
+            if value == REF_ABSENT && !absent_ok {
+                Err(format!("`{verb}` --{flag} takes a commit, not {REF_ABSENT:?}"))
+            } else {
+                Ok(value.to_string())
+            }
+        }),
+    )
+}
+
+/// The exit status of `ref-get` on a ref that does not exist: not 0 (nothing
+/// was written) and not 1 (nothing broke).
+pub const REF_ABSENT_EXIT: u8 = 2;
+
+/// `ref-get <ref> <cas-path>` — record the commit the ref names at
+/// `<cas-path>`, a direct child of the CAS, kind-tagged `commit` the way
+/// `put-commit` records one: `hash` gives its id, `--name:@=` passes it on.
+///
+/// A MISSING REF IS NOT AN ERROR AND NOT A SUCCESS: nothing is written and the
+/// answer is `Ok(false)`, which the binary turns into exit status
+/// [`REF_ABSENT_EXIT`], so ABSENT and BROKEN (status 1) stay apart
+/// (AGENTS.md). Reading never waits; `ref-then` is how a worker waits for a
 /// ref to change, without holding its runner slot.
-pub fn caos_ref_get(t: &dyn Transport, args: &[String]) -> Result<(), String> {
-    let [name] = args else {
-        return Err("usage: ref-get <ref>".to_string());
+pub fn caos_ref_get(t: &dyn Transport, args: &[String]) -> Result<bool, String> {
+    let [name, path] = args else {
+        return Err("usage: ref-get <ref> <cas-path>".to_string());
     };
     check_ref_name("ref-get", name)?;
+    let cas = cas_dir();
+    let target = validate_target(&cas, path)?;
+    probe_xattr(&cas)?;
     let body = server_get(
         &t.server_url()?,
         &format!("/ref?name={}", percent_encode(name)),
     )?;
-    println!("{}", String::from_utf8_lossy(&body).trim());
-    Ok(())
+    let value = String::from_utf8_lossy(&body).trim().to_string();
+    if value == REF_ABSENT {
+        return Ok(false);
+    }
+    check_ref_value("ref-get", "the server's answer", &value)?;
+    write_placeholder(&target, "commit", &value)?;
+    Ok(true)
 }
 
 /// `ref-set <ref> <hash|absent> (--expected=<hash|absent> | --force)` — move a
