@@ -628,8 +628,20 @@ mod tests {
         let commit = staging.add(Kind::Commit, commit.as_bytes()).unwrap();
         assert_eq!(staging.len(), 3);
         assert_eq!(staging.publish(&objects).unwrap(), 3);
-        let walk = git(&dir, &["rev-list", "--objects", "--missing=error", &commit.to_string()]);
-        assert!(walk.status.success(), "{}", String::from_utf8_lossy(&walk.stderr));
+        let walk = git(
+            &dir,
+            &[
+                "rev-list",
+                "--objects",
+                "--missing=error",
+                &commit.to_string(),
+            ],
+        );
+        assert!(
+            walk.status.success(),
+            "{}",
+            String::from_utf8_lossy(&walk.stderr)
+        );
         assert_eq!(String::from_utf8_lossy(&walk.stdout).lines().count(), 3);
         fs::remove_dir_all(dir).unwrap();
     }
