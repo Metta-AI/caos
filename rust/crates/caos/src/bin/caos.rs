@@ -147,7 +147,7 @@ fn run(args: &[String]) -> Result<(), String> {
         // (design/refs.md). `ref-get` is dispatched in `main`, for its exit
         // status.
         Some("ref-set") => caos::caos_ref_set(&http()?, &args[2..]),
-        // `ref-then <ref> [--expected=<hash|absent>] [--timeout=<secs>]
+        // `ref-then <ref> [--expected[:@]=<v>] [--timeout=<secs>]
         // [--then:<type>=<image>] [--catch]` — a continuation: the server waits
         // for the ref to change after this worker exits, holding no slot.
         Some("ref-then") => match &args[2..] {
