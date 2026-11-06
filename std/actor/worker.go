@@ -75,10 +75,25 @@ func serverURL() string {
 	return url
 }
 
+// refGet records the commit ref names at the CAS path and reports true, or
+// false if there is no such ref (`caos ref-get` exits 2 and writes nothing).
+// Any other failure ends the request.
+func refGet(ref, path string) bool {
+	cmd := exec.Command("caos", "ref-get", ref, path)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 2 {
+		return false
+	}
+	w.True(err == nil, "caos ref-get %s %s: %v: %s", ref, path, err, strings.TrimSpace(stderr.String()))
+	return true
+}
+
 // readRef is the branch's head on the server, or "" if the branch is absent.
 // `caos ref-get` records the head at the CAS path `at`, a fresh one per read.
 func readRef(ref, at string) string {
-	if w.RefGet(ref, at) {
+	if refGet(ref, at) {
 		return caos("hash", at)
 	}
 	return ""
