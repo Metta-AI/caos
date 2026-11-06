@@ -1468,6 +1468,11 @@ fn resolve_promise(
             // The PATH to evaluate (a blob, not an image): the middle step walks
             // `.caos-expr` from `in`'s root down to it. See `ServerEvalHost`.
             "eval" => eval = Some(blob_string(config, &entry.oid.to_string())?),
+            // A ref NAME, the value it is waiting to leave, and a timeout in
+            // seconds — all strings, recorded verbatim by `caos ref-then`.
+            "ref" => ref_name = Some(blob_string(config, &entry.oid.to_string())?),
+            "expected" => ref_expected = Some(blob_string(config, &entry.oid.to_string())?),
+            "timeout" => ref_timeout = Some(blob_string(config, &entry.oid.to_string())?),
             // Presence is the whole signal; the content is unread.
             "catch" => catch = true,
             // How many map children may be IN FLIGHT at once. Absent means all
