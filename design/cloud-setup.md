@@ -172,7 +172,7 @@ resolves from the dev stack. That leaves the checkout dirty with a `caos://`
 ticket, which is a credential. Observed in both test sessions: the client repo's
 Stop hook demanded the changes be committed, and the agent had to reason its way
 to declining — "it bakes an ephemeral dev-mode endpoint URL … into the repo, on
-`main`". Correct judgement, but judgement, not a mechanism.
+`main`". Correct judgment, but judgment, not a mechanism.
 
 The seed commit was already minted through a throwaway index (`git commit-tree`,
 unreferenced, so no push can carry it). Building the rewritten content only in

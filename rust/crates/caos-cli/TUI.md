@@ -319,5 +319,5 @@ For manual copying, press `Ctrl+Y`, select text with the terminal, and use its
 Copy action; Escape resumes the TUI. In iTerm2, automatic clipboard writes
 require Settings > General > Selection > Applications in terminal may access
 clipboard. This setting is required even when CAOS reports “Copy requested”;
-the request has no acknowledgement. If iTerm2's clipboard-access warning was
+the request has no acknowledgment. If iTerm2's clipboard-access warning was
 previously dismissed, copying can fail silently until the setting is enabled.

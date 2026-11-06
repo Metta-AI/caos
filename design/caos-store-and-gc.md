@@ -4,6 +4,11 @@ Status: proposal for discussion. Written against `Metta-AI/caos` at
 `ca150247b2982fd7bf119371aea215def5a433bb`, with PR #351 (`0f41904`,
 2026-10-27) read separately.
 
+Update 2026-11-06: the store question (sections 6 and 8 step 4) is decided
+in `design/loose-object-store.md`: loose objects only, never packed, on a
+btrfs volume, with the measurements behind it. Retention and the collector
+(sections 4, 5 and 7) are still open here.
+
 ## Summary
 
 caos uses git for three separable things: the **object format** (blobs,
@@ -52,7 +57,7 @@ in-process reader and the parent of the git subprocesses that write to it.
 - Not git: Redis (`caos:result:*` maps an ArgTree hash to `"<type> <hash>"`;
   `caos:trace:*`, images, leases), bounded by `allkeys-lru` at 2 GB by
   default. The registry holds converted images; git holds the image
-  inputs. `/cas` exists only inside worker containers, materialised from
+  inputs. `/cas` exists only inside worker containers, materialized from
   git objects.
 - Workers and clients each use a throwaway local repo with `origin` =
   server, `gc.auto 0`, `receive.autogc false`, exact-ref fetches
@@ -295,8 +300,8 @@ and exactly what gix cannot do over git's layout.
 
 **P11. The edges.** Import: fetch into a staging repo as now, then ingest
 the pack (gix-pack decodes a pack without a repository). Publish:
-materialise the closure into a staging repo and push. `log`, `show`,
-`diff`, `merge`: run git in a materialised staging repo for that source
+materialize the closure into a staging repo and push. `log`, `show`,
+`diff`, `merge`: run git in a materialized staging repo for that source
 tree. Clients that `git fetch caos <hash>` directly lose that; the iroh
 transport already dropped the git services (PR #343).
 

@@ -113,7 +113,7 @@ treearg)
   # so this builds that shape: `outer/` produces a tree whose `tool` entry is
   # the hello entry, and nothing is at `outer/tool` in the fixture.
   #
-  # Under the old behaviour this could not work at all — `outer/tool` is not a
+  # Under the old behavior this could not work at all — `outer/tool` is not a
   # directory, so resolution stopped before evaluating anything. It is the same
   # asymmetry `:@@=` had (design/flake-inputs.md, 4a): an entry reachable
   # remotely but not locally.
