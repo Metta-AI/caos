@@ -3864,6 +3864,120 @@ pub fn caos_sub_run(t: &dyn Transport, arg_tree: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// How a missing ref is spelled by `ref-get`, `ref-set` and `ref-then` (and by
+/// `push-git --expected`): the server's `refs::ABSENT`.
+pub const REF_ABSENT: &str = "absent";
+
+/// The one ref namespace a worker may read and write; the server refuses the
+/// rest (`refs/keys/` is its secret store). Checked here too, so a typo fails
+/// in the worker that made it rather than as a 400 from far away.
+pub const REF_PREFIX: &str = "refs/heads/";
+
+fn check_ref_name(verb: &str, name: &str) -> Result<(), String> {
+    if name.starts_with(REF_PREFIX) && name.len() > REF_PREFIX.len() {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{verb}` takes a ref under {REF_PREFIX}, got {name:?}"
+        ))
+    }
+}
+
+/// A ref value as given on a command line: a lowercase 40-character hash or
+/// [`REF_ABSENT`].
+fn check_ref_value(verb: &str, what: &str, value: &str) -> Result<(), String> {
+    if value == REF_ABSENT
+        || (value.len() == 40 && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{verb}` wants {what} to be a lowercase 40-character hash or {REF_ABSENT:?}, got {value:?}"
+        ))
+    }
+}
+
+/// `ref-get <ref>` — print the ref's value: the commit it names, or
+/// [`REF_ABSENT`]. Reading never waits; `ref-then` is how a worker waits for a
+/// ref to change, without holding its runner slot.
+pub fn caos_ref_get(t: &dyn Transport, args: &[String]) -> Result<(), String> {
+    let [name] = args else {
+        return Err("usage: ref-get <ref>".to_string());
+    };
+    check_ref_name("ref-get", name)?;
+    let body = server_get(
+        &t.server_url()?,
+        &format!("/ref?name={}", percent_encode(name)),
+    )?;
+    println!("{}", String::from_utf8_lossy(&body).trim());
+    Ok(())
+}
+
+/// `ref-set <ref> <hash|absent> (--expected=<hash|absent> | --force)` — move a
+/// ref, or delete it with `absent`.
+///
+/// A COMPARE-AND-SWAP BY DEFAULT: `--expected` names the value being replaced
+/// (`absent` for create-only) and the server checks it under the ref's lock.
+/// An unconditional write has to say `--force`, so leaving the expectation out
+/// is an error rather than a silent overwrite. A lost race fails with the
+/// value the ref actually holds. The new value must be a commit already in the
+/// store (`put-commit` mints one).
+pub fn caos_ref_set(t: &dyn Transport, args: &[String]) -> Result<(), String> {
+    let mut positional = Vec::new();
+    let mut expected: Option<&str> = None;
+    let mut force = false;
+    for arg in args {
+        if let Some(value) = arg.strip_prefix("--expected=") {
+            if expected.replace(value).is_some() {
+                return Err("`ref-set` --expected given twice".to_string());
+            }
+        } else if arg == "--force" {
+            force = true;
+        } else if arg.starts_with("--") {
+            return Err(format!("`ref-set` takes --expected=<hash|absent> or --force, got {arg}"));
+        } else {
+            positional.push(arg.as_str());
+        }
+    }
+    let [name, value] = positional[..] else {
+        return Err(
+            "usage: ref-set <ref> <hash|absent> (--expected=<hash|absent> | --force)".to_string(),
+        );
+    };
+    check_ref_name("ref-set", name)?;
+    check_ref_value("ref-set", "the new value", value)?;
+    let mut body = serde_json::json!({"name": name, "value": value});
+    match (expected, force) {
+        (Some(_), true) => {
+            return Err("`ref-set` takes --expected or --force, not both".to_string())
+        }
+        (None, false) => {
+            return Err(
+                "`ref-set` needs --expected=<hash|absent> (a compare-and-swap) or --force \
+                 (an unconditional write)"
+                    .to_string(),
+            )
+        }
+        (Some(old), false) => {
+            check_ref_value("ref-set", "--expected", old)?;
+            body["expected"] = serde_json::Value::String(old.to_string());
+        }
+        (None, true) => {}
+    }
+    let body = body.to_string();
+    server_call(
+        &t.server_url()?,
+        &ServerRequest {
+            method: "POST",
+            path: "/ref",
+            headers: &[("content-type", "application/json".to_string())],
+            body: Some(body.as_bytes()),
+            timeout_secs: Some(30),
+        },
+    )?;
+    Ok(())
+}
+
 /// `trace-child <name> <arg-tree>` — record, under THIS job's trace record, that
 /// it started `arg-tree` under `name`.
 ///
