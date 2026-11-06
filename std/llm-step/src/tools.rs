@@ -184,20 +184,6 @@ pub struct TreeTool {
     pub op: Option<String>,
 }
 
-/// What `@in` offers the model: the tree to run over, defaulting to the one
-/// that the tool's own path selected.
-///
-/// A SYNTHETIC parameter rather than something a tool writes itself — `@param
-/// in` stays refused, because `in` is bound by the interpreter and a tool
-/// declaring it by hand would be declaring the thing that binds it. Making it
-/// a parameter is what lets a caller redirect the input: a tool that lives in
-/// one tree (`caos-std/caos-build`, put there by the session's own
-/// expression) can be run over another (`feature/01-change`), which it cannot
-/// do while the input is derived from where the tool happens to sit.
-const IN_DOC: &str = "The tree to run over. Defaults to the source tree this \
-                      tool sits in, which for a tool the session itself \
-                      generated is usually not the tree you mean.";
-
 /// What `@request-id` offers the model (design/tool-contract.md, "`@request-id`").
 /// Leaving it out is the normal case: the harness fills in the call's own id.
 pub const REQUEST_ID: &str = "request-id";
