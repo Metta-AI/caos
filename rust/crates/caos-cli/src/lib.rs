@@ -2420,7 +2420,6 @@ pub fn describe_tool_set(
                 "ls",
                 "write",
                 "edit",
-                "import_source",
             ]
             .contains(&name)
         {
