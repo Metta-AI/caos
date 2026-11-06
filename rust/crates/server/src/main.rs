@@ -309,13 +309,13 @@ fn main() {
 
     // Open the object database once as a thread-safe handle; each request thread
     // takes a cheap local handle from it (see `handle`).
-    // Packed uploads accumulate while automatic repacking is disabled. gix
+    // Nothing writes packs any more (every transfer unpacks; see `mod loose`),
+    // but a store from before that, or a seeded one, can still hold them. gix
     // fixes its slot capacity at open time; its client default (at least 32)
-    // cannot accommodate a running server. Reserve its supported maximum.
-    // This is headroom, not pack maintenance: 32,767 is still a hard limit.
-    // TODO: consolidate packs during coordinated downtime, preserving ALL CAS
-    // objects (including unreferenced ones), before this capacity is exhausted.
-    // Do not enable live gc/repack: see the shared-reader constraints above.
+    // cannot accommodate many packs, so reserve its supported maximum. A store
+    // that is still packed is migrated offline by exploding its packs into
+    // loose objects (design/loose-object-store.md), never by a live repack:
+    // see the shared-reader constraints above.
     // Given skips gix's initial scan, so diagnose an already-full store here.
     let packs = std::fs::read_dir(std::path::Path::new(&git_dir).join("objects/pack"))
         .map(|entries| {
