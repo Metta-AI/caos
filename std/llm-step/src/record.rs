@@ -219,7 +219,7 @@ fn content_commit(store: &GitStore, locator: &str) -> Result<Oid, String> {
         ));
     }
     let url = parsed.fetch_url();
-    let token = crate::import_source::token_file(&url)
+    let token = github_token_file(&url)
         .map(std::fs::read_to_string)
         .transpose()
         .map_err(|_| "reading the GitHub token".to_string())?;
