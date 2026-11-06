@@ -4044,10 +4044,13 @@ pub fn caos_ref_set(t: &dyn Transport, args: &[String]) -> Result<(), String> {
 /// The longest `ref-then --timeout` the server accepts (its `refs::MAX_WAIT_SECS`).
 pub const REF_MAX_WAIT_SECS: u64 = 24 * 60 * 60;
 
-/// `ref-then <ref> [--expected=<hash|absent>] [--timeout=<secs>]
-/// [--then:<type>=<image>] [--catch]` — record a continuation that waits for
-/// `<ref>` to hold something other than `--expected` (default `absent`: wait
-/// for it to be set), then delivers the new value.
+/// `ref-then <ref> [--expected=<hash|absent> | --expected:@=<cas-path>]
+/// [--timeout=<secs>] [--then:<type>=<image>] [--catch]` — record a
+/// continuation that waits for `<ref>` to hold something other than
+/// `--expected` (default `absent`: wait for it to be set), then delivers the
+/// new value. `--expected:@=` names the commit by the CAS path it is recorded
+/// at, like `ref-set`'s: a `ref-get` result, or the `--result` an earlier
+/// `ref-then` delivered, to wait for the change after that one.
 ///
 /// THE WAITING IS THE SERVER'S. Like every continuation this is the worker's
 /// final act: it exits, its runner slot is free, and the server's promise
