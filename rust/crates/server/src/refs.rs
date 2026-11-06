@@ -44,16 +44,6 @@ pub(crate) const ABSENT: &str = "absent";
 /// Git's spelling of "no old value" on an `update-ref` command line.
 const ZEROS: &str = "0000000000000000000000000000000000000000";
 
-/// The longest a `ref-then` may wait. A day: long enough for any human-paced
-/// handshake, short enough that a forgotten waiter does not hold a server
-/// thread for ever.
-pub(crate) const MAX_WAIT_SECS: u64 = 24 * 60 * 60;
-
-/// How often a waiter rereads the ref when nothing has woken it. Only a write
-/// that bypassed [`set`] needs this; one that came through it wakes waiters
-/// immediately.
-const RECHECK: Duration = Duration::from_secs(1);
-
 /// Bumped on every write through [`set`], so a waiter can sleep until
 /// something has changed rather than rereading on a timer.
 static GENERATION: Mutex<u64> = Mutex::new(0);
