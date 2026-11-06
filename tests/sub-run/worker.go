@@ -176,8 +176,10 @@ func detached() {
 			"--then:hash="+then)
 		return
 	}
-	seen := arg("result")
-	w.True(seen != absent, "ref-then on %s delivered %q", ref(nonce, "go"), seen)
+	seen := delivered(ref(nonce, "go"))
+	// What was delivered is what the ref holds, read back the same way.
+	w.True(w.RefGet(ref(nonce, "go"), "/cas/go"), "%s vanished after ref-then saw it", ref(nonce, "go"))
+	w.True(w.Hash("/cas/go") == seen, "ref-then delivered %s, but %s holds %s", seen, ref(nonce, "go"), w.Hash("/cas/go"))
 	create(nonce, "done", "done")
 	w.Report("detached: saw go at " + seen + ", answered on done\n")
 }
