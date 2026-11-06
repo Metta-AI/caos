@@ -649,6 +649,44 @@ mod tests {
     }
 
     #[test]
+    fn a_quarantine_is_published_children_first_and_emptied() {
+        let dir = scratch("quarantine");
+        let objects = dir.join("objects");
+        let quarantine = objects.join("incoming-test");
+        // Stand in for receive-pack: loose objects in the quarantine.
+        let mut pushed = Staging::new(quarantine.clone()).unwrap();
+        let blob = pushed.add(Kind::Blob, b"pushed\n").unwrap();
+        let mut tree = Vec::new();
+        tree.extend_from_slice(b"100644 file\0");
+        tree.extend_from_slice(blob.as_bytes());
+        let tree = pushed.add(Kind::Tree, &tree).unwrap();
+        let mut read = Command::new("git");
+        read.arg("--git-dir")
+            .arg(&dir)
+            .env("GIT_OBJECT_DIRECTORY", &quarantine)
+            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", &objects)
+            .args(["cat-file", "--batch"]);
+        assert_eq!(publish_quarantined(&quarantine, &objects, read).unwrap(), 2);
+        assert!(list_loose(&quarantine).unwrap().is_empty());
+        let walk = git(
+            &dir,
+            &["rev-list", "--objects", "--missing=error", &tree.to_string()],
+        );
+        assert!(
+            walk.status.success(),
+            "{}",
+            String::from_utf8_lossy(&walk.stderr)
+        );
+
+        // A push that arrived as a pack is refused rather than left to git.
+        fs::create_dir_all(quarantine.join("pack")).unwrap();
+        fs::write(quarantine.join("pack/pack-x.pack"), b"").unwrap();
+        let error = publish_quarantined(&quarantine, &objects, Command::new("git")).unwrap_err();
+        assert!(error.to_string().contains("arrived as a pack"), "{error}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn references_follow_commits_and_tags_not_gitlinks() {
         let a = "1111111111111111111111111111111111111111";
         let b = "2222222222222222222222222222222222222222";
