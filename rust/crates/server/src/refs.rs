@@ -483,7 +483,11 @@ mod tests {
         let tree = repo.git(&["mktree"], "");
         let not_commit = set(repo.path(), REF, &Value::Oid(tree), &Expected::Any).unwrap_err();
         assert_eq!(not_commit.status, 400);
-        assert!(not_commit.message().contains("is a tree"), "{}", not_commit.message());
+        assert!(
+            not_commit.message().contains("is a tree"),
+            "{}",
+            not_commit.message()
+        );
 
         let missing = Value::Oid("1".repeat(40));
         assert_eq!(
