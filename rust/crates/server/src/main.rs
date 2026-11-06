@@ -326,11 +326,11 @@ fn main() {
         })
         .unwrap_or(0);
     if packs >= (1 << 15) - 1 {
-        eprintln!("fatal: object store has {packs} packs; consolidate packs offline, preserving unreferenced CAS objects, before restarting");
+        eprintln!("fatal: object store has {packs} packs; explode them into loose objects offline, preserving unreferenced CAS objects, before restarting (design/loose-object-store.md)");
         std::process::exit(1);
     }
-    if packs >= 30_000 {
-        eprintln!("warning: object store has {packs} packs, approaching the 32767-pack limit; schedule offline consolidation");
+    if packs > 0 {
+        eprintln!("warning: object store has {packs} pack(s); nothing should write packs any more, so these predate the loose-object store; explode them offline (design/loose-object-store.md)");
     }
     let options = gix::open::Options::default()
         .object_store_slots(gix::odb::store::init::Slots::Given((1 << 15) - 1));
