@@ -153,17 +153,17 @@ cat > "$foreign/hello/.caos-expr" <<EXPR
 HELP=<<END
 Pinned generated tool.
 @param word The word.
-@in
+@root
 END
 curry --base:hash=$bash_image --worker1:@=worker.sh --help=\$HELP
 EXPR
 cat > "$foreign/hello/worker.sh" <<'WORKER'
 #!/usr/bin/env bash
 set -euo pipefail
-caos get /cas/args/in
-caos get /cas/args/in/mcp-marker
+caos get /cas/args/root
 caos get /cas/args/word
-printf 'pinned %s %s' "$(cat /cas/args/word)" "$(cat /cas/args/in/mcp-marker)" > /tmp/out
+mkdir -p /tmp/out
+printf 'pinned %s %s' "$(cat /cas/args/word)" "$(cat /cas/args/root)" > /tmp/out/stdout
 caos put /tmp/out /cas/out
 WORKER
 git -C "$foreign" init -q
@@ -226,12 +226,13 @@ case "$help" in
   *'"isError":false'*'Pinned generated tool.'*|*'Pinned generated tool.'*'"isError":false'*) ;;
   *) fail "pinned help missed the generated path: $help" ;;
 esac
-invalid=$(call_tool 21 run hello)
+marker="${prefix}mcp-marker"
+invalid=$(call_tool 21 run hello "$(jq -nc --arg root "$marker" '{root:$root}')")
 case "$invalid" in
   *needs*word*) ;;
   *) fail "run did not reject missing arguments: $invalid" ;;
 esac
-ran=$(call_tool 22 run hello '{"word":"supplied"}')
+ran=$(call_tool 22 run hello "$(jq -nc --arg root "$marker" '{word:"supplied",root:$root}')")
 case "$ran" in
   *'pinned supplied original-input'*) ;;
   *) fail "pinned invocation lost its path, arguments, or original input: $ran" ;;
