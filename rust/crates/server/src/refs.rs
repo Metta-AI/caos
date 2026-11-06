@@ -491,7 +491,9 @@ mod tests {
 
         let missing = Value::Oid("1".repeat(40));
         assert_eq!(
-            set(repo.path(), REF, &missing, &Expected::Any).unwrap_err().status,
+            set(repo.path(), REF, &missing, &Expected::Any)
+                .unwrap_err()
+                .status,
             400
         );
     }
