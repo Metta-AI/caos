@@ -1647,7 +1647,6 @@ fn launch_resolved_tool(
         )?;
         return resume(cfg, state, turn);
     }
-    let (ws, wc) = materialize_source_tree(state, &commit)?;
     let relative = read_arg("tool-lookup")?;
     let image = arg("result");
     let site = CallSite::at(&turn.request, &call, &current.message_id);
