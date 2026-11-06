@@ -556,7 +556,7 @@ fn walk_inner(
     // ever followed once the whole request is over, by which time the handler
     // is finished too and gets skipped. The `then` stage would be invisible for
     // exactly as long as it was running, which for `run-tool test` is the whole
-    // summarising phase.
+    // summarizing phase.
     //
     // The LIVE view replaces the node with its handler, because only the
     // frontier is interesting. The completed view hangs the handler off it as a

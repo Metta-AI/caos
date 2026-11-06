@@ -501,7 +501,7 @@ def main():
             assert remote_head("topic") == first[0]
             assert push(second[0], old=first[0])["status"] == "complete"
             assert remote_head("topic") == second[0]
-            # Equal destination converges even after a lost acknowledgement.
+            # Equal destination converges even after a lost acknowledgment.
             assert push(second[0], old=first[0])["kind"] == "ref-converged"
             assert push(third[0], old=first[0])["status"] == "conflict"
             assert json.loads(push(first[0], old=second[0], expected=422))["code"] == "not-fast-forward"
