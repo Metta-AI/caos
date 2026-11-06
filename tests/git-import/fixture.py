@@ -269,7 +269,10 @@ def main():
             run("git", "init", "-q", str(consumer))
             run("git", "-C", str(consumer), "fetch", "-q", base, second[0])
             assert run("git", "-C", str(consumer), "rev-parse", "FETCH_HEAD") == second[0]
-            assert list((odb / "objects/pack").glob("*.pack"))
+            # The store is loose objects only (design/loose-object-store.md): the
+            # import published its objects loose, and left no pack behind.
+            assert not list((odb / "objects/pack").glob("*.pack"))
+            assert (odb / "objects" / second[0][:2] / second[0][2:]).is_file()
             before = len(observations)
             commands = git_commands.read_text()
             assert call(payload(second[0])) == {"commit": second[0]}
