@@ -5,7 +5,8 @@
 //! local working repo and exchanged with the server by negotiated push/fetch, so
 //! a large unchanged tree is almost free to "upload" and an edit ships only its
 //! delta. Compute is triggered over HTTP against the same server — its URL is
-//! always the `caos` remote's URL, never an env var.
+//! the `caos` remote's URL, never an env var, unless `--server=<url>` ahead of
+//! the command overrides it for that invocation.
 //!
 //! There is no `/cas` here — that's the worker's world. The commands: `run`
 //! (compute, with the result checked out to any host path, or a file result
