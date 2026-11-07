@@ -816,22 +816,6 @@ mod config_tests {
         }
     }
 
-    #[allow(dead_code)]
-    fn unused_placeholder() {
-        let given = args(&["hook"]);
-        let (config, _) = Config::parse(&given).unwrap();
-        assert_eq!(
-            config.step.as_deref(),
-            Some("--llm-step:@@=github:o/r?rev=abc")
-        );
-        assert_eq!(config.base.as_deref(), Some("github:o/c?rev=def"));
-        assert!(!config.agents_md);
-        let given = args(&["hook", "--agents-md"]);
-        let (config, rest) = Config::parse(&given).unwrap();
-        assert_eq!(rest, ["hook"]);
-        assert!(config.agents_md);
-    }
-
     /// `--base=<sha>` named a commit in a checkout, and nothing reads one now.
     #[test]
     fn a_base_that_is_not_a_locator_is_refused_with_the_replacement() {
