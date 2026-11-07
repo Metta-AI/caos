@@ -60,7 +60,7 @@ fn main() -> ExitCode {
 /// command: `caos-cli --server=caos://<ticket> watch <ticket>`. Only flags
 /// ahead of the command are global; a `--server` after it belongs to that
 /// command (`mcp`, `secrets-push` and `tui` take their own).
-fn take_global_flags(args: &[String]) -> Result<Vec<String>, String> {
+fn take_global_flags(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
     let mut rest = args.iter().skip(1);
     let mut server = None;
     let mut out = vec![args.first().cloned().unwrap_or_default()];
