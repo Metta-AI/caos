@@ -10,16 +10,17 @@ replay `caos tui` performs for a session it started itself
 Two commands make that work:
 
 ```text
-caos mcp hook     record one Claude Code hook payload (JSON on stdin)
-caos mcp serve    a stdio bridge to the server's tool server (POST /mcp)
+caos --server=<url> mcp hook     record one Claude Code hook payload (JSON on stdin)
+caos --server=<url> mcp serve    a stdio bridge to the server's tool server (POST /mcp)
 ```
 
 Both are told, by argument, everything they need. **Neither reads a checkout.** A
 process has no repository to be standing in, and a path (`--llm-step:@=std/llm-step`)
-is refused by name because it would name a file in one:
+is refused by name because it would name a file in one. The server is the
+client's GLOBAL flag, so it comes before `mcp`; a `--server` after `mcp` is
+refused with the form that works. The rest come after `mcp`:
 
 ```text
---server=<url>                the caos server
 --llm-step:@@=<git locator>   the step that runs the tools, pinned: git+…?rev=<40 hex>&dir=std/llm-step
 --base:@@=<git locator>       what a NEW session starts from (the hook; optional)
 --secret-readers=<key …>      the secret reader keys this process presents (else the checkout's git config)
