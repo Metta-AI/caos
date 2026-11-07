@@ -306,9 +306,14 @@ func settingsJSON(a args, locator string) []byte {
 	for _, extra := range sharedArgs(a) {
 		shellStep += " " + shellQuote(extra)
 	}
+	shellServer := ""
+	for _, global := range serverArgs(a) {
+		shellServer += shellQuote(global) + " "
+	}
 	walkStrings(settings, func(s string) string {
 		s = strings.ReplaceAll(s, `"${CAOS_BIN:-caos}"`, "caos")
 		s = strings.ReplaceAll(s, "${CAOS_BIN:-caos}", "caos")
+		s = strings.ReplaceAll(s, sharedServer+" ", shellServer)
 		return strings.ReplaceAll(s, sharedStep, shellStep)
 	})
 
