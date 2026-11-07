@@ -783,16 +783,43 @@ mod config_tests {
     }
 
     #[test]
-    fn the_arguments_name_the_server_the_step_and_the_base() {
+    fn the_arguments_name_the_step_and_the_base() {
         let given = args(&[
             "hook",
-            "--server=http://s",
             "--llm-step:@@=github:o/r?rev=abc",
             "--base:@@=github:o/c?rev=def",
         ]);
         let (config, rest) = Config::parse(&given).unwrap();
         assert_eq!(rest, ["hook"]);
-        assert_eq!(config.server.as_deref(), Some("http://s"));
+        assert_eq!(
+            config.step.as_deref(),
+            Some("--llm-step:@@=github:o/r?rev=abc")
+        );
+        assert_eq!(config.base.as_deref(), Some("github:o/c?rev=def"));
+        assert!(!config.agents_md);
+        let given = args(&["hook", "--agents-md"]);
+        let (config, rest) = Config::parse(&given).unwrap();
+        assert_eq!(rest, ["hook"]);
+        assert!(config.agents_md);
+    }
+
+    /// The server is the global flag, ahead of `mcp`; one after it is refused
+    /// with the form that works, rather than ignored.
+    #[test]
+    fn a_server_after_mcp_is_refused_with_the_global_form() {
+        for given in [
+            args(&["hook", "--server=http://s"]),
+            args(&["serve", "--server", "http://s"]),
+        ] {
+            let error = Config::parse(&given).unwrap_err();
+            assert!(error.contains("caos-cli --server=<url> mcp"), "{error}");
+        }
+    }
+
+    #[allow(dead_code)]
+    fn unused_placeholder() {
+        let given = args(&["hook"]);
+        let (config, _) = Config::parse(&given).unwrap();
         assert_eq!(
             config.step.as_deref(),
             Some("--llm-step:@@=github:o/r?rev=abc")
