@@ -1557,7 +1557,7 @@ fn remote_refs(
     let mut args = vec![
         "ls-remote".to_string(),
         "--refs".to_string(),
-        CAOS_REMOTE.to_string(),
+        t.remote().to_string(),
     ];
     args.extend(patterns);
     let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
