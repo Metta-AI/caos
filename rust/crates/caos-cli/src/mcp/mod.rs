@@ -14,7 +14,7 @@
 //! the ref is the whole record.
 //!
 //! NOTHING HERE READS A CHECKOUT. A process knows the server it talks to (from
-//! `--server=<url>`, or the environment), the step that runs tools
+//! the global `caos-cli --server=<url> mcp ...`), the step that runs tools
 //! (`--llm-step:@@=<locator>`) and, for a session's first prompt, where its
 //! content comes from (`--base:@@=<locator>`); the rest is a request to the
 //! server. A harness that wants uncommitted files in a session commits and
