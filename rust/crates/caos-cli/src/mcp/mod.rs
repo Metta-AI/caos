@@ -147,10 +147,10 @@ pub fn cli_mcp(args: &[String]) -> Result<(), String> {
 fn usage() -> String {
     format!(
         "usage:\n  \
-         caos mcp hook    (reads one Claude Code hook payload on stdin)\n  \
-         caos mcp serve   (workspace tool server; JSON-RPC on stdio)\n\n\
-         Both take the server (--server=<url>) and name the step that \
-         runs this session's tools:\n  \
+         caos --server=<url> mcp hook    (reads one Claude Code hook payload on stdin)\n  \
+         caos --server=<url> mcp serve   (workspace tool server; JSON-RPC on stdio)\n\n\
+         Both need the server, as the global --server=<url> before `mcp`, and name the \
+         step that runs this session's tools:\n  \
          {}\n\
          and the hook takes `--base:@@=<git locator>` for what a new session starts from, \
          and `--agents-md` to answer the prompt that creates it with the session's \
