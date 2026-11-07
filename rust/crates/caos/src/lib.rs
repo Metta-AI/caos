@@ -570,6 +570,35 @@ pub fn check_server_reachable(url: &str) -> Result<(), String> {
 /// caos <url>`). Push/fetch use it.
 pub const CAOS_REMOTE: &str = "caos";
 
+/// A server URL that replaces the `caos` remote for this whole process: what
+/// `caos-cli --server=<url> <command> ...` sets, before any transport exists.
+///
+/// Process-wide rather than threaded through each command, because the flag
+/// applies to every command and transports are opened in many places (the
+/// tui, its launcher, `secrets-push`), each by discovering the checkout. A
+/// transport reads it once, when it is opened ([`GitTransport::discover`]).
+static SERVER_OVERRIDE: OnceLock<String> = OnceLock::new();
+
+/// Make every transport this process opens talk to `url` instead of the
+/// checkout's `caos` remote. Git takes a URL wherever it takes a remote name,
+/// and every push, fetch and `ls-remote` names its refspecs explicitly, so the
+/// URL stands in for the remote with no configuration written to the repo.
+/// Set once; a second call is an error rather than a silent switch.
+pub fn set_server_override(url: &str) -> Result<(), String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("--server needs a URL".to_string());
+    }
+    SERVER_OVERRIDE
+        .set(url.to_string())
+        .map_err(|_| "the server is already set for this process".to_string())
+}
+
+/// The override [`set_server_override`] installed, if any.
+pub fn server_override() -> Option<&'static str> {
+    SERVER_OVERRIDE.get().map(String::as_str)
+}
+
 /// Transport over the server as a `caos` git remote, used by `caos-cli`. Objects
 /// are built in the local working repo (cheap, in-process via gix) and exchanged
 /// with the server by negotiated git push/fetch — so a large unchanged tree costs
@@ -589,6 +618,9 @@ pub struct GitTransport {
     /// Keeping it here prevents a transport from silently switching repos if
     /// the process working directory changes after discovery.
     work_dir: PathBuf,
+    /// What git is told to push to and fetch from: the `caos` remote's name,
+    /// or the URL of a [`set_server_override`] in force when this was opened.
+    remote: String,
 }
 
 impl GitTransport {
@@ -613,16 +645,24 @@ impl GitTransport {
             })?
             .canonicalize()
             .map_err(|e| format!("resolving the git working tree: {e}"))?;
+        let remote = server_override().unwrap_or(CAOS_REMOTE).to_string();
         Ok(Self {
             repo,
             git_dir,
             work_dir,
+            remote,
         })
     }
 
     /// The worktree this transport and its subprocess Git commands operate on.
     pub fn work_dir(&self) -> &Path {
         &self.work_dir
+    }
+
+    /// The remote argument for this transport's Git network commands: the
+    /// `caos` remote's name, or the `--server` URL that overrides it.
+    pub fn remote(&self) -> &str {
+        &self.remote
     }
 
     /// Verify that the configured CAOS server accepts connections.
@@ -633,11 +673,16 @@ impl GitTransport {
     /// low-level Git transport error into one concise diagnosis.
     pub fn ensure_server_reachable(&self) -> Result<(), String> {
         let url = self.server_url()?;
+        let overridden = self.remote != CAOS_REMOTE;
         check_server_reachable(&url).map_err(|error| {
-            format!(
-                "{error}\n\
-                 check that it is running and that the `{CAOS_REMOTE}` git remote points to the right URL"
-            )
+            if overridden {
+                format!("{error}\ncheck that it is running and that --server names the right URL")
+            } else {
+                format!(
+                    "{error}\n\
+                     check that it is running and that the `{CAOS_REMOTE}` git remote points to the right URL"
+                )
+            }
         })
     }
 
@@ -914,10 +959,14 @@ impl Transport for GitTransport {
         // The `caos` remote's URL *is* the server: the CLI already pushes/fetches
         // objects there, and /run lives at the same host. So a person configures
         // the server once (`git remote add caos <url>`) and never sets an env var.
+        // `--server=<url>` replaces it for one invocation.
+        if self.remote != CAOS_REMOTE {
+            return Ok(self.remote.clone());
+        }
         let remote = self.repo.find_remote(CAOS_REMOTE).map_err(|e| {
             format!(
                 "no `{CAOS_REMOTE}` git remote (add it with \
-                 `git remote add {CAOS_REMOTE} <server-url>`): {e}"
+                 `git remote add {CAOS_REMOTE} <server-url>`, or pass `--server=<url>`): {e}"
             )
         })?;
         let url = remote
@@ -1136,7 +1185,7 @@ impl GitTransport {
         // whatever actually defeated the retries, which is the only interesting
         // one (it cost a debugging session — the visible error said "reference
         // already exists" while the real failure was unknown).
-        Err(format!("pushing {hash} to {CAOS_REMOTE}: {last}"))
+        Err(format!("pushing {hash} to {}: {last}", self.remote()))
     }
 
     fn push_req_ref(&self, hash: &str) -> Result<(), String> {
@@ -1173,7 +1222,7 @@ impl GitTransport {
         // proceeding anyway` and the full closure back.
         let negotiate = self.is_commit_object(hash);
         let mut args: Vec<&str> = push_negotiation_args(negotiate);
-        args.extend(["push", "--porcelain", "--progress", CAOS_REMOTE, &refspec]);
+        args.extend(["push", "--porcelain", "--progress", self.remote(), &refspec]);
 
         let started = std::time::Instant::now();
         let outcome = self.git_capture_stderr(&args);
@@ -1396,10 +1445,10 @@ impl GitTransport {
             "fetch",
             "--quiet",
             "--no-write-fetch-head",
-            CAOS_REMOTE,
+            self.remote(),
             hash,
         ])
-        .map_err(|e| format!("fetching {hash} from {CAOS_REMOTE}: {e}"))
+        .map_err(|e| format!("fetching {hash} from {}: {e}", self.remote()))
     }
 
     /// Fetch object `hash` like [`Self::fetch_object`], but negotiate with `tip`
@@ -1424,10 +1473,10 @@ impl GitTransport {
             "--no-write-fetch-head",
             "--negotiation-tip",
             tip,
-            CAOS_REMOTE,
+            self.remote(),
             hash,
         ])
-        .map_err(|e| format!("fetching {hash} from {CAOS_REMOTE}: {e}"))
+        .map_err(|e| format!("fetching {hash} from {}: {e}", self.remote()))
     }
 }
 

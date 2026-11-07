@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use caos::{
     compute_client_request_with_secrets, curry_client_object, eval_cli_image_arg,
-    run_client_request_with_secrets, GitTransport, Secrets, Transport, CAOS_REMOTE,
+    run_client_request_with_secrets, GitTransport, Secrets, Transport,
 };
 use session_protocol::v3::apply::{apply, client_signature, mint, Transition};
 use session_protocol::v3::legacy;
@@ -285,7 +285,7 @@ fn signature(username: &str) -> Result<Signature, String> {
 }
 
 fn open_store(t: &GitTransport) -> Result<GitStore, String> {
-    GitStore::open(t.work_dir(), Some(CAOS_REMOTE))
+    GitStore::open(t.work_dir(), Some(t.remote()))
 }
 
 /// The session's head as the server holds it, with its objects local.
@@ -1557,7 +1557,7 @@ fn remote_refs(
     let mut args = vec![
         "ls-remote".to_string(),
         "--refs".to_string(),
-        CAOS_REMOTE.to_string(),
+        t.remote().to_string(),
     ];
     args.extend(patterns);
     let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
@@ -1713,7 +1713,7 @@ fn fetch_head_batch(t: &GitTransport, refspecs: &[(String, String)]) {
         "--no-tags".to_string(),
         "--no-write-fetch-head".to_string(),
         "--filter=blob:none".to_string(),
-        CAOS_REMOTE.to_string(),
+        t.remote().to_string(),
     ];
     args.extend(refspecs.iter().map(|(_, refspec)| refspec.clone()));
     let args = args.iter().map(String::as_str).collect::<Vec<_>>();
@@ -2769,7 +2769,7 @@ mod tests {
         git(&repo, &["config", "user.email", "alice@example.com"]);
         git(
             &repo,
-            &["remote", "add", CAOS_REMOTE, remote.to_str().unwrap()],
+            &["remote", "add", caos::CAOS_REMOTE, remote.to_str().unwrap()],
         );
         git(
             &repo,
@@ -3462,7 +3462,12 @@ mod tests {
         assert_eq!(
             git(
                 transport.work_dir(),
-                &["ls-remote", "--refs", CAOS_REMOTE, &session_ref_prefix]
+                &[
+                    "ls-remote",
+                    "--refs",
+                    caos::CAOS_REMOTE,
+                    &session_ref_prefix
+                ]
             )
             .lines()
             .count(),
