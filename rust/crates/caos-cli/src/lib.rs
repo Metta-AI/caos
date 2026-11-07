@@ -3472,7 +3472,7 @@ mod tests {
         assert_eq!(
             git(
                 transport.work_dir(),
-                &["ls-remote", "--refs", CAOS_REMOTE, &session_ref_prefix]
+                &["ls-remote", "--refs", caos::CAOS_REMOTE, &session_ref_prefix]
             )
             .lines()
             .count(),
