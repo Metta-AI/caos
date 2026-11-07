@@ -13,8 +13,8 @@
 //! CLI surface plus the privileged runner.
 //!
 //! Subcommands: `get-hash`, `get`, `put`, `put-commit`, `hash`, `forward`, `map-then`,
-//! `run-then`, `run-request-then`, `sub-run`, `prepare-request`, `curry`, `next`
-//! and `runner`. (Image import and ref resolution are user-facing only — see
+//! `run-then`, `run-request-then`, `sub-run`, `ref-get`, `ref-set`,
+//! `prepare-request`, `curry`, `next` and `runner`. (Image import and ref resolution are user-facing only — see
 //! `caos-cli`.)
 
 use std::process::ExitCode;
@@ -31,6 +31,18 @@ fn main() -> ExitCode {
     if args.get(1).map(String::as_str) == Some("next") {
         return match caos::runner::next_client(&args[2..]) {
             Ok(status) => ExitCode::from(status),
+            Err(err) => {
+                eprintln!("{}: {err}", prog_name(&args));
+                ExitCode::FAILURE
+            }
+        };
+    }
+    // Neither is `ref-get`'s "the ref does not exist": nothing was written,
+    // and nothing broke.
+    if args.get(1).map(String::as_str) == Some("ref-get") {
+        return match http().and_then(|t| caos::caos_ref_get(&t, &args[2..])) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::from(caos::REF_ABSENT_EXIT),
             Err(err) => {
                 eprintln!("{}: {err}", prog_name(&args));
                 ExitCode::FAILURE
@@ -130,6 +142,11 @@ fn run(args: &[String]) -> Result<(), String> {
             (Some(name), Some(arg_tree), None) => caos::caos_trace_child(&http()?, name, arg_tree),
             _ => Err(usage(args)),
         },
+        // `ref-set <ref> (--new[:@]=<v> | --delete) (--expected[:@]=<v> |
+        // --force)` — compare-and-swap a named mutable ref under refs/heads/
+        // (design/refs.md). `ref-get` is dispatched in `main`, for its exit
+        // status.
+        Some("ref-set") => caos::caos_ref_set(&http()?, &args[2..]),
         // Start an already-stored ArgTree without waiting, preserving this
         // job's server-side run stack and secret store.
         Some("sub-run") => match &args[2..] {
@@ -182,6 +199,8 @@ fn usage(args: &[String]) -> String {
          {prog} eval-path-then <in-cas-path> --eval=<path> [--then:<type>=<image>] [--catch]\n  \
          {prog} run-request-then <arg-tree-hash|cas-path> [--then:<type>=<image>] [--catch]\n  \
          {prog} sub-run <arg-tree-hash>\n  \
+         {prog} ref-get <ref> <cas-path>   (exit 2: no such ref)\n  \
+         {prog} ref-set <ref> (--new=<hash> | --new:@=<cas-path> | --delete)\n      (--expected=<hash|absent> | --expected:@=<cas-path> | --force)\n  \
          {prog} trace-child <name> <arg-tree-hash>\n  \
          {prog} prepare-request --base:<type>=<image-or-arg tree> [--name=value | --name:@=path ...]\n  \
          {prog} resolve-image <hex hash | docker://<ref>>\n  \
