@@ -225,9 +225,12 @@ trunk's head at `00-base`, adopts a branch GitHub rewrote with the same
 content (merging a stacked PR rebases the branches above it) under the layer's
 local edits, merges in a branch someone else pushed to, restacks each layer
 onto the one below, and reports a layer whose PR was merged (removing it with
-`remove-merged=true`). It pushes nothing: run `stack-publish` after it, and
-every push is a fast-forward. A merge conflict stops it at that layer and names
-the `merge` call that gives you a ledger to resolve.
+`remove-merged=true`). It fetches every remote commit it needs itself, the
+trunk's new head and commits someone else pushed to a layer's branch, so do
+not `import_source` the trunk or a branch before running it: start with
+`stack-sync`. It pushes nothing: run `stack-publish` after it, and every push
+is a fast-forward. A merge conflict stops it at that layer and names the
+`merge` call that gives you a ledger to resolve.
 
 ```text
 run_tool(path="caos-std/stack-sync", arguments={"stack": "sources/repo"})
