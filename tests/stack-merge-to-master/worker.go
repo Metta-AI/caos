@@ -8,7 +8,7 @@
 // the repository, saying nothing was merged. The refusals (no trunk, an up-to
 // that names no layer or an undescribed one, a stack with no descriptions, no
 // such directory, an unknown argument) must come before that. The selection,
-// the commit title and the CI verdict have unit tests in llm-step.
+// the commit title and the CI verdict are tested by tests/stack-merge-stages.
 package main
 
 import (
@@ -225,7 +225,7 @@ func main() {
 			shell("tu_l2", "cp -a mystack/01-feature mystack/02-tests && echo tests > mystack/02-tests/tests.txt && cp -a mystack/02-tests mystack/99-dirty", "mystack"),
 			write("tu_d1", "mystack/01-feature.pr.md", "Add the feature ("+salt+")\n"),
 			write("tu_d2", "mystack/02-tests.pr.md", "Test the feature ("+salt+")\n"))
-		good := map[string]any{"stack": "mystack", "repository": invalid, "trunk": "main"}
+		good := map[string]any{"root": "mystack", "repository": invalid, "trunk": "main"}
 		with := func(extra map[string]any) map[string]any {
 			m := map[string]any{}
 			for k, v := range good {
@@ -239,11 +239,11 @@ func main() {
 		respond(3,
 			merge("tu_merge", good),
 			merge("tu_upto", with(map[string]any{"up-to": "01", "dry-run": "true"})),
-			merge("tu_notrunk", map[string]any{"stack": "mystack", "repository": invalid}),
+			merge("tu_notrunk", map[string]any{"root": "mystack", "repository": invalid}),
 			merge("tu_nolayer", with(map[string]any{"up-to": "03-docs"})),
 			merge("tu_dirty", with(map[string]any{"up-to": "99-dirty"})),
-			merge("tu_bare", map[string]any{"stack": "bare", "repository": invalid, "trunk": "main"}),
-			merge("tu_nowhere", map[string]any{"stack": "nowhere", "repository": invalid, "trunk": "main"}),
+			merge("tu_bare", map[string]any{"root": "bare", "repository": invalid, "trunk": "main"}),
+			merge("tu_nowhere", map[string]any{"root": "nowhere", "repository": invalid, "trunk": "main"}),
 			merge("tu_badarg", with(map[string]any{"squash": "true"})),
 			ci("tu_ci", map[string]any{"root": "mystack", "repository": invalid, "branch": "02-tests"}),
 			ci("tu_cinorepo", map[string]any{"root": ".", "branch": "feature"}),
@@ -290,8 +290,8 @@ func main() {
 			{"tu_nolayer", []string{`up-to "03-docs" names no layer`}},
 			{"tu_dirty", []string{"up-to 99-dirty", "no .pr.md"}},
 			{"tu_bare", []string{"no layer has a .pr.md description"}},
-			{"tu_nowhere", []string{"stack nowhere"}},
-			{"tu_badarg", []string{"invalid stack-merge-to-master arguments", "squash"}},
+			{"tu_nowhere", []string{"nothing is at the root path"}},
+			{"tu_badarg", []string{"takes no \"squash\" argument"}},
 			{"tu_cinorepo", []string{"pass repository"}},
 			{"tu_cibad", []string{"branch must be"}},
 		} {

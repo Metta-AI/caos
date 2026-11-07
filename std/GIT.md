@@ -97,7 +97,7 @@ copy(root="sources/<repo>", from="00-base", to="99-dirty")
 move(root="sources/<repo>", from="99-dirty", to="01-<name>")
 write(root="sources/<repo>/01-<name>.pr.md",
       content="<PR title>\n\n<PR body>\n")
-run_tool(path="caos-std/stack-publish", arguments={"stack": "sources/<repo>"})
+run_tool(path="caos-std/stack-publish", arguments={"root": "sources/<repo>"})
 ```
 
 The last call pushes `01-<name>` to the branch `<name>` (give `branch-prefix`
@@ -228,8 +228,8 @@ every push is a fast-forward. A merge conflict stops it at that layer and names
 the `merge` call that gives you a ledger to resolve.
 
 ```text
-run_tool(path="caos-std/stack-sync", arguments={"stack": "sources/repo"})
-run_tool(path="caos-std/stack-publish", arguments={"stack": "sources/repo"})
+run_tool(path="caos-std/stack-sync", arguments={"root": "sources/repo"})
+run_tool(path="caos-std/stack-publish", arguments={"root": "sources/repo"})
 ```
 
 By hand: import the new upstream tip at a fresh path, put it at `00-base`, and
@@ -309,7 +309,7 @@ never re-publish a branch just to clean its commits.
 ### One call: `caos-std/stack-publish`
 
 ```text
-run_tool(path="caos-std/stack-publish", arguments={"stack": "sources/<repo>"})
+run_tool(path="caos-std/stack-publish", arguments={"root": "sources/<repo>"})
 ```
 
 For every layer that has a `.pr.md` beside it, earliest first, it pushes the
@@ -333,15 +333,18 @@ stack 367: unchanged
   `trunk` when the base was imported by commit hash, or to publish elsewhere.
   A repository that was renamed or moved to another owner since the import
   is followed: the GitHub calls use the name GitHub gives it now.
-- `dry-run=true` reports the layers, branches, bases and titles without
-  observing or changing anything. Use it first on a new stack.
+- `dry-run=true` reports the layers, branches, bases and titles, and each
+  branch's current head, without changing anything. Use it first on a new
+  stack.
 - The `.pr.md` is the description's home. A PR whose title or body differs is
   updated to match, and the result says so; edit the file, not GitHub.
 - Republishing after you merged up is a fast-forward and needs no `force`. A
   non-fast-forward push is refused unless `force=true`, and means a rebuilt
-  layer or someone else's push to the branch: look before forcing.
-- Each push is leased on the remote head observed at the start, like
-  `publish_source`, and rejects a commit whose tree contains paths matched by
+  layer or someone else's push to the branch: look before forcing. With
+  `force`, pass `expected`: one line `<branch> <head>` per layer, as the dry
+  run prints them, so a branch that moved after you looked is not overwritten.
+- Without `force`, each push is leased on the remote head read when the call
+  runs, like `publish-source`, and rejects a commit whose tree contains paths matched by
   its own `.gitignore` rules, **including tracked files** (`allow-ignored=true`
   to publish them anyway). Resolve merge conflicts and clear `.caos/conflicts`
   first. Test and inspect the intended PR diff (`diff`) before publishing.
@@ -384,11 +387,11 @@ Merge a reviewed stack with `caos-std/stack-merge-to-master`, never by hand
 through `caos-std/github` or by asking someone to press the button:
 
 ```text
-run_tool(path="caos-std/stack-sync", arguments={"stack": "sources/<repo>"})
-run_tool(path="caos-std/stack-publish", arguments={"stack": "sources/<repo>"})
-run_tool(path="caos-std/stack-merge-to-master", arguments={"stack": "sources/<repo>", "dry-run": "true"})
-run_tool(path="caos-std/stack-merge-to-master", arguments={"stack": "sources/<repo>"})
-run_tool(path="caos-std/stack-sync", arguments={"stack": "sources/<repo>", "remove-merged": "true"})
+run_tool(path="caos-std/stack-sync", arguments={"root": "sources/<repo>"})
+run_tool(path="caos-std/stack-publish", arguments={"root": "sources/<repo>"})
+run_tool(path="caos-std/stack-merge-to-master", arguments={"root": "sources/<repo>", "dry-run": "true"})
+run_tool(path="caos-std/stack-merge-to-master", arguments={"root": "sources/<repo>"})
+run_tool(path="caos-std/stack-sync", arguments={"root": "sources/<repo>", "remove-merged": "true"})
 ```
 
 - It merges the described layers' PRs into the trunk (the branch `00-base`

@@ -1,0 +1,4 @@
+# tests/stack-merge-stages, as an ENTRY: evaluating this directory yields the
+# test's ARG TREE, which dev/run-test then runs. A staged WORKER test of
+# std/stack-merge-to-master's verdict and merge stages, with made-up answers.
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --merge:@=DEEP-DEPS/merge

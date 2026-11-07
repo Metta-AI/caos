@@ -1,0 +1,4 @@
+# tests/stack-sync-merge, as an ENTRY: evaluating this directory yields the
+# test's ARG TREE, which dev/run-test then runs. A staged WORKER test of
+# std/stack-sync's `sync` stage over real commits; it reads no remote.
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --stack-sync:@=DEEP-DEPS/stack-sync
