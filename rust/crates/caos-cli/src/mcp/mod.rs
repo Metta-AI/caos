@@ -85,7 +85,10 @@ pub struct Config {
 
 impl Config {
     fn parse(args: &[String]) -> Result<(Self, Vec<&str>), String> {
-        let mut config = Config::default();
+        let mut config = Config {
+            server: caos::server_override().map(String::from),
+            ..Config::default()
+        };
         let mut turn = TurnOptions::default();
         let mut rest = Vec::new();
         for argument in args {
