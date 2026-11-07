@@ -4043,6 +4043,77 @@ pub fn caos_ref_set(t: &dyn Transport, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The longest `ref-then --timeout` the server accepts (its `refs::MAX_WAIT_SECS`).
+pub const REF_MAX_WAIT_SECS: u64 = 24 * 60 * 60;
+
+/// `ref-then <ref> [--expected=<hash|absent> | --expected:@=<cas-path>]
+/// [--timeout=<secs>] [--then:<type>=<image>] [--catch]` — record a
+/// continuation that waits for `<ref>` to hold something other than
+/// `--expected` (default `absent`: wait for it to be set), then delivers the
+/// new value. `--expected:@=` names the commit by the CAS path it is recorded
+/// at, like `ref-set`'s: a `ref-get` result, or the `--result` an earlier
+/// `ref-then` delivered, to wait for the change after that one.
+///
+/// THE WAITING IS THE SERVER'S. Like every continuation this is the worker's
+/// final act: it exits, its runner slot is free, and the server's promise
+/// interpreter blocks a request thread on the ref instead. A worker that
+/// polled with `ref-get` in a loop would hold its slot while the writer it is
+/// waiting for may be queued for one — the hold-and-wait design/map-then.md
+/// rules out.
+///
+/// The new commit reaches `--then` as `--result`, a commit entry exactly like
+/// what `ref-get` records, so the callback reads `/cas/args/result` as it
+/// would any commit-valued arg. A ref DELETED while it was waited on (only
+/// possible when `--expected` names a commit) arrives instead as a bare
+/// `--absent` flag and no `--result`. With no `--then`, the commit is this
+/// request's result (an empty blob for a deletion). If `--timeout` (default
+/// 600s, at most a day) passes first the wait fails, and `--catch` delivers
+/// that failure to `--then` as `--error` instead. A request that waited on a
+/// ref is never cached: its answer depends on when it ran.
+pub fn caos_ref_then(t: &dyn Transport, name: &str, kvs: &[String]) -> Result<(), String> {
+    check_ref_name("ref-then", name)?;
+    // The continuation records `expected` verbatim, as a hash or `absent`, so
+    // a `--expected:@=<cas path>` is resolved to its commit's hash here.
+    let mut resolved = Vec::with_capacity(kvs.len());
+    for kv in kvs {
+        match ref_flag("ref-then", "expected", true, kv).transpose()? {
+            Some(value) => resolved.push(format!("--expected={value}")),
+            None => resolved.push(kv.clone()),
+        }
+    }
+    let kvs = &resolved[..];
+    for kv in kvs {
+        if let Some(value) = kv.strip_prefix("--timeout=") {
+            match value.parse::<u64>() {
+                Ok(seconds) if (1..=REF_MAX_WAIT_SECS).contains(&seconds) => {}
+                _ => {
+                    return Err(format!(
+                        "`ref-then --timeout` wants whole seconds from 1 to {REF_MAX_WAIT_SECS}, got {value:?}"
+                    ))
+                }
+            }
+        }
+    }
+    record_continuation(
+        t,
+        "ref-then",
+        ContinuationSubject::Ref(name),
+        kvs,
+        &["then"],
+        &["expected", "timeout"],
+        &["catch"],
+        |given| {
+            if given.contains(&"catch") && !given.contains(&"then") {
+                return Err(
+                    "`ref-then --catch` needs --then: the error has to be delivered somewhere"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        },
+    )
+}
+
 /// `trace-child <name> <arg-tree>` — record, under THIS job's trace record, that
 /// it started `arg-tree` under `name`.
 ///
@@ -4081,6 +4152,8 @@ pub fn caos_trace_child(t: &dyn Transport, name: &str, arg_tree: &str) -> Result
 enum ContinuationSubject<'a> {
     Input(&'a str),
     Request(&'a str),
+    /// The name of a ref to wait on (`ref-then`), recorded as a blob.
+    Ref(&'a str),
 }
 
 /// Shared body of [`caos_map_then`] / [`caos_run_then`] / [`caos_eval_then`] /
@@ -4161,6 +4234,12 @@ fn record_continuation(
                 oid,
             }
         }
+        // `ref` is the NAME of the ref to wait on: a string, not an object.
+        ContinuationSubject::Ref(name) => Entry {
+            mode: EntryKind::Blob.into(),
+            filename: b"ref".to_vec().into(),
+            oid: post_object(t, "blob", name.as_bytes())?,
+        },
     };
     let mut entries = vec![subject];
 

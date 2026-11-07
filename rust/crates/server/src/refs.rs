@@ -1,5 +1,5 @@
-//! Named, mutable refs that a worker reads and moves: `GET /ref` and
-//! `POST /ref` (design/refs.md).
+//! Named, mutable refs that a worker reads and moves: `GET /ref`, `POST /ref`,
+//! and the wait behind `caos ref-then` (design/refs.md).
 //!
 //! Everything else in the store is addressed by content. These are the one
 //! deliberate exception a worker is offered, for state that has to outlive a
@@ -19,10 +19,17 @@
 //! the value it expects to replace (`absent` for create-only), and git checks
 //! that under the ref's lock. A stale expectation is a 409 naming the value
 //! the ref actually has, so a caller that lost a race knows what it lost to.
+//!
+//! A WAIT HOLDS A SERVER THREAD, NOT A RUNNER SLOT. `ref-then` is a
+//! continuation: the worker records it and exits, and the server's promise
+//! interpreter blocks here until the ref moves away from the value the worker
+//! saw. A write through `POST /ref` wakes waiters at once; a write that went
+//! round this module (a `git push` to the same repository) is noticed by the
+//! once-a-second recheck.
 
 use std::process::Command;
 use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::{Config, HttpError};
 
@@ -36,6 +43,16 @@ pub(crate) const ABSENT: &str = "absent";
 
 /// Git's spelling of "no old value" on an `update-ref` command line.
 const ZEROS: &str = "0000000000000000000000000000000000000000";
+
+/// The longest a `ref-then` may wait. A day: long enough for any human-paced
+/// handshake, short enough that a forgotten waiter does not hold a server
+/// thread for ever.
+pub(crate) const MAX_WAIT_SECS: u64 = 24 * 60 * 60;
+
+/// How often a waiter rereads the ref when nothing has woken it. Only a write
+/// that bypassed [`set`] needs this; one that came through it wakes waiters
+/// immediately.
+const RECHECK: Duration = Duration::from_secs(1);
 
 /// Bumped on every write through [`set`], so a waiter can sleep until
 /// something has changed rather than rereading on a timer.
@@ -267,6 +284,40 @@ fn notify() {
     CHANGED.notify_all();
 }
 
+/// Block until `name` holds something other than `from`, and return what it
+/// holds; fail once `timeout` has passed with it unchanged.
+///
+/// The generation is taken BEFORE each read, so a write landing between the
+/// read and the sleep moves it and the sleep returns at once: there is no
+/// window in which a change can be missed until the next recheck.
+pub(crate) fn wait_for_change(
+    git_dir: &str,
+    name: &str,
+    from: &Value,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let seen = *GENERATION.lock().unwrap_or_else(|e| e.into_inner());
+        let now = read(git_dir, name).map_err(|e| e.message().to_string())?;
+        if now != *from {
+            return Ok(now);
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(format!(
+                "ref {name} was still {} after {}s",
+                from.text(),
+                timeout.as_secs()
+            ));
+        }
+        let guard = GENERATION.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = CHANGED
+            .wait_timeout_while(guard, left.min(RECHECK), |generation| *generation == seen)
+            .unwrap_or_else(|e| e.into_inner());
+    }
+}
+
 /// `GET /ref?name=<ref>` — the ref's value, `<oid>` or `absent`, and a newline.
 pub(crate) fn get_endpoint(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
     let name = crate::compute::query_param(query, "name")
@@ -462,5 +513,42 @@ mod tests {
         assert!(Value::parse(&"0".repeat(40)).is_err());
         assert!(Value::parse(&"A".repeat(40)).is_err());
         assert!(Value::parse("abc").is_err());
+    }
+
+    #[test]
+    fn a_wait_returns_when_a_write_lands_and_times_out_when_none_does() {
+        let repo = Repo::new("wait");
+        let a = repo.commit("a");
+
+        let timed_out =
+            wait_for_change(repo.path(), REF, &Value::Absent, Duration::from_millis(200))
+                .unwrap_err();
+        assert!(timed_out.contains("was still absent"), "{timed_out}");
+
+        let started = Instant::now();
+        let path = repo.path().to_string();
+        let writer = {
+            let a = a.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                set(&path, REF, &a, &Expected::Is(Value::Absent)).unwrap();
+            })
+        };
+        let seen =
+            wait_for_change(repo.path(), REF, &Value::Absent, Duration::from_secs(30)).unwrap();
+        writer.join().unwrap();
+        assert_eq!(seen, a);
+        // Woken by the write, not by the once-a-second recheck.
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "{:?}",
+            started.elapsed()
+        );
+
+        // Already different: no wait at all.
+        assert_eq!(
+            wait_for_change(repo.path(), REF, &Value::Absent, Duration::from_secs(30)).unwrap(),
+            a
+        );
     }
 }

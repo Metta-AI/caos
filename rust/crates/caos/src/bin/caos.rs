@@ -13,7 +13,7 @@
 //! CLI surface plus the privileged runner.
 //!
 //! Subcommands: `get-hash`, `get`, `put`, `put-commit`, `hash`, `forward`, `map-then`,
-//! `run-then`, `run-request-then`, `sub-run`, `ref-get`, `ref-set`,
+//! `run-then`, `run-request-then`, `sub-run`, `ref-get`, `ref-set`, `ref-then`,
 //! `prepare-request`, `curry`, `next` and `runner`. (Image import and ref resolution are user-facing only — see
 //! `caos-cli`.)
 
@@ -147,6 +147,13 @@ fn run(args: &[String]) -> Result<(), String> {
         // (design/refs.md). `ref-get` is dispatched in `main`, for its exit
         // status.
         Some("ref-set") => caos::caos_ref_set(&http()?, &args[2..]),
+        // `ref-then <ref> [--expected[:@]=<v>] [--timeout=<secs>]
+        // [--then:<type>=<image>] [--catch]` — a continuation: the server waits
+        // for the ref to change after this worker exits, holding no slot.
+        Some("ref-then") => match &args[2..] {
+            [name, kvs @ ..] => caos::caos_ref_then(&http()?, name, kvs),
+            _ => Err(usage(args)),
+        },
         // Start an already-stored ArgTree without waiting, preserving this
         // job's server-side run stack and secret store.
         Some("sub-run") => match &args[2..] {
@@ -201,6 +208,7 @@ fn usage(args: &[String]) -> String {
          {prog} sub-run <arg-tree-hash>\n  \
          {prog} ref-get <ref> <cas-path>   (exit 2: no such ref)\n  \
          {prog} ref-set <ref> (--new=<hash> | --new:@=<cas-path> | --delete)\n      (--expected=<hash|absent> | --expected:@=<cas-path> | --force)\n  \
+         {prog} ref-then <ref> [--expected=<hash|absent> | --expected:@=<cas-path>]\n      [--timeout=<secs>] [--then:<type>=<image>] [--catch]\n  \
          {prog} trace-child <name> <arg-tree-hash>\n  \
          {prog} prepare-request --base:<type>=<image-or-arg tree> [--name=value | --name:@=path ...]\n  \
          {prog} resolve-image <hex hash | docker://<ref>>\n  \

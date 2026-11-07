@@ -1,4 +1,4 @@
-# Named refs for workers: `ref-get`, `ref-set`
+# Named refs for workers: `ref-get`, `ref-set`, `ref-then`
 
 Everything a worker handles is addressed by content, with one deliberate
 exception: a **named, mutable ref**. Some state has to outlive a request
@@ -55,6 +55,50 @@ caos ref-set <ref> (--new=<hash> | --new:@=<cas-path> | --delete)
 - **Reading a ref is not a pure function of the ArgTree.** A worker that reads
   one and is then answered from the cache sees the old value. A caller that
   needs a fresh read makes its request unique (std/actor's `request-id`).
+
+## Waiting: `ref-then`
+
+```text
+caos ref-then <ref> [--expected=<hash|absent> | --expected:@=<cas-path>]
+              [--timeout=<secs>] [--then:<type>=<image>] [--catch]
+```
+
+A worker that needs to wait for another job to move a ref must not poll for
+it. A container looping on `ref-get` holds its runner slot while the writer
+it is waiting for may be queued for one: the hold-and-wait that
+`design/map-then.md`'s deadlock argument rules out. So waiting is a
+**continuation**, like `run-request-then`:
+
+- The worker records `ref-then` as its final act and exits. Its slot is free.
+- The server's promise interpreter blocks a request thread until the ref holds
+  something other than `--expected` (default `absent`, so by default it waits
+  for the ref to be set), then runs `--then` with `--result`: the new commit,
+  as a commit entry exactly like what `ref-get` records. The callback reads
+  `/cas/args/result` like any commit-valued arg, and can wait for the change
+  after that one with `--expected:@=/cas/args/result`. With no `--then`, the
+  commit is the request's result.
+- A ref **deleted** while it was waited on, which can only happen when
+  `--expected` names a commit, reaches `--then` as a bare `--absent` flag and
+  no `--result`. With no `--then`, the request's result is then an empty blob.
+- `--timeout` bounds the wait: 600s by default, a day at most. A timeout fails
+  the wait, and `--catch` hands that failure to `--then` as `--error` instead,
+  so the callback can report what it was waiting for.
+- **A request that waited on a ref is never cached.** Its answer depends on
+  when it ran, not on its ArgTree. It uses the same flag a caught failure
+  does.
+
+A write through `ref-set` wakes waiters at once. One that went round it (a git
+push to the server) is noticed by a once-a-second recheck.
+
+An in-flight wait lives on a server thread, as every continuation's
+resolution does, so a server restart drops it along with the rest of the
+request. `ref-then` adds no durability problem that `run-request-then` does
+not already have.
+
+`tests/sub-run` uses it to prove that detached work outlives its caller with
+a handshake rather than a fixed sleep: the test sets a ref only after the
+caller has exited, the detached job waits for it with `ref-then` and answers
+on a second ref, and the test waits for that with `ref-then` in turn.
 
 ## Server
 

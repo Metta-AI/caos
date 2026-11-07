@@ -66,6 +66,9 @@ const REDIS_TIMEOUT: Duration = Duration::from_secs(5);
 /// resolve rather than a final value (the hash names the continuation tree).
 const PROMISE_KIND: &str = "promise";
 
+/// How long a `ref-then` waits when it names no `--timeout`.
+const REF_WAIT_DEFAULT_SECS: u64 = 600;
+
 /// Marker entry naming a curry node — a tree pairing a `base` image ref with an
 /// `args` subtree of bound arguments (mirrors the client's `CURRY_MARKER`).
 /// Promise resolution unwraps these server-side so `map`/`then` can be
@@ -1445,6 +1448,9 @@ fn resolve_promise(
     let mut request: Option<String> = None;
     let (mut map, mut run, mut then) = (None, None, None);
     let mut eval = None;
+    // `ref-then`: the ref to wait on, the value it is waiting to leave, and
+    // how long it may wait (design/refs.md).
+    let (mut ref_name, mut ref_expected, mut ref_timeout) = (None, None, None);
     let mut catch = false;
     let mut max_parallel: Option<usize> = None;
     for entry in fetch_tree(config, cont)
@@ -1465,6 +1471,11 @@ fn resolve_promise(
             // The PATH to evaluate (a blob, not an image): the middle step walks
             // `.caos-expr` from `in`'s root down to it. See `ServerEvalHost`.
             "eval" => eval = Some(blob_string(config, &entry.oid.to_string())?),
+            // A ref NAME, the value it is waiting to leave, and a timeout in
+            // seconds — all strings, recorded verbatim by `caos ref-then`.
+            "ref" => ref_name = Some(blob_string(config, &entry.oid.to_string())?),
+            "expected" => ref_expected = Some(blob_string(config, &entry.oid.to_string())?),
+            "timeout" => ref_timeout = Some(blob_string(config, &entry.oid.to_string())?),
             // Presence is the whole signal; the content is unread.
             "catch" => catch = true,
             // How many map children may be IN FLIGHT at once. Absent means all
@@ -1499,9 +1510,16 @@ fn resolve_promise(
         run.is_some(),
         request.is_some(),
         eval.is_some(),
+        ref_name.is_some(),
         then.is_some(),
         catch,
     )?;
+    if (ref_expected.is_some() || ref_timeout.is_some()) && ref_name.is_none() {
+        return Err(HttpError::new(
+            500,
+            format!("continuation {cont} has 'expected' or 'timeout' without 'ref'"),
+        ));
+    }
 
     // The middle step, if any: `map` fans out over `in`'s children and yields a
     // `children` tree; `run` builds one request from its image + `in`; `request`
@@ -1655,20 +1673,74 @@ fn resolve_promise(
                 )
             });
         Some(continuation_result(config, cont, evaluated, catch)?)
+    } else if let Some(name) = &ref_name {
+        // Wait, on THIS request thread, for the ref to leave the value the
+        // worker saw. The worker has exited, so no runner slot is held while
+        // the writer it is waiting for runs. The new commit travels as
+        // `result`, a gitlink entry like any commit result; a deletion as a
+        // bare `absent` marker. A timeout is a failure `catch` can deliver.
+        crate::refs::validate_name(name)?;
+        let from =
+            crate::refs::Value::parse(ref_expected.as_deref().unwrap_or(crate::refs::ABSENT))
+                .map_err(|e| HttpError::new(400, format!("continuation {cont}: expected: {e}")))?;
+        let seconds = match ref_timeout.as_deref() {
+            None => REF_WAIT_DEFAULT_SECS,
+            Some(text) => match text.parse::<u64>() {
+                Ok(n) if (1..=crate::refs::MAX_WAIT_SECS).contains(&n) => n,
+                _ => {
+                    return Err(HttpError::new(
+                        400,
+                        format!(
+                            "continuation {cont}: timeout must be whole seconds from 1 to {}, got {text:?}",
+                            crate::refs::MAX_WAIT_SECS
+                        ),
+                    ))
+                }
+            },
+        };
+        let waited = crate::refs::wait_for_change(
+            &config.git_dir,
+            name,
+            &from,
+            Duration::from_secs(seconds),
+        )
+        .map_err(|e| HttpError::new(500, e));
+        match waited {
+            Ok(crate::refs::Value::Absent) => {
+                // Presence is the whole signal, as for `catch`. Without a
+                // `then` the empty blob is the request's result.
+                let oid = store_git_blob(config, b"")
+                    .map_err(|e| HttpError::new(500, format!("storing absent marker: {e}")))?;
+                Some((
+                    named_entry("absent", gix::objs::tree::EntryKind::Blob.into(), oid),
+                    format!("blob {oid}"),
+                    false,
+                ))
+            }
+            waited => {
+                let waited = waited.map(|value| format!("commit {}", value.text()));
+                Some(continuation_result(config, cont, waited, catch)?)
+            }
+        }
     } else {
         None
     };
 
-    let caught = mid.as_ref().is_some_and(|(_, _, caught)| *caught);
+    // A REF WAIT IS NEVER CACHED, caught or not: what it answers depends on
+    // when it ran, not on its ArgTree, so a memoized answer would hand the
+    // next caller a value the ref may no longer hold — and skip the wait. The
+    // same flag a caught failure sets keeps it out of the cache.
+    let caught = mid.as_ref().is_some_and(|(_, _, caught)| *caught) || ref_name.is_some();
 
     // The promise type, for the record. A continuation with only a `then` has
     // no middle step at all (a plain tail call), which is a shape in its own
     // right and not a missing one.
-    let kind = match (&map, &run, &request, &eval) {
-        (Some(_), _, _, _) => "map",
-        (_, Some(_), _, _) => "run",
-        (_, _, Some(_), _) => "request",
-        (_, _, _, Some(_)) => "eval",
+    let kind = match (&map, &run, &request, &eval, &ref_name) {
+        (Some(_), _, _, _, _) => "map",
+        (_, Some(_), _, _, _) => "run",
+        (_, _, Some(_), _, _) => "request",
+        (_, _, _, Some(_), _) => "eval",
+        (_, _, _, _, Some(_)) => "ref",
         _ => "then",
     };
 
@@ -1743,18 +1815,20 @@ fn validate_continuation_shape(
     has_run: bool,
     has_request: bool,
     has_eval: bool,
+    has_ref: bool,
     has_then: bool,
     catch: bool,
 ) -> Result<(), HttpError> {
     let middle_count = usize::from(has_map)
         + usize::from(has_run)
         + usize::from(has_request)
-        + usize::from(has_eval);
+        + usize::from(has_eval)
+        + usize::from(has_ref);
     if middle_count > 1 {
         return Err(HttpError::new(
             500,
             format!(
-                "continuation {cont} has more than one of 'map', 'run', 'request', and 'eval' (they are mutually exclusive)"
+                "continuation {cont} has more than one of 'map', 'run', 'request', 'eval' and 'ref' (they are mutually exclusive)"
             ),
         ));
     }
@@ -1764,7 +1838,14 @@ fn validate_continuation_shape(
             format!("continuation {cont} has both 'request' and 'in'"),
         ));
     }
-    if !has_request && !has_input {
+    // `ref-then` waits on a named ref: there is no data node to carry.
+    if has_ref && has_input {
+        return Err(HttpError::new(
+            500,
+            format!("continuation {cont} has both 'ref' and 'in'"),
+        ));
+    }
+    if !has_request && !has_ref && !has_input {
         return Err(HttpError::new(
             500,
             format!("continuation {cont} missing 'in'"),
@@ -1778,11 +1859,11 @@ fn validate_continuation_shape(
     }
     // Both checked here rather than client-side only: a continuation is a tree
     // any worker can hand us, so the interpreter states its own contract.
-    if catch && !has_run && !has_request && !has_eval {
+    if catch && !has_run && !has_request && !has_eval && !has_ref {
         return Err(HttpError::new(
             500,
             format!(
-                "continuation {cont} has 'catch' without 'run', 'request' or 'eval' (catch covers one fallible step)"
+                "continuation {cont} has 'catch' without 'run', 'request', 'eval' or 'ref' (catch covers one fallible step)"
             ),
         ));
     }
@@ -3807,9 +3888,49 @@ mod continuation_shape_tests {
             has_run,
             has_request,
             false,
+            false,
             has_then,
             catch,
         )
+    }
+
+    /// The `ref` middle step (`caos ref-then`): exclusive with the others,
+    /// carries no `in`, and a `catch` needs a `then`.
+    fn ref_shape(
+        has_input: bool,
+        has_other_middle: bool,
+        has_then: bool,
+        catch: bool,
+    ) -> Result<(), HttpError> {
+        validate_continuation_shape(
+            "test-continuation",
+            has_input,
+            has_other_middle,
+            false,
+            false,
+            false,
+            true,
+            has_then,
+            catch,
+        )
+    }
+
+    #[test]
+    fn ref_waits_on_a_name_and_obeys_the_middle_step_rules() {
+        ref_shape(false, false, false, false).unwrap();
+        ref_shape(false, false, true, true).unwrap();
+        assert!(ref_shape(true, false, true, false)
+            .unwrap_err()
+            .message()
+            .contains("both 'ref' and 'in'"));
+        assert!(ref_shape(false, true, true, false)
+            .unwrap_err()
+            .message()
+            .contains("mutually exclusive"));
+        assert!(ref_shape(false, false, false, true)
+            .unwrap_err()
+            .message()
+            .contains("without 'then'"));
     }
 
     /// The `eval` middle step obeys the same shape rules as `run`: exclusive
@@ -3827,6 +3948,7 @@ mod continuation_shape_tests {
             false,
             false,
             true,
+            false,
             has_then,
             catch,
         )
