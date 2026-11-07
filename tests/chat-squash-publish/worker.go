@@ -245,13 +245,14 @@ func main() {
 			return use(id, "publish_source", map[string]any{"source_tree": source,
 				"repository": "https://caos-squash-publish.invalid/repo.git", "branch": "feature", "force": true})
 		}
-		// The same operation reached BY PATH: std/publish-source is an entry for an
-		// operation of the step (`@op`), so a session that mounts it runs it with
-		// run_tool like any tool. Its arguments are strings, like every tool's.
+		// The same publication reached BY PATH: std/publish-source is an ordinary
+		// worker (design/tool-contract.md), run with run_tool like any tool, with
+		// the source tree as `root`. Without force it reads the branch first, which
+		// is where a `.invalid` host stops it.
 		publishByPath := func(id, source string) map[string]any {
 			return use(id, "run_tool", map[string]any{"path": "tools/publish-source", "arguments": map[string]any{
-				"source-tree": source, "repository": "https://caos-squash-publish.invalid/repo.git",
-				"branch": "feature", "force": "true"}})
+				"root": source, "repository": "https://caos-squash-publish.invalid/repo.git",
+				"branch": "feature"}})
 		}
 		respond(1,
 			write("tu_sh", "tools/sh/.caos-expr", "curry --base:hash="+caos("hash", "/cas/args/bash-tool")),
@@ -326,8 +327,8 @@ func main() {
 		// went on to read the remote, and it refuses a plain folder as before.
 		childByPath, dirByPath := seen(6, "tu_pub2"), seen(6, "tu_dir2")
 		note("publish-source by path, publish/mystack/01-feature: %s", childByPath)
-		w.True(strings.Contains(dirByPath, "requires an existing source gitlink"), "the control call by path on a plain folder was not refused as one: %s", dirByPath)
-		w.True(strings.Contains(childByPath, "remote branch lookup failed"), "publish-source by path on the squashed layer failed somewhere unexpected: %s", childByPath)
+		w.True(strings.Contains(dirByPath, "not a source tree"), "the control call by path on a plain folder was not refused as one: %s", dirByPath)
+		w.True(strings.Contains(childByPath, "reading the refs of https://caos-squash-publish.invalid/repo.git failed"), "publish-source by path on the squashed layer failed somewhere unexpected: %s", childByPath)
 		note("ok: publish-source by path took the squashed layer and stopped only at the remote")
 
 		w.Report(narration.String() + "chat-squash-publish: ALL PASS\n")

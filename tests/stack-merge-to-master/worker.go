@@ -245,9 +245,9 @@ func main() {
 			merge("tu_bare", map[string]any{"stack": "bare", "repository": invalid, "trunk": "main"}),
 			merge("tu_nowhere", map[string]any{"stack": "nowhere", "repository": invalid, "trunk": "main"}),
 			merge("tu_badarg", with(map[string]any{"squash": "true"})),
-			ci("tu_ci", map[string]any{"stack": "mystack", "repository": invalid, "branch": "02-tests"}),
-			ci("tu_cinorepo", map[string]any{"branch": "feature"}),
-			ci("tu_cibad", map[string]any{"branch": "a b", "repository": invalid}))
+			ci("tu_ci", map[string]any{"root": "mystack", "repository": invalid, "branch": "02-tests"}),
+			ci("tu_cinorepo", map[string]any{"root": ".", "branch": "feature"}),
+			ci("tu_cibad", map[string]any{"root": ".", "branch": "a b", "repository": invalid}))
 		respond(4, map[string]any{"type": "text", "text": "done"})
 
 		w.Step("the turn")

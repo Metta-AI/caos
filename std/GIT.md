@@ -409,8 +409,8 @@ run_tool(path="caos-std/stack-sync", arguments={"stack": "sources/<repo>", "remo
   PR below merges. A failure stops it there: the layers below are merged, the
   ones above are untouched, and running it again carries on.
 - `caos-std/ci-status` prints the checks of one branch: `branch` is a branch
-  name, a commit, or with `stack` a layer (`02-tests` or `tests`). Its first
-  line is the verdict, and failing checks are listed first.
+  name, a commit, or, with the stack as `root`, a layer (`02-tests` or
+  `tests`). Its first line is the verdict, and failing checks are listed first.
 
 ### Waiting for CI
 
@@ -422,14 +422,14 @@ and pick it up with `result`, so the wait does not hold up other work:
 
 ```text
 start(path="caos-std/ci-status", arguments={
-  "stack": "sources/<repo>", "branch": "02-tests", "wait-min": "30"})
+  "root": "sources/<repo>", "branch": "02-tests", "wait-min": "30"})
 ... other work ...
 result(ticket=<ticket>)
 ```
 
-Every call reads GitHub afresh: `ci-status` runs inside the step, which is
-keyed on the call itself, so the same arguments after a new push are a new
-read, not a cached answer. A check that has not been created yet is not
+Every call reads GitHub afresh: `ci-status` declares `@request-id`, which the
+harness fills with the call's own id, so the same arguments after a new push
+are a new read, not a cached answer. A check that has not been created yet is not
 waited for: right after a push the answer can be `no checks`.
 
 ### The repository's squash setting

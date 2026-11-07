@@ -22,10 +22,10 @@ jq -n --arg entry "$entry" '{content:[{type:"tool_use",id:"stage",name:"write",
   input:{"file-path":"tools/import-source/.caos-expr",content:("curry --base:hash=" + $entry + "\n")}}],
   stop_reason:"tool_use"}' > /tmp/stub/response-1.json
 cat > /tmp/stub/response-2.json <<'JSON'
-{"content":[{"type":"tool_use","id":"help","name":"tool_help","input":{"path":"tools/import-source"}},{"type":"tool_use","id":"import","name":"run_tool","input":{"path":"tools/import-source","arguments":{"source":"https://github.com/octocat/Hello-World.git","into":"imports/hello/base"}}}],"stop_reason":"tool_use"}
+{"content":[{"type":"tool_use","id":"help","name":"tool_help","input":{"path":"tools/import-source"}},{"type":"tool_use","id":"import","name":"run_tool","input":{"path":"tools/import-source","arguments":{"root":"imports/hello","source":"https://github.com/octocat/Hello-World.git","into":"base"}}}],"stop_reason":"tool_use"}
 JSON
 cat > /tmp/stub/response-3.json <<'JSON'
-{"content":[{"type":"tool_use","id":"read","name":"read","input":{"file-path":"imports/hello/base/README"}},{"type":"tool_use","id":"occupied","name":"run_tool","input":{"path":"tools/import-source","arguments":{"source":"https://github.com/octocat/Hello-World.git","into":"imports/hello/base"}}},{"type":"tool_use","id":"stray","name":"run_tool","input":{"path":"tools/import-source","arguments":{"source":"https://github.com/octocat/Hello-World.git","into":"imports/other","branch":"main"}}}],"stop_reason":"tool_use"}
+{"content":[{"type":"tool_use","id":"read","name":"read","input":{"file-path":"imports/hello/base/README"}},{"type":"tool_use","id":"occupied","name":"run_tool","input":{"path":"tools/import-source","arguments":{"root":"imports/hello","source":"https://github.com/octocat/Hello-World.git","into":"base"}}},{"type":"tool_use","id":"stray","name":"run_tool","input":{"path":"tools/import-source","arguments":{"root":"imports","source":"https://github.com/octocat/Hello-World.git","into":"other","branch":"main"}}}],"stop_reason":"tool_use"}
 JSON
 printf '%s\n' '{"content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}' > /tmp/stub/response-4.json
 start_stub /tmp/stub
@@ -44,7 +44,7 @@ jq -e --arg commit "$imported" '.commit == $commit and .repository == "https://g
 # `tool_help` describes the entry: its parameters are the model's whole documentation.
 jq -r '.messages[].content | select(type == "array") | .[] | select(.type == "tool_result" and .tool_use_id == "help") | .content | if type == "array" then .[0].text else . end' /tmp/stub/request-3.json > /tmp/help.text
 grep -q "into" /tmp/help.text || fail "tool_help did not describe the entry: $(cat /tmp/help.text)"
-grep -q "Unused session path" /tmp/help.text || fail "tool_help lost the parameter docs: $(cat /tmp/help.text)"
+grep -q "Unused name inside root" /tmp/help.text || fail "tool_help lost the parameter docs: $(cat /tmp/help.text)"
 grep -qF 'Hello World!' /tmp/stub/request-4.json || fail "the read could not see the imported blob"
 
 # Mistakes are values the model can act on: a taken path, and an argument the operation
