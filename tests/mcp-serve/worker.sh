@@ -26,8 +26,8 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 # is request/response with UNSOLICITED notifications interleaved, so a reader
 # has to skip lines it did not ask for rather than assume the next line is its
 # answer.
-open_server() { # <arguments: the server and the step>
-  coproc SERVER { "$CAOS_CLI" mcp serve $1 2>/tmp/mcp-serve.err; }
+open_server() { # <the global --server flag> <arguments: the step>
+  coproc SERVER { "$CAOS_CLI" $1 mcp serve $2 2>/tmp/mcp-serve.err; }
   SERVER_IN=${SERVER[1]}
   SERVER_OUT=${SERVER[0]}
 }
