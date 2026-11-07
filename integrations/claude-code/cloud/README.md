@@ -110,8 +110,9 @@ sits at `/home/user/repo` and Claude's own state under `/home/claude/.claude`.
 All three are written anyway; it costs nothing.
 
 Nothing has to be committed to a session repo for it to reach a server, either:
-stage 1 writes the server into the configuration as `--server=<url>` on every
-`caos mcp` command, and adds nothing to the checkout. That is the only place a
+stage 1 writes the server into the configuration as the client's global
+`--server=<url>`, ahead of `mcp` on every `caos mcp` command
+(`caos --server=<url> mcp hook ...`), and adds nothing to the checkout. That is the only place a
 server is named.
 
 **The checkout is there before the setup script runs**, which is what lets the
