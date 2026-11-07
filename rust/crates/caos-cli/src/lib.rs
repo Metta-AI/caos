@@ -1713,7 +1713,7 @@ fn fetch_head_batch(t: &GitTransport, refspecs: &[(String, String)]) {
         "--no-tags".to_string(),
         "--no-write-fetch-head".to_string(),
         "--filter=blob:none".to_string(),
-        CAOS_REMOTE.to_string(),
+        t.remote().to_string(),
     ];
     args.extend(refspecs.iter().map(|(_, refspec)| refspec.clone()));
     let args = args.iter().map(String::as_str).collect::<Vec<_>>();
