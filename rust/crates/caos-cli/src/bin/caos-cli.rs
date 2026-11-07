@@ -53,7 +53,7 @@ fn main() -> ExitCode {
 
 /// Consume the flags that come BEFORE the command and apply to all of them,
 /// returning argv with them removed, so every command still sees its own
-/// arguments from `args[2..]`.
+/// arguments from `args[2..]`, and the `--server` they named.
 ///
 /// `--server=<url>` (or `--server <url>`) names the caos server for this
 /// invocation, overriding the checkout's `caos` git remote — for every
