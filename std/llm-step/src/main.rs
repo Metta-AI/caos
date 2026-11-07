@@ -20,6 +20,7 @@ mod stack_merge_to_master;
 mod stack_publish;
 mod stack_sync;
 mod record;
+mod root;
 mod source_trees;
 mod subagents;
 mod timing;
@@ -1702,6 +1703,9 @@ fn launch_resolved_tool(
             Ok(())
         };
     }
+    if tool.root {
+        return launch_root_tool(cfg, state, turn, &call, &tool, &image, &current.message_id);
+    }
     let nested = json!({"id": id, "input":
         call.input.get("arguments").cloned().unwrap_or_else(|| json!({}))});
     // A tool that declares `@scope <param>` runs over, and a writer changes, the
@@ -1810,6 +1814,110 @@ fn launch_resolved_tool(
     }
 }
 
+/// Launch a `@root` tool (design/tool-contract.md, "`root`"): it is given the
+/// object at its `root` path in the session as it is now, and nothing else.
+/// Where the tool sits decided which definition runs, never what it runs
+/// over. The session commit is the call's input, so a writer's result is put
+/// back against exactly what it was given.
+fn launch_root_tool(
+    cfg: &Config,
+    state: &mut progress::State,
+    turn: &Turn,
+    call: &Call,
+    tool: &tools::TreeTool,
+    image: &str,
+    declaration: &str,
+) -> Result<(), String> {
+    let id = call.id.as_str();
+    let site = CallSite::at(&turn.request, call, declaration);
+    let arguments = call
+        .input
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let nested = json!({"id": id, "input": arguments});
+    let session = state.session()?.tree().clone();
+    let bound = match tools::tree_tool_args(&nested, tool, Some(session.as_str())) {
+        Ok(bound) => bound,
+        Err(block) => {
+            site.failed(state, &block, None)?;
+            return resume(cfg, state, turn);
+        }
+    };
+    let root_path = nested["input"][tools::ROOT].as_str().unwrap_or_default();
+    let base = state.head().clone();
+    let located = root::components(root_path).and_then(|components| {
+        let tree = state.store().tree_of(&base)?;
+        root::resolve(state.store(), &tree, &components)
+    });
+    let object = match located {
+        Ok(object) => object,
+        Err(error) => {
+            site.failed(state, &error_block(id, &error), None)?;
+            return resume(cfg, state, turn);
+        }
+    };
+    let ready: Vec<(String, tools::ReadyArg)> = bound
+        .iter()
+        .filter(|(key, _)| key.as_str() != tools::ROOT)
+        .map(|(key, value)| Ok((key.clone(), value.ready()?)))
+        .collect::<Result<_, String>>()?;
+    let mut args: Vec<(&str, Arg)> = ready
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.arg()))
+        .collect();
+    // The object itself, materialized so it binds at its own kind: a blob, a
+    // tree, or a gitlink's commit. Nothing there binds nothing.
+    let materialized = fresh("root");
+    if let Some((_, oid)) = &object {
+        caos(["get-hash", oid.as_str(), &materialized])?;
+        args.push((tools::ROOT, Arg::Path(&materialized)));
+    }
+    if tool.call {
+        args.push(("call", Arg::Lit(id)));
+    }
+    if tool.request_id && !args.iter().any(|(name, _)| *name == tools::REQUEST_ID) {
+        args.push((tools::REQUEST_ID, Arg::Lit(id)));
+    }
+    let tool_tree = cas_hash(image)?;
+    let task = (|| {
+        let curried = caos_curry(Arg::Hash(&tool_tree), &args)?;
+        let task_text = prepare_request(Arg::Hash(&curried), &[])?;
+        Oid::parse(&task_text, "root tool task")
+    })();
+    let task = match task {
+        Ok(task) => task,
+        Err(error) => {
+            site.failed(state, &error_block(id, &error), None)?;
+            return resume(cfg, state, turn);
+        }
+    };
+    let started = CallRecord {
+        id: id.to_string(),
+        name: call.name.clone(),
+        declaration_message: declaration.to_string(),
+        source_tree_name: None,
+        input_commit: Some(base),
+        status: CallStatus::Started,
+        task: Some(task),
+        result: None,
+        source_tree_resolution: None,
+        files: Vec::new(),
+        files_outcome: None,
+    };
+    let expected = state.head().clone();
+    match state.try_append_at(
+        &expected,
+        Transition::ToolStart {
+            payloads: Vec::new(),
+            record: started.clone(),
+        },
+    )? {
+        progress::TryAppend::HeadChanged(_) => resume(cfg, state, turn),
+        progress::TryAppend::Appended(_) => dispatch_started(state, &turn.request, call, &started),
+    }
+}
+
 fn dispatch_started(
     state: &mut progress::State,
     request: &Oid,
@@ -1831,10 +1939,12 @@ fn dispatch_started(
     // Read from the declaration here, at dispatch, because by the time the
     // result comes back the tool's own path is no longer bound (`self_curry`
     // unbinds it) and `record.name` is only ever `run_tool`.
-    let writer_storage;
-    if let Some(declared) = declared_writer(call, record)? {
-        writer_storage = declared;
-        extras.push(("tool-writer", Arg::Lit(&writer_storage)));
+    let (writer_storage, root_storage) = declared_contract(call, record)?;
+    if let Some(declared) = &writer_storage {
+        extras.push(("tool-writer", Arg::Lit(declared)));
+    }
+    if let Some(root) = &root_storage {
+        extras.push(("tool-root", Arg::Lit(root)));
     }
     let scope_storage;
     if call.name == "grep" {
@@ -1860,10 +1970,16 @@ fn dispatch_started(
 /// a tool's help now comes from its EVALUATED image, so that would mean
 /// evaluating it twice.
 ///
+/// The second, for a task whose tool declares `@root`: the root path the call
+/// named (design/tool-contract.md, "`root`"), which its result is read against.
+///
 /// `None` for a task whose tool carries no help, which is every reader.
-fn declared_writer(call: &Call, record: &CallRecord) -> Result<Option<String>, String> {
+fn declared_contract(
+    call: &Call,
+    record: &CallRecord,
+) -> Result<(Option<String>, Option<String>), String> {
     let Some(task) = record.task.as_ref() else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let at = fresh("task-image");
     caos(["get-hash", task.as_str(), &at])?;
@@ -1871,19 +1987,23 @@ fn declared_writer(call: &Call, record: &CallRecord) -> Result<Option<String>, S
         Ok(Some(tool)) => tool,
         // A malformed or absent help is not this function's business: the call
         // has already run and its result is about to be read.
-        _ => return Ok(None),
+        _ => return Ok((None, None)),
     };
-    if !described.writer {
-        return Ok(None);
-    }
     // Name it the way the model named it, so an error about the proposal points
     // back at what it called.
-    Ok(Some(
+    let writer = described.writer.then(|| {
         call.input["path"]
             .as_str()
             .unwrap_or(&record.name)
-            .to_string(),
-    ))
+            .to_string()
+    });
+    let root = described.root.then(|| {
+        call.input["arguments"][tools::ROOT]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    });
+    Ok((writer, root))
 }
 
 fn dispatch_wait_started(
@@ -1932,6 +2052,10 @@ fn callback_result(
     // name any more.
     if read_arg_opt("op")?.as_deref() == Some("agent-wait") {
         return wait_callback_block(state, record);
+    }
+    if let Some(root) = read_arg_opt("tool-root")? {
+        let writer = read_arg_opt("tool-writer")?;
+        return root_callback(state, record, &root, writer.as_deref());
     }
     if let Some(tool) = read_arg_opt("tool-writer")? {
         return writer_callback(state, record, &tool);
@@ -2005,6 +2129,92 @@ fn writer_callback(
         result_block(&record.id, result.out.trim_end(), result.failed),
         Some(proposal),
     ))
+}
+
+/// A `@root` tool's result (design/tool-contract.md, "The result"): the model
+/// reads `stdout`; a writer's `root` or `deleted` is put at its root path in
+/// the session as it was when the call started, everything above it rewritten
+/// (a child commit at each gitlink on the way), and that session is the
+/// proposal `complete_compute` reconciles with whatever happened since.
+///
+/// A tool's mistake is answered as an `is_error` tool_result naming it, as for
+/// any writer.
+fn root_callback(
+    state: &mut progress::State,
+    record: &CallRecord,
+    root_path: &str,
+    writer: Option<&str>,
+) -> Result<(Value, Option<Oid>), String> {
+    let fail = |message: String| Ok((error_block(&record.id, &message), None));
+    let result = match tools::root_result(&arg("result"), writer.is_some()) {
+        Ok(result) => result,
+        Err(error) => return fail(format!("{}: {error}", writer.unwrap_or("the tool"))),
+    };
+    let text = tools::keep_tail(&result.stdout);
+    let block = result_block(&record.id, &text, result.failed);
+    let Some(tool) = writer else {
+        return Ok((block, None));
+    };
+    if result.failed {
+        return Ok((block, None));
+    }
+    let base = record
+        .input_commit
+        .clone()
+        .ok_or("a root tool's start has no input commit")?;
+    let components = root::components(root_path)?;
+    let base_tree = state.store().tree_of(&base)?;
+    let old = root::resolve(state.store(), &base_tree, &components)?;
+    let message = result
+        .commit_message
+        .as_deref()
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .unwrap_or(tool)
+        .to_string();
+    let new = if result.deleted {
+        None
+    } else {
+        let result_tree = Oid::parse(&cas_hash(&arg("result"))?, "root tool result")?;
+        state.fetch_object(&result_tree)?;
+        let entry = state
+            .store()
+            .read_tree(&result_tree)
+            .map_err(String::from)?
+            .into_iter()
+            .find(|entry| entry.name == "root")
+            .ok_or("the result has no root entry")?;
+        // A plain file keeps an executable bit it had: a tool that writes a
+        // file's content rarely means to change its mode.
+        let mode = match (entry.mode, &old) {
+            (Mode::Blob, Some((Mode::Executable, _))) => Mode::Executable,
+            (mode, _) => mode,
+        };
+        match (mode, &old) {
+            // A source tree's new code: the harness commits it, a child of the
+            // commit it replaces.
+            (Mode::Tree, Some((Mode::Commit, parent))) => {
+                let parent = parent.clone();
+                let minted = mint_source_tree_commit(state, &entry.oid, &parent, &message)?;
+                state.push_code(&minted)?;
+                Some((Mode::Commit, minted))
+            }
+            _ => Some((mode, entry.oid)),
+        }
+    };
+    if new == old {
+        return Ok((block, None));
+    }
+    let rebuilt = root::replace(state.store_mut(), &base_tree, &components, new, &message)?;
+    // A gitlink's commit is not part of the closure of the tree that names it,
+    // so each commit made on the way goes up on its own, deepest first, before
+    // the proposal that names them.
+    for commit in &rebuilt.commits {
+        state.push_code(commit)?;
+    }
+    let proposal = mint_source_tree_commit(state, &rebuilt.tree, &base, &message)?;
+    state.push_code(&proposal)?;
+    Ok((block, Some(proposal)))
 }
 
 fn mint_source_tree_commit(
@@ -3408,6 +3618,7 @@ fn self_curry(
         "tool-git",
         "tool-in",
         "tool-writer",
+        "tool-root",
         "op",
         "in",
         "result",
