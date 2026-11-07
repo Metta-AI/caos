@@ -59,7 +59,7 @@ fn main() -> ExitCode {
 /// invocation, overriding the checkout's `caos` git remote — for every
 /// command: `caos-cli --server=caos://<ticket> watch <ticket>`. Only flags
 /// ahead of the command are global; a `--server` after it belongs to that
-/// command (`mcp`, `secrets-push` and `tui` take their own).
+/// command (`secrets-push` and `tui` take their own; `mcp` takes only this one).
 fn take_global_flags(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
     let mut rest = args.iter().skip(1);
     let mut server = None;
