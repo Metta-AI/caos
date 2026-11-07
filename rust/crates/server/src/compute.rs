@@ -3181,8 +3181,11 @@ pub(crate) fn wait_ticket(config: &Config, ticket: &str) -> Result<Vec<u8>, Http
     }
 }
 
-/// Evaluations running in THIS process. A ticket recorded `pending` that is not
-/// in here belonged to a server that has since died.
+/// Evaluations running in THIS process. A ticket joins it after redis records
+/// `pending` and leaves it after redis records the outcome (`TicketGuard`'s
+/// drop), so a ticket recorded `pending` that is not in here belonged to a
+/// server that has since died, or has just finished: `settle_ticket_state`
+/// reads redis again to tell the two apart.
 fn live_tickets() -> &'static Mutex<HashSet<String>> {
     static LIVE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     LIVE.get_or_init(|| Mutex::new(HashSet::new()))
@@ -3395,15 +3398,134 @@ pub(crate) fn expression_result(config: &Config, ticket: &str) -> Result<Vec<u8>
     if ticket.len() != 40 || !ticket.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(HttpError::new(400, format!("invalid ticket: {ticket:?}")));
     }
-    let state = cache_get(&config.redis_addr, &ticket_key(config, ticket))
-        .map_err(|e| HttpError::new(500, format!("cannot read ticket {ticket}: {e}")))?
-        .ok_or_else(|| HttpError::new(404, format!("unknown ticket {ticket}")))?;
-    let state = if state == "pending" && !live_tickets().lock().unwrap().contains(ticket) {
-        "failed 500 the server restarted before this finished; start it again".to_string()
-    } else {
-        state
+    let read = || {
+        cache_get(&config.redis_addr, &ticket_key(config, ticket))
+            .map_err(|e| HttpError::new(500, format!("cannot read ticket {ticket}: {e}")))?
+            .ok_or_else(|| HttpError::new(404, format!("unknown ticket {ticket}")))
     };
+    // The lock is taken and released inside each call: holding it across a
+    // redis read would queue every poll behind a network round trip.
+    let is_live = || live_tickets().lock().unwrap().contains(ticket);
+    let state = settle_ticket_state(read()?, is_live, read)?;
     Ok(format!("{state}\n").into_bytes())
+}
+
+/// What `GET /result` answers for a ticket whose redis state read `state`.
+///
+/// `pending` from a ticket this process is not running means the server that
+/// was running it died, except in one ordering: `TicketGuard::drop` writes the
+/// final state to redis BEFORE it removes the ticket from `live_tickets`, so a
+/// run that ends between the poll's redis read and its look at the live set
+/// shows a stale `pending` and a ticket that is no longer live. That was
+/// reported as a restart on caosd-prod (2026-11-05, a container up 26 hours
+/// with no restarts). So having seen the ticket not live, read redis once more
+/// (`reread`): the removal was observed, so the write before it is visible and
+/// the second read returns the final state.
+///
+/// A second `pending` is a restart only if the ticket is still not live: a new
+/// `start` of the same ticket after the first run failed records `pending` and
+/// joins the live set under one lock, and that `pending` is real.
+///
+/// It still reads as a restart when the guard could not record the outcome
+/// (`cache_set` failed in its drop, which logs `cannot record`): redis keeps
+/// `pending` after the ticket leaves the live set, and nothing here can tell
+/// that apart from a server that died. Starting it again is the right advice
+/// in both cases.
+fn settle_ticket_state(
+    state: String,
+    is_live: impl Fn() -> bool,
+    reread: impl FnOnce() -> Result<String, HttpError>,
+) -> Result<String, HttpError> {
+    if state != "pending" || is_live() {
+        return Ok(state);
+    }
+    let state = reread()?;
+    if state != "pending" || is_live() {
+        return Ok(state);
+    }
+    Ok("failed 500 the server restarted before this finished; start it again".to_string())
+}
+
+#[cfg(test)]
+mod ticket_state_tests {
+    use super::*;
+
+    const RESTARTED: &str = "failed 500 the server restarted before this finished; start it again";
+
+    /// `is_live` answering from `answers`, in order, and panicking past them.
+    fn live_sequence(answers: &[bool]) -> impl Fn() -> bool + '_ {
+        let next = std::cell::Cell::new(0);
+        move || {
+            let i = next.get();
+            next.set(i + 1);
+            *answers
+                .get(i)
+                .unwrap_or_else(|| panic!("is_live asked {} times", i + 1))
+        }
+    }
+
+    fn no_reread() -> Result<String, HttpError> {
+        panic!("redis was read again")
+    }
+
+    /// The answer, or a panic naming the error (`HttpError` is not `Debug`).
+    fn answer(state: Result<String, HttpError>) -> String {
+        state.unwrap_or_else(|e| panic!("{} {}", e.status(), e.message()))
+    }
+
+    #[test]
+    fn a_run_that_finishes_during_the_poll_answers_its_result() {
+        // Read 1 saw `pending`; the guard then recorded `ok` and left the live
+        // set before the poll looked at it.
+        let state = settle_ticket_state("pending".into(), live_sequence(&[false]), || {
+            Ok("ok tree abc".into())
+        });
+        assert_eq!(answer(state), "ok tree abc");
+    }
+
+    #[test]
+    fn a_failure_recorded_during_the_poll_is_answered_as_itself() {
+        let state = settle_ticket_state("pending".into(), live_sequence(&[false]), || {
+            Ok("failed 422 bad args".into())
+        });
+        assert_eq!(answer(state), "failed 422 bad args");
+    }
+
+    #[test]
+    fn pending_twice_and_not_live_is_a_restart() {
+        let state = settle_ticket_state("pending".into(), live_sequence(&[false, false]), || {
+            Ok("pending".into())
+        });
+        assert_eq!(answer(state), RESTARTED);
+    }
+
+    #[test]
+    fn a_ticket_started_again_during_the_poll_is_pending() {
+        let state = settle_ticket_state("pending".into(), live_sequence(&[false, true]), || {
+            Ok("pending".into())
+        });
+        assert_eq!(answer(state), "pending");
+    }
+
+    #[test]
+    fn a_live_pending_ticket_is_pending_without_a_second_read() {
+        let state = settle_ticket_state("pending".into(), live_sequence(&[true]), no_reread);
+        assert_eq!(answer(state), "pending");
+    }
+
+    #[test]
+    fn a_finished_ticket_is_answered_without_looking_further() {
+        let state = settle_ticket_state("ok tree abc".into(), live_sequence(&[]), no_reread);
+        assert_eq!(answer(state), "ok tree abc");
+    }
+
+    #[test]
+    fn a_failed_second_read_is_the_error() {
+        let state = settle_ticket_state("pending".into(), live_sequence(&[false]), || {
+            Err(HttpError::new(500, "cannot read ticket"))
+        });
+        assert_eq!(state.unwrap_err().status(), 500);
+    }
 }
 
 #[cfg(test)]
