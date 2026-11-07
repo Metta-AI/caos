@@ -47,6 +47,8 @@ pub(super) fn prepare(args: &mut Args) -> Result<PathBuf, String> {
     let server = args
         .server
         .clone()
+        // `caos-cli --server=<url> tui` stands in for the checkout's remote.
+        .or_else(|| caos::server_override().map(String::from))
         .or_else(|| {
             checkout
                 .as_ref()
