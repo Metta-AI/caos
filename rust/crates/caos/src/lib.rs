@@ -945,6 +945,10 @@ impl Transport for GitTransport {
         // The `caos` remote's URL *is* the server: the CLI already pushes/fetches
         // objects there, and /run lives at the same host. So a person configures
         // the server once (`git remote add caos <url>`) and never sets an env var.
+        // `--server=<url>` replaces it for one invocation.
+        if self.remote != CAOS_REMOTE {
+            return Ok(self.remote.clone());
+        }
         let remote = self.repo.find_remote(CAOS_REMOTE).map_err(|e| {
             format!(
                 "no `{CAOS_REMOTE}` git remote (add it with \
