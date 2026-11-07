@@ -46,10 +46,11 @@ func main() {
 		// where a uid-0 lookup can fail, so point it at the /tmp it owns.
 		w.Must(os.Setenv("HOME", "/tmp"))
 
-		// `in` may be a tree or a commit (a source tree in the session):
+		// `root` may be a tree or a commit (a source tree in the session):
 		// resolve to the tree either way, fetch one level, then the two files.
 		const root = "/cas/flake-root"
-		w.Caos("resolve", w.Hash(args+"/in"), ".", root)
+		w.True(w.Exists(args+"/root"), "nothing is at the root path: root is the directory holding flake.nix")
+		w.Caos("resolve", w.Hash(args+"/root"), ".", root)
 		w.Get(root)
 		w.True(w.Check(os.Lstat(root)).IsDir(), "in is not a tree")
 		w.True(w.Exists(filepath.Join(root, "flake.nix")), "no flake.nix in the tree")
@@ -76,7 +77,12 @@ func main() {
 			nix("flake", "update")
 		}
 		w.True(w.Exists(filepath.Join(ws, "flake.lock")), "nix left no flake.lock")
-		w.Put(filepath.Join(ws, "flake.lock"), "/cas/out")
+		// The answer under the root contract (design/tool-contract.md):
+		// `{stdout}`, the new lock, for the caller to write.
+		const out = "/tmp/flake-update-out"
+		w.Must(os.MkdirAll(out, 0o755))
+		w.Must(os.WriteFile(filepath.Join(out, "stdout"), w.Check(os.ReadFile(filepath.Join(ws, "flake.lock"))), 0o644))
+		w.Put(out, "/cas/out")
 	})
 }
 

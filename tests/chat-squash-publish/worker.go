@@ -2,10 +2,10 @@
 // llm-step's real tool loop with a scripted model, in one turn: build a stack
 // with the shell, write a plan, run create-squashed-stack into publish/mystack,
 // reword one message in the plan and run it again (a republish over what the
-// first run wrote), then call publish_source.
+// first run wrote), then run publish-source.
 //
 // It checks that create-squashed-stack leaves publish/mystack/01-feature as a
-// source tree that publish_source accepts. The repository is a `.invalid`
+// source tree that publish-source accepts. The repository is a `.invalid`
 // host, so no push happens: the call must get past the source-tree check and
 // fail reading the remote. The same call on publish/mystack, a plain folder,
 // must be refused at that check.
@@ -133,7 +133,7 @@ func use(id, name string, input map[string]any) map[string]any {
 
 func shell(id, cmd, path string) map[string]any {
 	return use(id, "run_tool", map[string]any{"path": "tools/sh",
-		"arguments": map[string]any{"cmd": cmd, "paths": []string{path}}})
+		"arguments": map[string]any{"root": ".", "cmd": cmd, "paths": []string{path}}})
 }
 
 func write(id, path, content string) map[string]any {
@@ -239,19 +239,16 @@ func main() {
 		m1 := "Add the feature (" + salt + ")\n\nWhy it exists,\nover two lines."
 		m2 := "Test the feature (" + salt + ")\n\nOne body line."
 		m2b := "Test the feature, reworded (" + salt + ")\n\nA republish: only this message changed."
-		squash := use("tu_squash", "run_tool", map[string]any{"path": "tools/squash", "arguments": map[string]any{"plan": "mystack.plan"}})
-		squash2 := use("tu_squash2", "run_tool", map[string]any{"path": "tools/squash", "arguments": map[string]any{"plan": "mystack.plan"}})
-		publish := func(id, source string) map[string]any {
-			return use(id, "publish_source", map[string]any{"source_tree": source,
-				"repository": "https://caos-squash-publish.invalid/repo.git", "branch": "feature", "force": true})
-		}
-		// The same operation reached BY PATH: std/publish-source is an entry for an
-		// operation of the step (`@op`), so a session that mounts it runs it with
-		// run_tool like any tool. Its arguments are strings, like every tool's.
+		squash := use("tu_squash", "run_tool", map[string]any{"path": "tools/squash", "arguments": map[string]any{"root": ".", "plan": "mystack.plan"}})
+		squash2 := use("tu_squash2", "run_tool", map[string]any{"path": "tools/squash", "arguments": map[string]any{"root": ".", "plan": "mystack.plan"}})
+		// The publication, reached BY PATH: std/publish-source is an ordinary
+		// worker (design/tool-contract.md), run with run_tool like any tool, with
+		// the source tree as `root`. Without force it reads the branch first, which
+		// is where a `.invalid` host stops it.
 		publishByPath := func(id, source string) map[string]any {
 			return use(id, "run_tool", map[string]any{"path": "tools/publish-source", "arguments": map[string]any{
-				"source-tree": source, "repository": "https://caos-squash-publish.invalid/repo.git",
-				"branch": "feature", "force": "true"}})
+				"root": source, "repository": "https://caos-squash-publish.invalid/repo.git",
+				"branch": "feature"}})
 		}
 		respond(1,
 			write("tu_sh", "tools/sh/.caos-expr", "curry --base:hash="+caos("hash", "/cas/args/bash-tool")),
@@ -265,8 +262,7 @@ func main() {
 		// The republish: reword one message and squash again over the
 		// publish/mystack the first call wrote.
 		respond(4, write("tu_plan2", "mystack.plan", plan(m1, m2b)), squash2)
-		respond(5, publish("tu_pub", "publish/mystack/01-feature"), publish("tu_dir", "publish/mystack"),
-			publishByPath("tu_pub2", "publish/mystack/01-feature"), publishByPath("tu_dir2", "publish/mystack"))
+		respond(5, publishByPath("tu_pub2", "publish/mystack/01-feature"), publishByPath("tu_dir2", "publish/mystack"))
 		respond(6, map[string]any{"type": "text", "text": "published"})
 
 		w.Step("the turn")
@@ -313,21 +309,12 @@ func main() {
 		w.True(body == m2b, "C2's message is not the plan's, verbatim: [%s]", body)
 		note("ok: publish/mystack = {01-feature: %s, 02-tests: %s}, each a layer tree on the one below", c1, c2b)
 
-		child, dir := seen(6, "tu_pub"), seen(6, "tu_dir")
-		note("publish_source publish/mystack/01-feature: %s", child)
-		note("publish_source publish/mystack:            %s", dir)
-		w.True(strings.Contains(dir, "requires an existing source gitlink"), "the control call on a plain folder was not refused as one: %s", dir)
-		// read_branch's error: the call found the source gitlink and went on to
-		// read the remote.
-		w.True(strings.Contains(child, "remote branch lookup failed"), "publish_source on the squashed layer failed somewhere unexpected: %s", child)
-		note("ok: publish_source took the squashed layer and stopped only at the remote")
-
-		// By path, the operation answers the same way: it found the source gitlink and
-		// went on to read the remote, and it refuses a plain folder as before.
+		// The publication found the source gitlink and went on to read the remote,
+		// and it refuses a plain folder.
 		childByPath, dirByPath := seen(6, "tu_pub2"), seen(6, "tu_dir2")
 		note("publish-source by path, publish/mystack/01-feature: %s", childByPath)
-		w.True(strings.Contains(dirByPath, "requires an existing source gitlink"), "the control call by path on a plain folder was not refused as one: %s", dirByPath)
-		w.True(strings.Contains(childByPath, "remote branch lookup failed"), "publish-source by path on the squashed layer failed somewhere unexpected: %s", childByPath)
+		w.True(strings.Contains(dirByPath, "not a source tree"), "the control call by path on a plain folder was not refused as one: %s", dirByPath)
+		w.True(strings.Contains(childByPath, "reading the refs of https://caos-squash-publish.invalid/repo.git failed"), "publish-source by path on the squashed layer failed somewhere unexpected: %s", childByPath)
 		note("ok: publish-source by path took the squashed layer and stopped only at the remote")
 
 		w.Report(narration.String() + "chat-squash-publish: ALL PASS\n")

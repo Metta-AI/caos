@@ -42,8 +42,6 @@ pub fn is_inline(name: &str) -> bool {
             | "copy"
             | "move"
             | "remove"
-            | "import_source"
-            | "publish_source"
     )
 }
 
@@ -97,7 +95,7 @@ const EVAL_PATH_HELP: &str = "Evaluate a path and return the hash of what it pro
 
 /// Build a built-in tool's registry entry from its help text, through the very
 /// same `parse_help` → `tree_tool_declaration` path a discovered caos-tools
-/// tool takes. A std entry that declares `@git` gets the same builder.
+/// tool takes.
 pub(crate) fn builtin_tool(name: &str, help: &str) -> TreeTool {
     TreeTool::new(name, parse_help(&format!("built-in {name}"), help))
 }
@@ -116,7 +114,6 @@ pub fn declarations() -> Vec<Value> {
         ("copy", COPY_HELP),
         ("move", MOVE_HELP),
         ("remove", REMOVE_HELP),
-        ("import_source", crate::import_source::HELP),
         ("tool_help", TOOL_HELP_HELP),
         (EVAL_PATH, EVAL_PATH_HELP),
     ]
@@ -148,10 +145,8 @@ pub fn grep_declaration() -> Value {
 
 /// Arg names a tree tool may not declare: the interpreter binds these itself
 /// on every tool run, and `caos curry` errors on a rebind (SPEC, "Currying").
-/// `wc`/`refs` are bound only for `@git` tools, but reserved unconditionally
-/// so a tool can't declare a model arg the interpreter would then clobber.
-/// `in` is reserved for the same reason and asked for with `@in`, which turns
-/// it into a parameter the interpreter still binds.
+/// `in`, `wc`, `refs` and `call` left with the tags that bound them (`@in`,
+/// `@git`, `@call`; design/tool-contract.md, "Tags").
 ///
 /// EVERY NAME HERE IS ONE SOMETHING BINDS. `std` used to be on this list and is
 /// not any more: there is no `std` arg, a dependency rides inside the tree as a
@@ -159,7 +154,7 @@ pub fn grep_declaration() -> Value {
 /// declaring one. Reserving a name for its history costs a tool author a
 /// perfectly good parameter and tells the next reader that something binds it.
 const RESERVED_ARGS: &[&str] = &[
-    "in", "worker1", "base", "salt", "wc", "refs", "call",
+    "worker1", "base", "salt",
     // The tool's own ArgTree binds `help` (SPEC, "Tools"), and `caos curry`
     // refuses to rebind — so a tool declaring `@param help` would fail at
     // invocation rather than here, where the model can be told why.
@@ -172,67 +167,65 @@ pub struct TreeTool {
     pub name: String,
     pub doc: String,
     pub args: Vec<TreeArg>,
-    /// The tool declared `@git`: bind the input as a commit (`wc`) and the
-    /// turn's ref snapshot (`refs`), so it can walk history rather than read
-    /// content. See [`Help::git`] — including why it is opt-in, why it reaches
-    /// only DISPATCHED READERS, and why a writer's input commit can never be
-    /// one of these.
-    pub git: bool,
     /// The tool declared `@writer`: its result is a PROPOSED CHANGE to the tree
     /// it was run on, not a value. Nothing reads this yet — the harness still
     /// decides writer-ness by tool name (`callback_result`); this carries the
     /// declaration so that match can be replaced by it.
     pub writer: bool,
-    /// The tool declared `@in`: bind the tree it was run on. See
-    /// [`Help::wants_in`] for why absence is the default.
-    pub wants_in: bool,
-    /// The tool declared `@call`: bind this tool call's id as `call`. See
-    /// [`Help::call`].
-    pub call: bool,
-    /// The tool declared `@scope <param>`: the SOURCE TREE it runs over, and
-    /// changes if it is a writer, is the one the argument `<param>` names. See
-    /// [`Help::scope`].
-    pub scope: Option<String>,
+    /// The tool declared `@request-id`: an optional `request-id` parameter that
+    /// the harness fills with the tool call's id when the caller omits it. See
+    /// [`Help::request_id`].
+    pub request_id: bool,
+    /// The tool declared `@root`: it takes a required `root` path and is given
+    /// the object there (design/tool-contract.md, "`root`"). See [`Help::root`].
+    pub root: bool,
     /// The tool declared `@op <name>`: the step performs this operation itself.
     /// See [`Help::op`].
     pub op: Option<String>,
 }
 
-/// What `@in` offers the model: the tree to run over, defaulting to the one
-/// that the tool's own path selected.
-///
-/// A SYNTHETIC parameter rather than something a tool writes itself — `@param
-/// in` stays refused, because `in` is bound by the interpreter and a tool
-/// declaring it by hand would be declaring the thing that binds it. Making it
-/// a parameter is what lets a caller redirect the input: a tool that lives in
-/// one tree (`caos-std/caos-build`, put there by the session's own
-/// expression) can be run over another (`feature/01-change`), which it cannot
-/// do while the input is derived from where the tool happens to sit.
-const IN_DOC: &str = "The tree to run over. Defaults to the source tree this \
-                      tool sits in, which for a tool the session itself \
-                      generated is usually not the tree you mean.";
+/// What `@request-id` offers the model (design/tool-contract.md, "`@request-id`").
+/// Leaving it out is the normal case: the harness fills in the call's own id.
+pub const REQUEST_ID: &str = "request-id";
+
+/// The parameter `@root` adds: the path the tool works on.
+pub const ROOT: &str = "root";
+const REQUEST_ID_DOC: &str = "Leave this out: each call is then its own run, \
+                              never answered from an earlier call's cached result. \
+                              Pass a value only to share one result between calls \
+                              on purpose.";
 
 impl TreeTool {
     /// A named tool from its parsed help.
     fn new(name: &str, help: Help) -> TreeTool {
         let mut args = help.args;
-        if help.wants_in {
+        if help.root && !args.iter().any(|a| a.name == ROOT) {
+            // First, because it is what the call is about.
+            args.insert(
+                0,
+                TreeArg {
+                    name: ROOT.to_string(),
+                    doc: crate::root::ROOT_DOC.to_string(),
+                    required: true,
+                    ty: ArgType::Text,
+                },
+            );
+        }
+        if help.request_id && !args.iter().any(|a| a.name == REQUEST_ID) {
             args.push(TreeArg {
-                name: "in".to_string(),
-                doc: IN_DOC.to_string(),
+                name: REQUEST_ID.to_string(),
+                doc: REQUEST_ID_DOC.to_string(),
                 required: false,
-                ty: ArgType::Tree,
+                ty: ArgType::Text,
             });
         }
         TreeTool {
             name: name.to_string(),
             doc: help.doc,
             args,
-            git: help.git,
             writer: help.writer,
-            wants_in: help.wants_in,
-            call: help.call,
-            scope: help.scope,
+            request_id: help.request_id,
+            root: help.root,
             op: help.op,
         }
     }
@@ -430,74 +423,32 @@ pub struct Help {
     /// placeholder.
     pub doc: String,
     pub args: Vec<TreeArg>,
-    /// `@git`: bind the input as a COMMIT (`wc`) and the turn's ref snapshot
-    /// (`refs`), as extra args alongside whatever else the tool asked for.
-    ///
-    /// For a tool that must walk HISTORY rather than read content. `in` is a
-    /// tree, and a tree has no history: it cannot say what its parent was, what
-    /// changed in the last commit, or what `main` points at. A commit answers
-    /// the first two and the ref snapshot the third.
-    ///
-    /// Off by default because `wc` changes on EVERY accepted edit — each
-    /// mutation mints a child commit — while the tree can be byte-identical
-    /// across them. Binding it into a build or test tool would turn every call
-    /// into a cache miss for a commit it never reads. Same argument as
-    /// [`Help::wants_in`], one level up.
-    ///
-    /// IT APPLIES ONLY TO A DISPATCHED READER, and both halves of that are
-    /// load-bearing:
-    /// - DISPATCHED: an in-process built-in gets the session's store
-    ///   directly and ignores this. `log`/`show`/`diff` declared it for exactly
-    ///   that reason and it did nothing for them.
-    /// - READER: a WRITER's input commit is not a caller's to choose. Its
-    ///   proposal must descend from the commit whose pointer is being advanced
-    ///   (`writer_callback`'s ancestry check, and `reconcile`'s own `before`),
-    ///   so it is pinned to the scope. `merge` — the one tool that really needs
-    ///   the input commit — takes it as `ours`, bound by the launch, and its
-    ///   help says why: a model naming it "would be naming the session it
-    ///   is already in".
-    ///
-    /// NO TOOL USES IT TODAY. `merge` predates it and binds `wc` itself under a
-    /// name of its own, which is why the generic form found no users.
-    pub git: bool,
     /// `@writer`: this tool PROPOSES A CHANGE to the tree it is run on, rather
     /// than returning a value. Absent means read-only, which is the default
     /// precisely because it is the safe answer for a tool that forgot to say.
     pub writer: bool,
-    /// `@in`: bind the tree this tool was run on as `in`.
-    ///
-    /// Absent means DO NOT BIND IT, and that is the point: the tree is the
-    /// biggest thing that can land in an ArgTree, and the ArgTree is the cache
-    /// key. `caos-test-result`, whose entire input is a hash, carried the whole
-    /// source tree and so re-keyed on every edit to it — asking twice for the
-    /// same test record could not hit. `grep` has always done this right by
-    /// binding only the scope it searches, which is why a scoped grep is cheap.
-    pub wants_in: bool,
-    /// `@call`: bind this tool call's id as `call`, for a tool whose result
-    /// must not be reused by a later call with the same arguments, such as one
-    /// that talks to an outside service. Results are kept by their arguments,
-    /// and the call id is unique to the call yet the same when a call is
-    /// recovered, so a retry gets the stored result and a new call does not.
-    pub call: bool,
-    /// `@scope <param>`: the tool runs over, and a writer changes, the SOURCE
-    /// TREE the argument `<param>` names (the path of a code reference in the
-    /// session, such as `feature/01-change`).
-    ///
-    /// Everything else gets its scope from WHERE THE TOOL SITS: a tool reached
-    /// at `feature/01-change/caos-tools/test` runs over `feature/01-change`, and
-    /// one at `caos-std/…` over the session. That is wrong for a tool that
-    /// is a SHARED one and acts on a tree the caller picks: `merge` is reached at
-    /// `caos-std/merge` and must advance `feature/01-change`. The tag says which
-    /// parameter names the tree; with it the tool gets that tree's commit as
-    /// `wc` (it implies `@git`), a writer's proposal advances THAT source tree,
-    /// and `in` defaults to its code. The parameter must be declared with
-    /// `@param`: a tag that names none is reported, not obeyed.
-    pub scope: Option<String>,
+    /// `@request-id`: the tool reads or changes something outside caos, so a
+    /// result must never be reused by a later call that merely has the same
+    /// arguments. It gets an optional `request-id` parameter, which the harness
+    /// fills with the tool call's id when the caller leaves it out
+    /// (design/tool-contract.md, "`@request-id`"). The call id rather than a
+    /// random value because it is just as unique and it is in the transcript.
+    /// It replaced `@call`.
+    pub request_id: bool,
+    /// `@root`: the tool takes a REQUIRED `root` parameter, a path relative to
+    /// the session root, and is given the object there as `/cas/args/root` (a
+    /// blob, a tree or a gitlink's commit; absent when nothing is there) and
+    /// nothing else. Where the tool sits never decides what it runs over. Its
+    /// result is `{stdout, failed?}`, and a writer's adds `root` or `deleted`,
+    /// and `commit-message`; the harness puts a writer's new object back and
+    /// rewrites everything above it (design/tool-contract.md, "`root`").
+    /// It replaced `@in`, `@git` and `@scope`.
+    pub root: bool,
     /// `@op <name>`: the tool is an OPERATION OF THE STEP, not a worker. The entry
     /// that declares it exists to give the operation a path, a help and a place in
     /// `tool_help`/`run_tool`; running it is the step doing the work in process,
-    /// because the operation writes the session's own records (a source tree
-    /// imported, a publication, a subagent) and owns its call's lifecycle.
+    /// because the operation writes the session's own records (a child
+    /// session, an async task) and owns its call's lifecycle.
     pub op: Option<String>,
 }
 
@@ -515,23 +466,22 @@ fn block_tag(line: &str) -> Option<&str> {
 
 /// Parse a tool's `help` string as a JAVADOC comment (SPEC, "CaosTools"): the
 /// free text before the first block tag is the description, `@param <name>` /
-/// `@param [<name>]` tags declare the parameters, and the bare tags `@git` and
-/// `@writer` set flags.
+/// `@param [<name>]` tags declare the parameters, the bare tags `@writer`,
+/// `@root` and `@request-id` set flags, and `@op <name>` names an operation of
+/// the step.
 ///
 /// **An unrecognized tag is reported, never absorbed.** A misspelled `@writer`
 /// would otherwise leave a writer silently read-only — and then its proposal is
 /// discarded as a value, so the edit simply does not happen, with no error
 /// anywhere. Same reasoning as the `@param` message below: a tag this parser
 /// cannot act on is a defect in the tool, and the only place it can be noticed
-/// is here.
+/// is here. A tag that was removed is reported with what replaced it.
 fn parse_help(ctx: &str, text: &str) -> Help {
     let mut doc: Vec<&str> = Vec::new();
     let mut args = Vec::new();
-    let mut git = false;
     let mut writer = false;
-    let mut wants_in = false;
-    let mut call = false;
-    let mut scope: Option<String> = None;
+    let mut request_id = false;
+    let mut root = false;
     let mut op: Option<String> = None;
     let mut in_tags = false;
     for line in text.lines() {
@@ -548,29 +498,15 @@ fn parse_help(ctx: &str, text: &str) -> Help {
                 Some(a) => args.push(a),
                 None => eprintln!("{ctx}: unusable @param tag: {line}"),
             }
-        } else if trimmed == "@git" {
-            in_tags = true;
-            git = true;
         } else if trimmed == "@writer" {
             in_tags = true;
             writer = true;
-        } else if trimmed == "@in" {
+        } else if trimmed == "@request-id" {
             in_tags = true;
-            wants_in = true;
-        } else if trimmed == "@call" {
+            request_id = true;
+        } else if trimmed == "@root" {
             in_tags = true;
-            call = true;
-        } else if let Some(rest) = trimmed
-            .strip_prefix("@scope")
-            .filter(|rest| rest.starts_with(char::is_whitespace))
-        {
-            in_tags = true;
-            let name = rest.trim();
-            if name.is_empty() || name.contains(char::is_whitespace) {
-                eprintln!("{ctx}: @scope names one parameter, got {rest:?} — ignored");
-            } else {
-                scope = Some(name.to_string());
-            }
+            root = true;
         } else if let Some(rest) = trimmed
             .strip_prefix("@op")
             .filter(|rest| rest.starts_with(char::is_whitespace))
@@ -584,35 +520,39 @@ fn parse_help(ctx: &str, text: &str) -> Help {
             }
         } else if let Some(tag) = block_tag(trimmed) {
             in_tags = true;
-            eprintln!(
-                "{ctx}: unknown block tag @{tag} — ignored \
-                 (known: @param, @git, @writer, @in, @call, @scope, @op)"
-            );
+            match REMOVED_TAGS.iter().find(|(removed, _)| *removed == tag) {
+                Some((_, instead)) => eprintln!(
+                    "{ctx}: @{tag} was removed — ignored; {instead} \
+                     (design/tool-contract.md, \"Tags\")"
+                ),
+                None => eprintln!(
+                    "{ctx}: unknown block tag @{tag} — ignored \
+                     (known: @param, @root, @writer, @request-id, @op)"
+                ),
+            }
         } else if !in_tags {
             // Description text — everything before the first block tag.
             doc.push(trimmed);
         }
     }
-    // A scope that names no declared parameter would select nothing, silently:
-    // report it where the author can see it, and do not obey it.
-    if let Some(name) = &scope {
-        if !args.iter().any(|declared| &declared.name == name) {
-            eprintln!("{ctx}: @scope names {name:?}, which no @param declares — ignored");
-            scope = None;
-        }
-    }
     Help {
         doc: doc.join(" ").trim().to_string(),
         args,
-        // A scoped tool is handed its tree's commit, which is what `@git` is.
-        git: git || scope.is_some(),
         writer,
-        wants_in,
-        call,
-        scope,
+        request_id,
+        root,
         op,
     }
 }
+
+/// The tags design/tool-contract.md removed, each with what a tool declares
+/// instead.
+const REMOVED_TAGS: &[(&str, &str)] = &[
+    ("in", "declare @root and take the path to work on as `root`"),
+    ("git", "declare @root: a gitlink `root` gives the commit"),
+    ("scope", "declare @root: the source tree is the `root` path"),
+    ("call", "declare @request-id"),
+];
 
 /// The `help` string a tool's `.caos-expr` binds, read from the EXPRESSION'S
 /// OWN TEXT: a `HELP=<<END … END` here-string whose variable the value line
@@ -794,8 +734,8 @@ pub fn describe(tool: &TreeTool, path: &str) -> String {
     } else {
         "\nRead-only: returns a value and changes nothing.\n"
     });
-    out.push_str(if tool.wants_in {
-        "Reads a tree, named by its `in` parameter below.\n"
+    out.push_str(if tool.root {
+        "Works on the path its `root` parameter names, and sees nothing else.\n"
     } else {
         "Does not read the tree: its arguments are its whole input.\n"
     });
@@ -878,6 +818,88 @@ pub fn writer_result(result: &str) -> Result<WriterResult, String> {
         message: blob("message")?,
         failed: dir.join("failed").exists(),
     })
+}
+
+/// What a `@root` tool's result says (design/tool-contract.md, "The result"):
+/// `{stdout, failed?}`, and for a writer one of `root` (the new object for its
+/// root path) and `deleted`, and an optional `commit-message`.
+pub struct RootResult {
+    /// The text the model reads.
+    pub stdout: String,
+    /// The `failed` marker is present: the call failed, and a writer's result
+    /// is not applied, whatever else it holds.
+    pub failed: bool,
+    /// A writer returned `root`; its mode and object are read from the result
+    /// tree itself, which says exactly what the tool meant.
+    pub has_root: bool,
+    /// A writer returned `deleted`: remove whatever is at the root path.
+    pub deleted: bool,
+    pub commit_message: Option<String>,
+}
+
+/// Read a `@root` tool's result. Every mistake here is the TOOL's, answered to
+/// the model rather than failing the worker, as for [`writer_result`]. A writer
+/// that has not failed must say exactly one of `root` and `deleted`, so one
+/// that forgets its output can never delete its root.
+pub fn root_result(result: &str, writer: bool) -> Result<RootResult, String> {
+    caos(["get", result])?;
+    let dir = Path::new(result);
+    if !dir.is_dir() {
+        return Err("a result must be a tree holding `stdout`, not a blob".to_string());
+    }
+    let blob = |name: &str| -> Result<Option<String>, String> {
+        let file = dir.join(name);
+        if !file.exists() {
+            return Ok(None);
+        }
+        caos(["get", path(&file)])?;
+        let bytes = fs::read(&file).map_err(|e| format!("reading {name}: {e}"))?;
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    };
+    let stdout =
+        blob("stdout")?.ok_or("the result has no `stdout` entry — the text for the model")?;
+    let failed = dir.join("failed").exists();
+    let has_root = dir.join("root").exists();
+    let deleted = dir.join("deleted").exists();
+    if !writer && (has_root || deleted) {
+        return Err(
+            "the result holds `root` or `deleted`, but the tool does not declare @writer"
+                .to_string(),
+        );
+    }
+    if writer && !failed {
+        match (has_root, deleted) {
+            (true, true) => return Err("the result holds both `root` and `deleted`".to_string()),
+            (false, false) => {
+                return Err(
+                    "the result holds neither `root` (the new object for its root path) \
+                     nor `deleted`"
+                        .to_string(),
+                )
+            }
+            _ => {}
+        }
+    }
+    Ok(RootResult {
+        stdout,
+        failed,
+        has_root,
+        deleted,
+        commit_message: blob("commit-message")?,
+    })
+}
+
+/// The text a model reads, cut to [`MAX_READ_BYTES`] by keeping the TAIL:
+/// reports and diagnostics put the summary last.
+pub fn keep_tail(text: &str) -> String {
+    if text.len() <= MAX_READ_BYTES {
+        return text.trim_end().to_string();
+    }
+    let mut cut = text.len() - MAX_READ_BYTES;
+    while !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    format!("[... truncated ...]\n{}", text[cut..].trim_end())
 }
 
 /// Bind a tree-tool call's inputs to the parameters the script declared,
@@ -1345,7 +1367,7 @@ fn resolve_failure(rooted: bool, relative: &str, stderr: &str) -> String {
     if !rooted && stderr.contains("no such path") {
         format!(
             "{relative} is not in the session tree. Check the path first: `ls` its \
-             parent, and note an import lives where `import_source` put it (e.g. \
+             parent, and note an import lives where `caos-std/import-source` put it (e.g. \
              sources/<repo>/00-base). Only if an expression produces it (a mount \
              such as caos-std/ exists only in the evaluated tree) call eval_path with \
              that path or a parent of it, then pass the hash it prints as `root` with \
@@ -1589,7 +1611,7 @@ fn copy_entry(ws: &str, from: &[String], to: &[String]) -> Result<String, Fail> 
     // THE ENTRY ITSELF, NOT WHAT `resolve` MAKES OF IT. Resolving `from` walks
     // THROUGH a source tree (a commit entry) to its code tree, and a link to
     // that would copy the files but not the commit: the copy would not be a
-    // source tree, and `log`, `diff` and `publish_source` would not know it.
+    // source tree, and `log`, `diff` and `caos-std/publish-source` would not know it.
     // The child of the parent directory is the entry as stored -- which is
     // also how `ls` tells a commit from a directory.
     resolve(None, ws, from)?; // a path that is not there is the model's mistake
@@ -1791,7 +1813,6 @@ mod tests {
                     @param [log] Which inner-stack log.";
         let h = parse_help("t", help);
         assert_eq!(h.doc, "Print one test's record. A second description line.");
-        assert!(!h.git);
         assert!(!h.writer, "a tool is read-only unless it says otherwise");
         assert_eq!(h.args.len(), 2);
         assert_eq!(h.args[0].name, "hash");
@@ -1802,17 +1823,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_help_git_tag_and_no_params() {
-        let h = parse_help("t", "Just a description.\n@git");
-        assert_eq!(h.doc, "Just a description.");
-        assert!(h.git);
-        assert!(h.args.is_empty());
+    fn removed_tags_are_ignored_and_no_params() {
+        // `@in`, `@git`, `@scope` and `@call` are gone (design/tool-contract.md,
+        // "Tags"): reported, and they add neither a flag nor a parameter.
+        for tag in ["@in", "@git", "@scope src", "@call"] {
+            let h = parse_help("t", &format!("Just a description.\n{tag}"));
+            assert_eq!(h.doc, "Just a description.");
+            assert!(h.args.is_empty(), "{tag}");
+            assert!(!h.root && !h.writer && !h.request_id, "{tag}");
+        }
+        assert!(REMOVED_TAGS.iter().any(|(tag, _)| *tag == "in"));
 
         // Empty help → empty description (the caller placeholders it) and no args.
         let h = parse_help("t", "");
         assert!(h.doc.is_empty());
         assert!(h.args.is_empty());
-        assert!(!h.git);
         assert!(!h.writer);
     }
 
@@ -1865,52 +1890,16 @@ mod tests {
     }
 
     #[test]
-    fn in_is_opt_in_and_described() {
-        // Absent means the tree is NOT bound, which is what keeps it out of the
-        // cache key for a tool whose whole input is its arguments.
+    fn a_tool_without_root_reads_only_its_arguments() {
+        // Nothing binds the tree for it, so it is not in the cache key of a tool
+        // whose whole input is its arguments.
         let reader = TreeTool::new(
             "caos-test-result",
             parse_help("t", "Print a record.\n@param hash The hash."),
         );
-        assert!(!reader.wants_in);
+        assert_eq!(reader.args.len(), 1);
         let text = describe(&reader, "std/caos-test-result");
-        assert!(text.contains("Does not read the tree"));
-
-        let tester = TreeTool::new("caos-test", parse_help("t", "Run the suite.\n@in"));
-        assert!(tester.wants_in);
-        let text = describe(&tester, "std/caos-test");
-        assert!(text.contains("Reads a tree, named by its `in` parameter"));
-
-        // `@in` becomes an OPTIONAL `{tree}` parameter, which is what lets a
-        // caller run the tool over a tree other than the one it sits in.
-        assert_eq!(tester.args.len(), 1);
-        assert_eq!(tester.args[0].name, "in");
-        assert_eq!(tester.args[0].ty, ArgType::Tree);
-        assert!(!tester.args[0].required, "it defaults, so it is optional");
-        assert!(text.contains("in (optional)"), "listed for the model: {text}");
-
-        // A tool may not declare it by hand: `in` is what the interpreter
-        // binds, and `@in` is the way to ask for it.
-        let by_hand = parse_help("t", "d\n@param {tree} in The tree.");
-        assert!(by_hand.args.is_empty());
-        assert!(!by_hand.wants_in);
-    }
-
-    #[test]
-    fn call_is_opt_in_and_not_a_parameter() {
-        let plain = TreeTool::new("t", parse_help("t", "d\n@param path P."));
-        assert!(!plain.call);
-
-        // The harness binds `call`; the model never sees it.
-        let api = TreeTool::new("github", parse_help("t", "d\n@param path P.\n@call"));
-        assert!(api.call);
-        assert_eq!(api.args.len(), 1);
-        assert_eq!(api.args[0].name, "path");
-
-        // Nor may a tool declare it by hand.
-        let by_hand = parse_help("t", "d\n@param call The id.");
-        assert!(by_hand.args.is_empty());
-        assert!(!by_hand.call);
+        assert!(text.contains("Does not read the tree"), "{text}");
     }
 
     #[test]
@@ -1962,19 +1951,47 @@ mod tests {
     }
 
     #[test]
-    fn writer_is_opt_in_and_independent_of_git() {
+    fn writer_is_opt_in_and_independent_of_root() {
         let h = parse_help("t", "Merges a branch in.\n@writer");
         assert!(h.writer);
-        assert!(!h.git);
+        assert!(!h.root);
         assert_eq!(h.doc, "Merges a branch in.");
 
         // Both tags, in either order, and the description still stops at the
         // first one.
-        let h = parse_help("t", "Walks history and edits.\n@writer\n@git");
-        assert!(h.writer && h.git);
+        let h = parse_help("t", "Walks history and edits.\n@writer\n@root");
+        assert!(h.writer && h.root);
         assert_eq!(h.doc, "Walks history and edits.");
-        let h = parse_help("t", "d\n@git\n@writer");
-        assert!(h.writer && h.git);
+        let h = parse_help("t", "d\n@root\n@writer");
+        assert!(h.writer && h.root);
+    }
+
+    #[test]
+    fn root_is_a_required_first_parameter() {
+        let h = parse_help("t", "Edits a file.\n@param text The text.\n@writer\n@root\n@in");
+        assert!(h.root && h.writer);
+        let tool = TreeTool::new("t", h);
+        assert_eq!(tool.args[0].name, ROOT);
+        assert!(tool.args[0].required);
+        assert_eq!(tool.args.len(), 2, "no `in` is offered");
+        let described = describe(&tool, "caos-std/t");
+        assert!(described.contains("`root` parameter"), "{described}");
+    }
+
+    #[test]
+    fn request_id_is_an_optional_parameter_offered_once() {
+        let h = parse_help("t", "Talks to GitHub.\n@param path The path.\n@request-id");
+        assert!(h.request_id);
+        let tool = TreeTool::new("t", h);
+        let offered: Vec<_> = tool.args.iter().filter(|a| a.name == REQUEST_ID).collect();
+        assert_eq!(offered.len(), 1);
+        assert!(!offered[0].required);
+        // A tool that already declared it by hand is not offered it twice.
+        let h = parse_help("t", "d\n@param [request-id] Its own words.\n@request-id");
+        let tool = TreeTool::new("t", h);
+        assert_eq!(tool.args.len(), 1);
+        assert_eq!(tool.args[0].doc, "Its own words.");
+        assert!(!parse_help("t", "d\n@param path The path.").request_id);
     }
 
     #[test]
@@ -2001,9 +2018,9 @@ mod tests {
 
     #[test]
     fn parse_help_skips_reserved_and_malformed_params() {
-        // `in` is reserved; `Bad` is not a lowercase name → both skipped, the
+        // `salt` is reserved; `Bad` is not a lowercase name → both skipped, the
         // good one survives.
-        let h = parse_help("t", "d\n@param in nope\n@param Bad nope\n@param ok yes");
+        let h = parse_help("t", "d\n@param salt nope\n@param Bad nope\n@param ok yes");
         assert_eq!(h.args.len(), 1);
         assert_eq!(h.args[0].name, "ok");
     }
@@ -2068,7 +2085,7 @@ mod tests {
     fn read_and_ls_are_inline_and_declared() {
         // Routed in-process (no sub-run). A repository tool cannot shadow them:
         // it is named by path, never by name.
-        for t in ["read", "ls", "copy", "move", "remove", "import_source"] {
+        for t in ["read", "ls", "copy", "move", "remove"] {
             assert!(is_inline(t));
             assert!(declarations().iter().any(|d| d["name"] == t));
         }
@@ -2143,7 +2160,7 @@ mod tests {
             "input": {"file-path": "a", "caos_session": "s", "source_tree": "main"}});
         assert!(unknown_argument(&plumbing, "read").is_none());
         // A tool that is not a file tool is not this check's business.
-        assert!(unknown_argument(&json!({"input": {"x": 1}}), "import_source").is_none());
+        assert!(unknown_argument(&json!({"input": {"x": 1}}), "run_tool").is_none());
     }
 
     #[test]
@@ -2258,7 +2275,7 @@ mod tests {
 
         // Rejected: an arg the interpreter already binds (curry errors on a
         // rebind), and anything that isn't a plain lower-case flag name.
-        assert!(parse_arg("in The source tree.").is_none());
+        assert!(parse_arg("salt The salt.").is_none());
         assert!(parse_arg("worker1 The script.").is_none());
         assert!(parse_arg("Hash The record hash.").is_none());
         assert!(parse_arg("--hash The record hash.").is_none());
@@ -2284,11 +2301,9 @@ mod tests {
                     ty: ArgType::Text,
                 },
             ],
-            git: false,
             writer: false,
-            wants_in: false,
-            call: false,
-            scope: None,
+            request_id: false,
+            root: false,
             op: None,
         };
         let d = tree_tool_declaration(&tool);
@@ -2306,11 +2321,9 @@ mod tests {
             name: "build".to_string(),
             doc: "Build.".to_string(),
             args: Vec::new(),
-            git: false,
             writer: false,
-            wants_in: false,
-            call: false,
-            scope: None,
+            request_id: false,
+            root: false,
             op: None,
         };
         let d = tree_tool_declaration(&bare);
@@ -2339,11 +2352,9 @@ mod tests {
                     ty: ArgType::Text,
                 },
             ],
-            git: false,
             writer: false,
-            wants_in: false,
-            call: false,
-            scope: None,
+            request_id: false,
+            root: false,
             op: None,
         };
         let call = |input: Value| json!({"id": "toolu_01", "name": "echo-arg", "input": input});

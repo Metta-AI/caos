@@ -11,15 +11,10 @@
 //! the session.
 
 mod async_work;
-mod ci_status;
 mod githist;
-mod import_source;
 mod progress;
-mod publish_source;
-mod stack_merge_to_master;
-mod stack_publish;
-mod stack_sync;
 mod record;
+mod root;
 mod source_trees;
 mod subagents;
 mod timing;
@@ -1076,8 +1071,9 @@ fn op_call(call: &Call) -> Call {
 
 /// Perform a step operation (`@op` in a tool's help). Each owns its call's
 /// lifecycle: it writes the call's start, the records it exists for, and the
-/// call's completion itself. `started` is the call's record when this is a RESUME
-/// of an operation that began and has not finished.
+/// call's completion itself. `started` is the call's record when the step picks
+/// up an `agent-wait` that began in an earlier invocation; no other operation is
+/// ever run a second time (design/tool-contract.md, "No automatic resume").
 ///
 /// Returns whether the step should carry on at once. The one that does not is
 /// `agent-wait`, which dispatches a join on the child's relay and waits for its
@@ -1090,12 +1086,6 @@ fn run_op(
     started: Option<&CallRecord>,
 ) -> Result<bool, String> {
     match (op, started) {
-        ("import-source", _) => import_source::execute(state, site).map(|()| true),
-        ("publish-source", _) => publish_source::execute(state, site).map(|()| true),
-        ("stack-publish", _) => stack_publish::execute(state, site).map(|()| true),
-        ("stack-sync", _) => stack_sync::execute(state, site).map(|()| true),
-        ("stack-merge-to-master", _) => stack_merge_to_master::execute(state, site).map(|()| true),
-        ("ci-status", _) => ci_status::execute(state, site).map(|()| true),
         ("agent-spawn", _) => spawn_agent_call(cfg, state, site),
         ("agent-harvest", _) => harvest_agent_call(state, site).map(|()| true),
         ("run-async", _) => run_async_call(cfg, state, site).map(|()| true),
@@ -1131,25 +1121,15 @@ fn op_marker_path(site: &CallSite<'_>) -> String {
     )
 }
 
-/// The operation a STARTED `run_tool` call is in the middle of. A call resumed
-/// after a restart has only its record to go on, and re-evaluating the tool's path
-/// to learn the operation would be a build: so an operation says what it is in a
-/// payload of its own start, or by the pin it wrote before doing anything
-/// irreversible.
+/// The operation a STARTED `run_tool` call is in the middle of, as the marker in
+/// its start says. Only `agent-wait` is ever picked up again from here (a join
+/// spans step invocations); re-evaluating the tool's path to learn the operation
+/// would be a build, which is why the start carries it.
 fn started_op(view: &Session<'_>, site: &CallSite<'_>) -> Option<String> {
-    if let Ok(bytes) = view.payload(&op_marker_path(site)) {
-        if let Ok(Value::String(op)) = serde_json::from_slice::<Value>(&bytes) {
-            return Some(op);
-        }
-    }
-    if view.payload(&import_source::pin_path(site)).is_ok() {
-        Some("import-source".to_string())
-    } else if view.payload(&publish_source::pin_path(site)).is_ok() {
-        Some("publish-source".to_string())
-    } else if view.payload(&stack_publish::pin_path(site)).is_ok() {
-        Some("stack-publish".to_string())
-    } else {
-        None
+    let bytes = view.payload(&op_marker_path(site)).ok()?;
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(Value::String(op)) => Some(op),
+        _ => None,
     }
 }
 
@@ -1166,28 +1146,26 @@ fn drive_call(
         .tool(&call.id)?
     {
         if existing.status == CallStatus::Started {
+            // A subagent join spans step invocations by design: the step
+            // dispatches a join on the child's relay and is called back when
+            // the child finishes, so finding one started is the normal case.
+            if existing.name == subagents::WAIT_TOOL {
+                dispatch_wait_started(state, request, call, &existing)?;
+                return Ok(false);
+            }
             if existing.name == "run_tool" {
                 let inner = op_call(call);
                 let op_site = CallSite::new(request, declaration, &inner);
-                let op = started_op(&state.session()?, &op_site);
-                if let Some(op) = op {
-                    return run_op(cfg, &op, state, &op_site, Some(&existing));
+                if started_op(&state.session()?, &op_site).as_deref() == Some("agent-wait") {
+                    return run_op(cfg, "agent-wait", state, &op_site, Some(&existing));
                 }
             }
-            if existing.name == "publish_source" {
-                publish_source::execute(state, &site)?;
-                return Ok(true);
-            }
-            if existing.name == "import_source" {
-                import_source::execute(state, &site)?;
-                return Ok(true);
-            }
-            if existing.name == subagents::WAIT_TOOL {
-                dispatch_wait_started(state, request, call, &existing)?;
-            } else {
-                dispatch_started(state, request, call, &existing)?;
-            }
-            return Ok(false);
+            // Anything else found started was being run by a step that stopped
+            // before it finished. It is never run again behind the agent's back
+            // (design/tool-contract.md, "No automatic resume"): it is answered
+            // as unfinished, and the agent decides whether to call again.
+            close_unfinished(state, &existing)?;
+            return Ok(true);
         }
         return Ok(true);
     }
@@ -1200,14 +1178,6 @@ fn drive_call(
     }
     if call.name == subagents::HARVEST_TOOL {
         harvest_agent_call(state, &site)?;
-        return Ok(true);
-    }
-    if call.name == "publish_source" {
-        publish_source::execute(state, &site)?;
-        return Ok(true);
-    }
-    if call.name == "import_source" {
-        import_source::execute(state, &site)?;
         return Ok(true);
     }
     if call.name == async_work::TOOL_NAME {
@@ -1590,36 +1560,6 @@ fn prepare_grep(cfg: &Config, call: &Value, ws: &str) -> Result<Prepared, String
 /// there is one only when the tool asked for it — the tree is the biggest thing
 /// that can enter an ArgTree, and the ArgTree is the cache key
 /// (SPEC, "CaosTools" — Receiving args).
-/// Split the bound arguments into the ones that ride on the TOOL'S CURRY and
-/// the tree bound as the REQUEST's `in`.
-///
-/// `in` is bound in exactly ONE place whichever side supplied it — the
-/// request — because `caos curry` refuses a rebind, and binding the caller's
-/// tree in the curry while the request bound the default would be exactly
-/// that. So the caller's `in` is lifted out of the curry args here.
-///
-/// With no `in` supplied, the default is the tree the tool's own path selected,
-/// and only for a tool that declared `@in`.
-type Bindings<'a> = Vec<(&'a str, Arg<'a>)>;
-
-fn split_input<'a>(
-    ready: &'a [(String, tools::ReadyArg)],
-    wants_in: bool,
-    ws: &'a str,
-) -> (Bindings<'a>, Bindings<'a>) {
-    let args = ready
-        .iter()
-        .filter(|(name, _)| name != "in")
-        .map(|(name, value)| (name.as_str(), value.arg()))
-        .collect();
-    let input = match ready.iter().find(|(name, _)| name == "in") {
-        Some((_, supplied)) => vec![("in", supplied.arg())],
-        None if wants_in => vec![("in", Arg::Path(ws))],
-        None => Vec::new(),
-    };
-    (args, input)
-}
-
 fn prepared_request(
     image: &str,
     args: &[(&str, Arg<'_>)],
@@ -1677,7 +1617,6 @@ fn launch_resolved_tool(
         )?;
         return resume(cfg, state, turn);
     }
-    let (ws, wc) = materialize_source_tree(state, &commit)?;
     let relative = read_arg("tool-lookup")?;
     let image = arg("result");
     let site = CallSite::at(&turn.request, &call, &current.message_id);
@@ -1713,37 +1652,13 @@ fn launch_resolved_tool(
             Ok(())
         };
     }
+    if tool.root {
+        return launch_root_tool(cfg, state, turn, &call, &tool, &image, &current.message_id);
+    }
+    // A tool without `@root` reads nothing of the session: its arguments are its
+    // whole input (design/tool-contract.md, "Tags").
     let nested = json!({"id": id, "input":
         call.input.get("arguments").cloned().unwrap_or_else(|| json!({}))});
-    // A tool that declares `@scope <param>` runs over, and a writer changes, the
-    // source tree its argument names, not the one its path happens to sit in:
-    // `merge` is reached at `caos-std/merge` and advances `feature/01-change`.
-    let selected = tool
-        .scope
-        .as_deref()
-        .and_then(|param| nested["input"][param].as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let (name, commit, ws, wc) = match selected {
-        None => (name, commit, ws, wc),
-        Some(selected) => match source_tree_target(&state.session()?, Some(selected)) {
-            Ok(Some((scoped, scoped_commit))) => {
-                let (scoped_ws, scoped_wc) = materialize_source_tree(state, &scoped_commit)?;
-                (Some(scoped), scoped_commit, scoped_ws, scoped_wc)
-            }
-            Ok(None) | Err(_) => {
-                let why = source_tree_target(&state.session()?, Some(selected))
-                    .err()
-                    .unwrap_or_else(|| format!("unknown source tree {selected:?}"));
-                site.failed(
-                    state,
-                    &error_block(id, &why),
-                    name.map(|name| (name, commit)),
-                )?;
-                return resume(cfg, state, turn);
-            }
-        },
-    };
     let session = state.session()?.tree().clone();
     let bound = match tools::tree_tool_args(&nested, &tool, Some(session.as_str())) {
         Ok(bound) => bound,
@@ -1760,20 +1675,18 @@ fn launch_resolved_tool(
         .iter()
         .map(|(key, value)| Ok((key.clone(), value.ready()?)))
         .collect::<Result<_, String>>()?;
-    let (args, input) = split_input(&ready, tool.wants_in, ws.as_str());
-    let mut args = args;
-    if tool.git {
-        args.push(("wc", Arg::Path(&wc)));
-        if let Some(refs) = cfg.merge_refs.as_deref() {
-            args.push(("refs", Arg::Lit(refs)));
-        }
-    }
-    if tool.call {
-        args.push(("call", Arg::Lit(&call.id)));
+    let mut args: Vec<(&str, Arg)> = ready
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.arg()))
+        .collect();
+    // `@request-id` the caller left out: the call's own id, so this call is its
+    // own run and the transcript says which key it used.
+    if tool.request_id && !args.iter().any(|(name, _)| *name == tools::REQUEST_ID) {
+        args.push((tools::REQUEST_ID, Arg::Lit(&call.id)));
     }
     let task = (|| {
         let curried = caos_curry(Arg::Hash(&tool_tree), &args)?;
-        let task_text = prepare_request(Arg::Hash(&curried), &input)?;
+        let task_text = prepare_request(Arg::Hash(&curried), &[])?;
         Oid::parse(&task_text, "tree tool task")
     })();
     let task = match task {
@@ -1816,6 +1729,117 @@ fn launch_resolved_tool(
     }
 }
 
+/// Launch a `@root` tool (design/tool-contract.md, "`root`"): it is given the
+/// object at its `root` path in the session as it is now, and nothing else.
+/// Where the tool sits decided which definition runs, never what it runs
+/// over. The session commit is the call's input, so a writer's result is put
+/// back against exactly what it was given.
+fn launch_root_tool(
+    cfg: &Config,
+    state: &mut progress::State,
+    turn: &Turn,
+    call: &Call,
+    tool: &tools::TreeTool,
+    image: &str,
+    declaration: &str,
+) -> Result<(), String> {
+    let id = call.id.as_str();
+    let site = CallSite::at(&turn.request, call, declaration);
+    let arguments = call
+        .input
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let nested = json!({"id": id, "input": arguments});
+    let session = state.session()?.tree().clone();
+    let bound = match tools::tree_tool_args(&nested, tool, Some(session.as_str())) {
+        Ok(bound) => bound,
+        Err(block) => {
+            site.failed(state, &block, None)?;
+            return resume(cfg, state, turn);
+        }
+    };
+    let root_path = nested["input"][tools::ROOT].as_str().unwrap_or_default();
+    let base = state.head().clone();
+    let located = match root::locate(root_path) {
+        Ok(root::Located::Session(components)) => state
+            .store()
+            .tree_of(&base)
+            .and_then(|tree| root::resolve(state.store(), &tree, &components)),
+        Ok(root::Located::Object(..)) if tool.writer => Err(format!(
+            "root {root_path:?} names an object outside the session; a writer's root is a \
+             path in the session, such as sources/<repo>/<layer>/<file>"
+        )),
+        Ok(root::Located::Object(oid, components)) => {
+            root::resolve_object(state.store(), &oid, &components)
+        }
+        Err(error) => Err(error),
+    };
+    let object = match located {
+        Ok(object) => object,
+        Err(error) => {
+            site.failed(state, &error_block(id, &error), None)?;
+            return resume(cfg, state, turn);
+        }
+    };
+    let ready: Vec<(String, tools::ReadyArg)> = bound
+        .iter()
+        .filter(|(key, _)| key.as_str() != tools::ROOT)
+        .map(|(key, value)| Ok((key.clone(), value.ready()?)))
+        .collect::<Result<_, String>>()?;
+    let mut args: Vec<(&str, Arg)> = ready
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.arg()))
+        .collect();
+    // The object itself, materialized so it binds at its own kind: a blob, a
+    // tree, or a gitlink's commit. Nothing there binds nothing.
+    let materialized = fresh("root");
+    if let Some((_, oid)) = &object {
+        caos(["get-hash", oid.as_str(), &materialized])?;
+        args.push((tools::ROOT, Arg::Path(&materialized)));
+    }
+    if tool.request_id && !args.iter().any(|(name, _)| *name == tools::REQUEST_ID) {
+        args.push((tools::REQUEST_ID, Arg::Lit(id)));
+    }
+    let tool_tree = cas_hash(image)?;
+    let task = (|| {
+        let curried = caos_curry(Arg::Hash(&tool_tree), &args)?;
+        let task_text = prepare_request(Arg::Hash(&curried), &[])?;
+        Oid::parse(&task_text, "root tool task")
+    })();
+    let task = match task {
+        Ok(task) => task,
+        Err(error) => {
+            site.failed(state, &error_block(id, &error), None)?;
+            return resume(cfg, state, turn);
+        }
+    };
+    let started = CallRecord {
+        id: id.to_string(),
+        name: call.name.clone(),
+        declaration_message: declaration.to_string(),
+        source_tree_name: None,
+        input_commit: Some(base),
+        status: CallStatus::Started,
+        task: Some(task),
+        result: None,
+        source_tree_resolution: None,
+        files: Vec::new(),
+        files_outcome: None,
+    };
+    let expected = state.head().clone();
+    match state.try_append_at(
+        &expected,
+        Transition::ToolStart {
+            payloads: Vec::new(),
+            record: started.clone(),
+        },
+    )? {
+        progress::TryAppend::HeadChanged(_) => resume(cfg, state, turn),
+        progress::TryAppend::Appended(_) => dispatch_started(state, &turn.request, call, &started),
+    }
+}
+
 fn dispatch_started(
     state: &mut progress::State,
     request: &Oid,
@@ -1837,10 +1861,12 @@ fn dispatch_started(
     // Read from the declaration here, at dispatch, because by the time the
     // result comes back the tool's own path is no longer bound (`self_curry`
     // unbinds it) and `record.name` is only ever `run_tool`.
-    let writer_storage;
-    if let Some(declared) = declared_writer(call, record)? {
-        writer_storage = declared;
-        extras.push(("tool-writer", Arg::Lit(&writer_storage)));
+    let (writer_storage, root_storage) = declared_contract(call, record)?;
+    if let Some(declared) = &writer_storage {
+        extras.push(("tool-writer", Arg::Lit(declared)));
+    }
+    if let Some(root) = &root_storage {
+        extras.push(("tool-root", Arg::Lit(root)));
     }
     let scope_storage;
     if call.name == "grep" {
@@ -1866,10 +1892,16 @@ fn dispatch_started(
 /// a tool's help now comes from its EVALUATED image, so that would mean
 /// evaluating it twice.
 ///
+/// The second, for a task whose tool declares `@root`: the root path the call
+/// named (design/tool-contract.md, "`root`"), which its result is read against.
+///
 /// `None` for a task whose tool carries no help, which is every reader.
-fn declared_writer(call: &Call, record: &CallRecord) -> Result<Option<String>, String> {
+fn declared_contract(
+    call: &Call,
+    record: &CallRecord,
+) -> Result<(Option<String>, Option<String>), String> {
     let Some(task) = record.task.as_ref() else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let at = fresh("task-image");
     caos(["get-hash", task.as_str(), &at])?;
@@ -1877,19 +1909,23 @@ fn declared_writer(call: &Call, record: &CallRecord) -> Result<Option<String>, S
         Ok(Some(tool)) => tool,
         // A malformed or absent help is not this function's business: the call
         // has already run and its result is about to be read.
-        _ => return Ok(None),
+        _ => return Ok((None, None)),
     };
-    if !described.writer {
-        return Ok(None);
-    }
     // Name it the way the model named it, so an error about the proposal points
     // back at what it called.
-    Ok(Some(
+    let writer = described.writer.then(|| {
         call.input["path"]
             .as_str()
             .unwrap_or(&record.name)
-            .to_string(),
-    ))
+            .to_string()
+    });
+    let root = described.root.then(|| {
+        call.input["arguments"][tools::ROOT]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    });
+    Ok((writer, root))
 }
 
 fn dispatch_wait_started(
@@ -1938,6 +1974,10 @@ fn callback_result(
     // name any more.
     if read_arg_opt("op")?.as_deref() == Some("agent-wait") {
         return wait_callback_block(state, record);
+    }
+    if let Some(root) = read_arg_opt("tool-root")? {
+        let writer = read_arg_opt("tool-writer")?;
+        return root_callback(state, record, &root, writer.as_deref());
     }
     if let Some(tool) = read_arg_opt("tool-writer")? {
         return writer_callback(state, record, &tool);
@@ -2011,6 +2051,92 @@ fn writer_callback(
         result_block(&record.id, result.out.trim_end(), result.failed),
         Some(proposal),
     ))
+}
+
+/// A `@root` tool's result (design/tool-contract.md, "The result"): the model
+/// reads `stdout`; a writer's `root` or `deleted` is put at its root path in
+/// the session as it was when the call started, everything above it rewritten
+/// (a child commit at each gitlink on the way), and that session is the
+/// proposal `complete_compute` reconciles with whatever happened since.
+///
+/// A tool's mistake is answered as an `is_error` tool_result naming it, as for
+/// any writer.
+fn root_callback(
+    state: &mut progress::State,
+    record: &CallRecord,
+    root_path: &str,
+    writer: Option<&str>,
+) -> Result<(Value, Option<Oid>), String> {
+    let fail = |message: String| Ok((error_block(&record.id, &message), None));
+    let result = match tools::root_result(&arg("result"), writer.is_some()) {
+        Ok(result) => result,
+        Err(error) => return fail(format!("{}: {error}", writer.unwrap_or("the tool"))),
+    };
+    let text = tools::keep_tail(&result.stdout);
+    let block = result_block(&record.id, &text, result.failed);
+    let Some(tool) = writer else {
+        return Ok((block, None));
+    };
+    if result.failed {
+        return Ok((block, None));
+    }
+    let base = record
+        .input_commit
+        .clone()
+        .ok_or("a root tool's start has no input commit")?;
+    let components = root::components(root_path)?;
+    let base_tree = state.store().tree_of(&base)?;
+    let old = root::resolve(state.store(), &base_tree, &components)?;
+    // Without a message of its own, the commit says which tool changed what.
+    let message = result
+        .commit_message
+        .as_deref()
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map_or_else(|| format!("{tool} {root_path}"), str::to_string);
+    let new = if result.deleted {
+        None
+    } else {
+        let result_tree = Oid::parse(&cas_hash(&arg("result"))?, "root tool result")?;
+        state.fetch_object(&result_tree)?;
+        let entry = state
+            .store()
+            .read_tree(&result_tree)
+            .map_err(String::from)?
+            .into_iter()
+            .find(|entry| entry.name == "root")
+            .ok_or("the result has no root entry")?;
+        // A plain file keeps an executable bit it had: a tool that writes a
+        // file's content rarely means to change its mode.
+        let mode = match (entry.mode, &old) {
+            (Mode::Blob, Some((Mode::Executable, _))) => Mode::Executable,
+            (mode, _) => mode,
+        };
+        match (mode, &old) {
+            // A source tree's new code: the harness commits it, a child of the
+            // commit it replaces.
+            (Mode::Tree, Some((Mode::Commit, parent))) => {
+                let parent = parent.clone();
+                let minted = mint_source_tree_commit(state, &entry.oid, &parent, &message)?;
+                state.push_code(&minted)?;
+                Some((Mode::Commit, minted))
+            }
+            _ => Some((mode, entry.oid)),
+        }
+    };
+    if new == old {
+        return Ok((block, None));
+    }
+    let rebuilt = root::replace(state.store_mut(), &base_tree, &components, new, &message)?;
+    // A gitlink's commit is not part of the closure of the tree that names it,
+    // so each commit made on the way goes up on its own, deepest first, before
+    // the proposal that names them.
+    for commit in &rebuilt.commits {
+        state.push_code(commit)?;
+    }
+    let proposal = mint_source_tree_commit(state, &rebuilt.tree, &base, &message)?;
+    state.push_code(&proposal)?;
+    Ok((block, Some(proposal)))
 }
 
 fn mint_source_tree_commit(
@@ -2254,6 +2380,44 @@ fn completed_record(
         files_outcome: None,
         ..started.clone()
     }
+}
+
+/// What a call left started by a step that stopped is answered with.
+const UNFINISHED: &str = "this call did not finish: the step running it stopped before it completed. \
+It was not run again. Call it again if you still need its result; for anything that changes \
+something outside caos (a push, an import, a GitHub request), look at the remote first.";
+
+/// Close a call that a previous step left started, as failed with
+/// [`UNFINISHED`]. Concurrent completion wins: a call that is terminal by the
+/// time this looks again is left alone.
+fn close_unfinished<S: progress::RefStore>(
+    state: &mut progress::State<S>,
+    started: &CallRecord,
+) -> Result<(), String> {
+    let block = error_block(&started.id, UNFINISHED);
+    for _ in 0..progress::MAX_APPEND_ATTEMPTS {
+        state.reload()?;
+        if state
+            .session()?
+            .tool(&started.id)?
+            .is_some_and(|record| record.is_terminal())
+        {
+            return Ok(());
+        }
+        let record = completed_record(
+            started,
+            ToolResult::Failed {
+                error: observation_path(started),
+            },
+            None,
+        );
+        let expected = state.head().clone();
+        let transition = tool_complete_transition(record, &block, Vec::new())?;
+        if let progress::TryAppend::Appended(_) = state.try_append_at(&expected, transition)? {
+            return Ok(());
+        }
+    }
+    Err("session kept changing while closing an unfinished call".into())
 }
 
 fn complete_started_failed(
@@ -3100,15 +3264,6 @@ fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
     // Everything below implements no entry and has no path, so declaring it here
     // is the only way to reach it at all.
     let mut registry = tools::declarations();
-    let mut publish = with_source_tree(tools::tree_tool_declaration(&tools::builtin_tool(
-        "publish_source",
-        publish_source::HELP,
-    )));
-    // Help types are what a curried arg can carry, which has no boolean; this
-    // built-in reads its input as JSON, so it can take a real one.
-    publish["input_schema"]["properties"]["force"]["type"] = json!("boolean");
-    publish["input_schema"]["properties"]["allow_ignored"]["type"] = json!("boolean");
-    registry.push(publish);
     if cfg.run_and_update_ref_image.is_some() {
         registry.extend(subagents::declarations());
         registry.push(async_work::declaration());
@@ -3376,6 +3531,7 @@ fn self_curry(
         "tool-git",
         "tool-in",
         "tool-writer",
+        "tool-root",
         "op",
         "in",
         "result",
@@ -4417,6 +4573,79 @@ mod tests {
         let error = lookup_theirs(Some(&refs), Some("missing")).unwrap_err();
         assert!(error.contains("main") && error.contains("origin/main"));
     }
+    /// A call a previous step left started is answered as unfinished, never run
+    /// again; and a step that finds another one finished it first leaves that
+    /// answer alone.
+    #[test]
+    fn a_call_left_started_is_closed_as_unfinished() {
+        for concurrent in [false, true] {
+            let args = json!({"path":"caos-std/github","arguments":{}});
+            let golden = golden_with_first("run_tool", args.clone()).unwrap();
+            let call = Call {
+                id: "first".into(),
+                name: "run_tool".into(),
+                input: args,
+            };
+            let site = CallSite::at(&golden.request, &call, ASSISTANT_ID);
+            let mut started = site.stub(None);
+            started.status = CallStatus::Started;
+            let mut objects = golden.store;
+            let head = append_memory(
+                &mut objects,
+                &golden.head,
+                Transition::ToolStart {
+                    record: started.clone(),
+                    payloads: Vec::new(),
+                },
+            )
+            .unwrap();
+            // The other step's answer, landing between this step's look and its push.
+            let race = concurrent.then(|| {
+                let record = completed_record(
+                    &started,
+                    ToolResult::Complete {
+                        observation: observation_path(&started),
+                        proposal: None,
+                    },
+                    None,
+                );
+                tool_complete_transition(
+                    record,
+                    &result_block("first", "done", false),
+                    Vec::new(),
+                )
+                .unwrap()
+            });
+            let store = ImportStore {
+                objects,
+                head: head.clone(),
+                race,
+                lost_ack: false,
+            };
+            let mut state = progress::State::from_store(
+                store,
+                "refs/conversations/session/head".into(),
+                head,
+            )
+            .unwrap();
+            close_unfinished(&mut state, &started).unwrap();
+            state.reload().unwrap();
+            let record = state.session().unwrap().tool("first").unwrap().unwrap();
+            assert_eq!(
+                record.status,
+                if concurrent {
+                    CallStatus::Complete
+                } else {
+                    CallStatus::Failed
+                }
+            );
+            // Looking again changes nothing.
+            let before = state.head().clone();
+            close_unfinished(&mut state, &started).unwrap();
+            assert_eq!(*state.head(), before);
+        }
+    }
+
     struct ImportStore {
         objects: MemoryStore,
         head: Oid,
@@ -4447,263 +4676,6 @@ mod tests {
                 return Err("lost acknowledgment".into());
             }
             Ok(())
-        }
-    }
-
-    #[test]
-    fn import_pin_survives_lost_ack_restart_and_a_competing_observation() {
-        for competing in [false, true] {
-            let args = json!({"source":"https://example.com/repo.git","revision":"main","into":"imports/base"});
-            let golden = golden_with_first("import_source", args.clone()).unwrap();
-            let call = Call {
-                id: "first".into(),
-                name: "import_source".into(),
-                input: args,
-            };
-            let site = CallSite::at(&golden.request, &call, ASSISTANT_ID);
-            let first = json!({"commit":"a".repeat(40)});
-            let second = json!({"commit":"b".repeat(40)});
-            let mut record = site.stub(None);
-            record.status = CallStatus::Started;
-            let race = competing.then(|| Transition::ToolStart {
-                record,
-                payloads: vec![(
-                    "import.json".into(),
-                    canonical_payload_bytes(&second).unwrap(),
-                )],
-            });
-            let store = ImportStore {
-                objects: golden.store,
-                head: golden.head.clone(),
-                race,
-                lost_ack: true,
-            };
-            let mut state = progress::State::from_store(
-                store,
-                "refs/conversations/session/head".into(),
-                golden.head,
-            )
-            .unwrap();
-            let expected = if competing { &second } else { &first };
-            assert_eq!(
-                import_source::pin(&mut state, &site, &first)
-                    .unwrap()
-                    .as_ref(),
-                Some(expected)
-            );
-            let head = state.head().clone();
-            // Reloading from the persisted head must preserve the first winning observation.
-            state.reload().unwrap();
-            assert_eq!(
-                import_source::pin(&mut state, &site, &json!({"commit":"c".repeat(40)}))
-                    .unwrap()
-                    .as_ref(),
-                Some(expected)
-            );
-            assert_eq!(*state.head(), head);
-            assert!(state
-                .session()
-                .unwrap()
-                .source_trees()
-                .unwrap()
-                .is_empty());
-            let imported = Oid::parse(expected["commit"].as_str().unwrap(), "import").unwrap();
-            import_source::attach(&mut state, &site, "imports/base", &imported, expected).unwrap();
-            assert!(import_source::pin(&mut state, &site, &first)
-                .unwrap()
-                .is_none());
-        }
-    }
-
-    #[test]
-    fn publication_pin_keeps_commit_and_lease_across_source_edits_and_restart() {
-        use session_protocol::v3::{Descriptor, PublicationRecord, PublicationStatus};
-        for rejected in [false, true] {
-            let args = json!({"source_tree":"feature/lower","repository":"https://example.com/repo.git","branch":"topic"});
-            let golden = golden_with_first("publish_source", args.clone()).unwrap();
-            let call = Call {
-                id: "first".into(),
-                name: "publish_source".into(),
-                input: args,
-            };
-            let site = CallSite::at(&golden.request, &call, ASSISTANT_ID);
-            let store = ImportStore {
-                objects: golden.store,
-                head: golden.head.clone(),
-                race: None,
-                lost_ack: true,
-            };
-            let mut state = progress::State::from_store(
-                store,
-                "refs/conversations/session/head".into(),
-                golden.head,
-            )
-            .unwrap();
-            let commit = Oid::parse(&"a".repeat(40), "source").unwrap();
-            let old = Oid::parse(&"b".repeat(40), "old").unwrap();
-            let descriptor = Descriptor {
-                source_base: old.clone(),
-                source_head: commit.clone(),
-                target_base: old.clone(),
-                policy: "preserve".into(),
-                implementation: "caos/server-push".into(),
-                commit_policy: "preserve".into(),
-            };
-            let session = state.session().unwrap().identity().unwrap().id;
-            let key = publish_source::invocation(&session, &site).unwrap()[..32].to_string();
-            let id = ids::publication_id(
-                &session,
-                &key,
-                &ids::projection_id(&descriptor.to_value()).unwrap(),
-                &commit,
-                "https://example.com/repo.git",
-                "refs/heads/topic",
-                Some(&old),
-            )
-            .unwrap();
-            let pending = PublicationRecord {
-                id,
-                key,
-                descriptor,
-                planned_head: commit.clone(),
-                expected_old: Some(old.clone()),
-                repository: "https://example.com/repo.git".into(),
-                refname: "refs/heads/topic".into(),
-                source_tree_name: "feature/lower".into(),
-                status: PublicationStatus::Pending,
-                evidence: None,
-                observed: None,
-            };
-            let saved = publish_source::pin(&mut state, &site, &pending)
-                .unwrap()
-                .unwrap();
-            assert_eq!(saved, pending);
-            let newer = Oid::parse(&"c".repeat(40), "newer source").unwrap();
-            state
-                .append(Transition::FilesApply {
-                    files: vec![(
-                        "feature/lower".into(),
-                        Some((Mode::Commit, newer.encode_line())),
-                    )],
-                })
-                .unwrap();
-            state.reload().unwrap();
-            let mut competing = pending.clone();
-            competing.planned_head = newer.clone();
-            competing.expected_old = None;
-            let recovered = publish_source::pin(&mut state, &site, &competing)
-                .unwrap()
-                .unwrap();
-            assert_eq!(recovered, pending);
-            let outcome = if rejected {
-                publish_source::reconcile(
-                    &recovered,
-                    session_protocol::v3::publication::Outcome::new(
-                        PublicationStatus::Conflict,
-                        "validation-rejected",
-                        Some("Source contains ignored files".into()),
-                        None,
-                    ),
-                    || panic!("validation rejection must not observe the remote"),
-                )
-            } else {
-                // Git may resend after a lost acknowledgment and report a
-                // rejected old value even though its first push succeeded.
-                publish_source::reconcile(
-                    &recovered,
-                    session_protocol::v3::publication::Outcome::new(
-                        PublicationStatus::Conflict,
-                        "lease-rejected",
-                        None,
-                        None,
-                    ),
-                    || Ok(Some(commit.clone())),
-                )
-            };
-            publish_source::finish(&mut state, &site, &pending, Some(outcome)).unwrap();
-            let view = state.session().unwrap();
-            assert_eq!(
-                view.source_tree("feature/lower").unwrap().unwrap().commit,
-                newer
-            );
-            let receipt = view.publication(&pending.id).unwrap().unwrap();
-            assert_eq!(
-                receipt.status,
-                if rejected {
-                    PublicationStatus::Conflict
-                } else {
-                    PublicationStatus::Complete
-                }
-            );
-            assert_eq!(receipt.planned_head, commit);
-            assert_eq!(receipt.expected_old, Some(old));
-            assert!(publish_source::pin(&mut state, &site, &competing)
-                .unwrap()
-                .is_none());
-        }
-    }
-
-    #[test]
-    fn import_attachment_is_atomic_replayable_and_does_not_overwrite() {
-        for race_path in [
-            None,
-            Some("imports/base"),
-            Some("imports/base.source.json"),
-            Some("imports"),
-        ] {
-            let args = json!({"source":"https://example.com/repo.git","into":"imports/base"});
-            let golden = golden_with_first("import_source", args.clone()).unwrap();
-            let imported = Oid::parse(&"b".repeat(40), "import").unwrap();
-            let race = race_path.map(|path| Transition::FilesApply {
-                files: vec![(path.to_string(), Some((Mode::Blob, b"keep".to_vec())))],
-            });
-            let store = ImportStore {
-                objects: golden.store,
-                head: golden.head.clone(),
-                race,
-                lost_ack: true,
-            };
-            let mut state = progress::State::from_store(
-                store,
-                "refs/conversations/session/head".into(),
-                golden.head,
-            )
-            .unwrap();
-            assert!(state
-                .session()
-                .unwrap()
-                .source_trees()
-                .unwrap()
-                .is_empty());
-            let call = Call {
-                id: "first".into(),
-                name: "import_source".into(),
-                input: args,
-            };
-            let site = CallSite::at(&golden.request, &call, ASSISTANT_ID);
-            let provenance = json!({"repository":"https://example.com/repo.git","commit":imported});
-            import_source::attach(&mut state, &site, "imports/base", &imported, &provenance)
-                .unwrap();
-            let head = state.head().clone();
-            import_source::attach(&mut state, &site, "imports/base", &imported, &provenance)
-                .unwrap();
-            assert_eq!(*state.head(), head, "replay added another transition");
-            let view = state.session().unwrap();
-            let record = view.tool("first").unwrap().unwrap();
-            let block: Value =
-                serde_json::from_slice(&view.payload(&observation_path(&record)).unwrap()).unwrap();
-            if let Some(path) = race_path {
-                assert_eq!(view.snapshot().read(path).unwrap().unwrap(), b"keep");
-                assert_eq!(block["is_error"], true);
-                assert!(record.files.is_empty());
-            } else {
-                assert_eq!(
-                    view.source_tree("imports/base").unwrap().unwrap().commit,
-                    imported
-                );
-                assert!(view.snapshot().exists("imports/base.source.json").unwrap());
-                assert_eq!(record.files.len(), 2);
-            }
         }
     }
 }

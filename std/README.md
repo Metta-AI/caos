@@ -51,7 +51,7 @@ what each one does about that.
 ### Git advice: [GIT.md](GIT.md)
 
 For anything involving git or GitHub — importing a repo, merging, stacks,
-publishing a stack with `publish-stack`, `publish_source`, PRs and `github` — read
+publishing a stack with `stack-publish`, `publish-source`, PRs and `github` — read
 [`GIT.md`](GIT.md) first.
 
 ### Before you reach for the shell
@@ -63,20 +63,21 @@ needs `paths`:
 |---|---|
 | read, list or search | `read`, `ls`, `grep` |
 | create or change a file | `write`, `edit` |
-| copy a file or directory (a source tree stays a source tree) | `copy` (`from`, `to`) |
-| move or rename | `move` (`from`, `to`) |
-| delete | `remove` (`file-path`) |
+| copy a file or directory (a source tree stays a source tree) | `copy` (`root`, `from`, `to`) |
+| move or rename | `move` (`root`, `from`, `to`) |
+| delete | `remove` (`root`) |
 | see history or changes | `log`, `show`, `diff` |
 
 `read`, `ls`, `write`, `edit`, `copy`, `move`, `remove`, `grep`, `log`, `show` and `diff`
-are entries under `std/`, reached as `caos-std/<name>` like any other tool. They take an
-`in` tree, which defaults to the session. `llm-step` still registers its own copies
-for the turns it drives itself; those are being retired in favor of these.
+are entries under `std/`, reached as `caos-std/<name>` like any other tool. Every one of
+them takes `root`, the path it works on (design/tool-contract.md), as do `bash-tool`,
+`merge`, `move-sed`, `caos-build`, `caos-test` and `flake-update`. `llm-step` still registers its own copies for the turns it drives itself;
+those are being retired in favor of these.
 
-`import-source`, `publish-source`, `agent-spawn`, `agent-wait`, `agent-harvest` and `run-async`
+`import-source`, `publish-source`, `ci-status` and the stack tools are ordinary workers that
+reach GitHub through `github`. `agent-spawn`, `agent-wait`, `agent-harvest` and `run-async`
 are entries for OPERATIONS OF THE STEP (`@op` in their help): they write the session's own
-records (a source tree attached, a publication pinned before anything is pushed, a child
-session, an async task), so the step performs them in process. The entry gives the
+records (a child session, an async task), so the step performs them in process. The entry gives the
 operation a path, a help and a place in `tool_help`/`run_tool`.
 `eval-path` is not an entry: evaluating a path is one of the server's primitives (the
 `/eval` route), so it is a built-in tool, like `run`, `help`, `start` and `result`.

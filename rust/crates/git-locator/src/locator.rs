@@ -1,7 +1,7 @@
 //! The `git` a `:@@=` locator fetch runs as.
 //!
 //! [`import`](crate::import) is the narrow surface a human-driven
-//! `import_source` call gets: HTTPS only, because a model chooses that URL. A
+//! `import-source` call gets: HTTPS only, because a model chooses that URL. A
 //! locator is different — it is written in a `.caos-expr` by whoever wrote the
 //! repository, and the grammar has always admitted `git+ssh://`, `git+file://`
 //! and `github:` alongside `git+https://` (design/flake-inputs.md). So this

@@ -9,13 +9,13 @@ file is the working guide.
 
 Code is never checked out. A **source tree** is a gitlink in the session
 tree (a path such as `sources/myrepo/01-parser`) that points at a commit.
-`import_source` creates one from GitHub, `copy` duplicates one with its
+`caos-std/import-source` creates one from GitHub, `copy` duplicates one with its
 history, `write`/`edit` (and `bash-tool`) change one, and every accepted change
 records a child commit automatically: there is no staging and no commit step.
 `log`, `show` and `diff` are how you see history, because there is no `git` in
 the shell. Getting a stack out is one call, `caos-std/stack-publish`: it
 pushes each layer's branch, opens or updates the chained PRs from the `.pr.md`
-beside each layer, and links them as a GitHub stack. Under it, `publish_source`
+beside each layer, and links them as a GitHub stack. Under it, `caos-std/publish-source`
 pushes one commit to a branch, and `caos-std/github` is one GitHub API call,
 for what the operation does not do (read and answer comments, anything else).
 
@@ -23,7 +23,7 @@ for what the operation does not do (read and answer comments, anything else).
 
 | to | use |
 |---|---|
-| bring in a repo at a branch, ref or full commit hash | `import_source` |
+| bring in a repo at a branch, ref or full commit hash | `caos-std/import-source` |
 | duplicate a source tree, with its history | `copy` |
 | change files | `write`, `edit` |
 | see history and changes | `log`, `show`, `diff` |
@@ -33,7 +33,7 @@ for what the operation does not do (read and answer comments, anything else).
 | merge a published stack's PRs, bottom to top, each squashed with its `.pr.md` as the commit message | `caos-std/stack-merge-to-master` |
 | see what CI says about a branch, a layer or a commit | `caos-std/ci-status` |
 | rename a layer and its `.pr.md` together | `caos-std/move-sed` |
-| push one commit to a GitHub branch | `publish_source` |
+| push one commit to a GitHub branch | `caos-std/publish-source` |
 | read and answer PR comments, anything else on GitHub | `caos-std/github` |
 
 `tool_help(path="caos-std/<name>")` prints a std tool's exact parameters.
@@ -73,7 +73,7 @@ sources/<repo>/
 - **`99-dirty`** is where you work between layers. Edit it freely, and let its
   history grow. It has no `.pr.md`, so it is never published. When the work in
   it is a finished chunk, `move` it to the next layer name
-  (`move(from="sources/<repo>/99-dirty", to="sources/<repo>/02-<name>")`),
+  (`move(root="sources/<repo>", from="99-dirty", to="02-<name>")`),
   write `sources/<repo>/02-<name>.pr.md`, then `copy` that layer to a fresh
   `99-dirty` to carry on.
 - **Make a new layer only where you would normally start a new layer of a
@@ -90,14 +90,15 @@ the old name; `caos-std/move-sed` renames a layer and its sidecar in one call
 ## One change, one layer
 
 ```text
-import_source(source="https://github.com/<owner>/<repo>.git",
-              revision="main", into="sources/<repo>/00-base")
-copy(from="sources/<repo>/00-base", to="sources/<repo>/99-dirty")
+run_tool(path="caos-std/import-source",
+         arguments={"root": "sources/<repo>", "into": "00-base",
+                    "source": "https://github.com/<owner>/<repo>.git", "revision": "main"})
+copy(root="sources/<repo>", from="00-base", to="99-dirty")
 ... edit sources/<repo>/99-dirty ...
-move(from="sources/<repo>/99-dirty", to="sources/<repo>/01-<name>")
-write(file-path="sources/<repo>/01-<name>.pr.md",
+move(root="sources/<repo>", from="99-dirty", to="01-<name>")
+write(root="sources/<repo>/01-<name>.pr.md",
       content="<PR title>\n\n<PR body>\n")
-run_tool(path="caos-std/stack-publish", arguments={"stack": "sources/<repo>"})
+run_tool(path="caos-std/stack-publish", arguments={"root": "sources/<repo>"})
 ```
 
 The last call pushes `01-<name>` to the branch `<name>` (give `branch-prefix`
@@ -107,8 +108,8 @@ it fast-forwards the branch; the PR follows.
 
 - Edit and publish a source tree (`sources/<repo>/...`), never the
   session root. `edit` on a bare path succeeds but changes only scratch
-  files, and `publish_source` rejects `.`.
-- Omit `revision` to import the default branch. A new `import_source` call
+  files, and `publish-source` takes only a source tree as its `root`.
+- Omit `revision` to import the default branch. A new `import-source` call
   observes the remote again, so importing the same branch at a fresh path gives
   you its new tip. Public repositories need no token.
 - The destination path and its `.source.json` sibling must both be unused.
@@ -140,9 +141,9 @@ applies unchanged. Verified end to end against a scratch repo:
    public or private if the user did not say; private is the safe default.
    The response's `full_name` gives the org's canonical capitalization
    (`Metta-AI`, not `metta-ai`).
-2. `import_source` it into `sources/<repo>/00-base`, `copy` that to
+2. `caos-std/import-source` it into `sources/<repo>/00-base`, `copy` that to
    `sources/<repo>/99-dirty`, `write` the files there.
-3. `publish_source` the `99-dirty` tree to `main`. This is a plain
+3. `caos-std/publish-source` the `99-dirty` tree to `main`. This is a plain
    fast-forward from the imported tip, so it needs no `force`. Prefer a
    branch plus a PR unless the repo is a scratch one.
 4. Check the result with `GET /repos/<owner>/<repo>/contents/?ref=main`. A new
@@ -183,7 +184,7 @@ examples that follow use the stack shown just before them.
 
 ### Merging
 
-`merge(source-tree=Y, theirs=X)` (run as `run_tool(path="caos-std/merge", arguments={...})`)
+`merge(root=Y, theirs=X)` (run as `run_tool(path="caos-std/merge", arguments={...})`)
 merges `X` into the gitlink `Y` and always mints a merge commit with parents `Y` and `X`.
 It picks the highest common ancestor as the base. The optional `merge-base` overrides
 that, which you only need to replay a change onto a history that lacks its old
@@ -191,8 +192,8 @@ base (a layer rebuilt on a force-pushed upstream: `merge-base` is the old tip
 of the previous layer).
 
 `theirs` is a **full commit hash** (from `log` on a source tree) or the **path of a
-source tree** in the session, such as one `import_source` just made. A branch
-NAME is not accepted: to merge `origin/main`, `import_source` the remote at
+source tree** in the session, such as one `import-source` just made. A branch
+NAME is not accepted: to merge `origin/main`, `import-source` the remote at
 `revision=main` into a fresh path, then pass that path as `theirs`.
 
 On a conflict the merge still advances the gitlink, with git's inline markers
@@ -210,7 +211,7 @@ Edit `sources/repo/01-feature` (A becomes A2), then merge each layer into the
 one after it, earliest first:
 
 ```text
-merge(source-tree="sources/repo/02-tests",
+merge(root="sources/repo/02-tests",
       theirs="<full hash of sources/repo/01-feature>")
 
 sources/repo/01-feature  -> A2  parent A
@@ -233,8 +234,8 @@ is a fast-forward. A merge conflict stops it at that layer and names the
 `merge` call that gives you a ledger to resolve.
 
 ```text
-run_tool(path="caos-std/stack-sync", arguments={"stack": "sources/repo"})
-run_tool(path="caos-std/stack-publish", arguments={"stack": "sources/repo"})
+run_tool(path="caos-std/stack-sync", arguments={"root": "sources/repo"})
+run_tool(path="caos-std/stack-publish", arguments={"root": "sources/repo"})
 ```
 
 By hand, only where `stack-sync` cannot run (it refuses, or the layers are not
@@ -243,14 +244,15 @@ a stack directory): import the new upstream tip at a fresh path, put it at
 after it:
 
 ```text
-import_source(source=..., revision="main", into="sources/repo/00-base-2")
-remove(file-path="sources/repo/00-base")
-remove(file-path="sources/repo/00-base.source.json")
-move(from="sources/repo/00-base-2", to="sources/repo/00-base")
-move(from="sources/repo/00-base-2.source.json", to="sources/repo/00-base.source.json")
-merge(source-tree="sources/repo/01-feature",
+run_tool(path="caos-std/import-source", arguments={"root": "sources/repo",
+         "source": ..., "revision": "main", "into": "00-base-2"})
+remove(root="sources/repo/00-base")
+remove(root="sources/repo/00-base.source.json")
+move(root="sources/repo", from="00-base-2", to="00-base")
+move(root="sources/repo", from="00-base-2.source.json", to="00-base.source.json")
+merge(root="sources/repo/01-feature",
       theirs="<full hash of sources/repo/00-base>")
-merge(source-tree="sources/repo/02-tests",
+merge(root="sources/repo/02-tests",
       theirs="<full hash of sources/repo/01-feature>")
 ```
 
@@ -261,9 +263,9 @@ of the previous layer.
 
 ```text
 remove sources/repo/01-feature; copy sources/repo/00-base -> sources/repo/01-feature
-merge(source-tree="sources/repo/01-feature", theirs="<A>", merge-base="<H>")
+merge(root="sources/repo/01-feature", theirs="<A>", merge-base="<H>")
 remove sources/repo/02-tests;   copy sources/repo/01-feature -> sources/repo/02-tests
-merge(source-tree="sources/repo/02-tests",   theirs="<B>", merge-base="<A>")
+merge(root="sources/repo/02-tests",   theirs="<B>", merge-base="<A>")
 ```
 
 ### Dropping, combining, splitting
@@ -288,9 +290,9 @@ such as `02` to `03` then `01` to `02` has no ordering problem:
 
 ```text
 run_tool(path="caos-std/move-sed", arguments={
-  "dir": "sources/repo", "pattern": "^02-tests(\\..+)?$", "replacement": "03-tests$1"})
+  "root": "sources/repo", "pattern": "^02-tests(\\..+)?$", "replacement": "03-tests$1"})
 run_tool(path="caos-std/move-sed", arguments={
-  "dir": "sources/repo", "pattern": "^01-feature(\\..+)?$", "replacement": "02-y$1"})
+  "root": "sources/repo", "pattern": "^01-feature(\\..+)?$", "replacement": "02-y$1"})
 ```
 
 `replacement` uses Go's `$1` / `${name}`, never sed's `\1`. The result lists
@@ -316,7 +318,7 @@ never re-publish a branch just to clean its commits.
 ### One call: `caos-std/stack-publish`
 
 ```text
-run_tool(path="caos-std/stack-publish", arguments={"stack": "sources/<repo>"})
+run_tool(path="caos-std/stack-publish", arguments={"root": "sources/<repo>"})
 ```
 
 For every layer that has a `.pr.md` beside it, earliest first, it pushes the
@@ -340,15 +342,18 @@ stack 367: unchanged
   `trunk` when the base was imported by commit hash, or to publish elsewhere.
   A repository that was renamed or moved to another owner since the import
   is followed: the GitHub calls use the name GitHub gives it now.
-- `dry-run=true` reports the layers, branches, bases and titles without
-  observing or changing anything. Use it first on a new stack.
+- `dry-run=true` reports the layers, branches, bases and titles, and each
+  branch's current head, without changing anything. Use it first on a new
+  stack.
 - The `.pr.md` is the description's home. A PR whose title or body differs is
   updated to match, and the result says so; edit the file, not GitHub.
 - Republishing after you merged up is a fast-forward and needs no `force`. A
   non-fast-forward push is refused unless `force=true`, and means a rebuilt
-  layer or someone else's push to the branch: look before forcing.
-- Each push is leased on the remote head observed at the start, like
-  `publish_source`, and rejects a commit whose tree contains paths matched by
+  layer or someone else's push to the branch: look before forcing. With
+  `force`, pass `expected`: one line `<branch> <head>` per layer, as the dry
+  run prints them, so a branch that moved after you looked is not overwritten.
+- Without `force`, each push is leased on the remote head read when the call
+  runs, like `publish-source`, and rejects a commit whose tree contains paths matched by
   its own `.gitignore` rules, **including tracked files** (`allow-ignored=true`
   to publish them anyway). Resolve merge conflicts and clear `.caos/conflicts`
   first. Test and inspect the intended PR diff (`diff`) before publishing.
@@ -367,7 +372,7 @@ stack 367: unchanged
 
 ### By hand, one commit
 
-`publish_source(source_tree, repository, branch, force?)` pushes one gitlink's
+`caos-std/publish-source` (`root`, `repository`, `branch`, and `force` with `expected`) pushes one gitlink's
 commit to one branch, with the same lease, fast-forward and `.gitignore` rules,
 and opens no PR. `caos-std/github` is one GitHub API call: `method`, `path`
 under `https://api.github.com`, and optional JSON `body`, every value a string;
@@ -379,17 +384,23 @@ with `POST /repos/{owner}/{repo}/pulls` (`title`, `head`, `base`, `body`), and
 link PRs with `POST /repos/{owner}/{repo}/stacks` and
 `{"pull_requests": [<numbers, earliest first>]}`.
 
+In place of `method`/`path`/`body`, `caos-std/github` takes `batch`: a JSON
+array of operations (`api`, `head`, `push`, `import`), run in order and
+stopping at the first that is not ok, answered with a JSON array of results.
+It is how the other git tools reach GitHub (only `std/github` holds the token,
+design/tool-contract.md); `tool_help` describes each operation.
+
 ## Merging a stack
 
 Merge a reviewed stack with `caos-std/stack-merge-to-master`, never by hand
 through `caos-std/github` or by asking someone to press the button:
 
 ```text
-run_tool(path="caos-std/stack-sync", arguments={"stack": "sources/<repo>"})
-run_tool(path="caos-std/stack-publish", arguments={"stack": "sources/<repo>"})
-run_tool(path="caos-std/stack-merge-to-master", arguments={"stack": "sources/<repo>", "dry-run": "true"})
-run_tool(path="caos-std/stack-merge-to-master", arguments={"stack": "sources/<repo>"})
-run_tool(path="caos-std/stack-sync", arguments={"stack": "sources/<repo>", "remove-merged": "true"})
+run_tool(path="caos-std/stack-sync", arguments={"root": "sources/<repo>"})
+run_tool(path="caos-std/stack-publish", arguments={"root": "sources/<repo>"})
+run_tool(path="caos-std/stack-merge-to-master", arguments={"root": "sources/<repo>", "dry-run": "true"})
+run_tool(path="caos-std/stack-merge-to-master", arguments={"root": "sources/<repo>"})
+run_tool(path="caos-std/stack-sync", arguments={"root": "sources/<repo>", "remove-merged": "true"})
 ```
 
 - It merges the described layers' PRs into the trunk (the branch `00-base`
@@ -410,8 +421,8 @@ run_tool(path="caos-std/stack-sync", arguments={"stack": "sources/<repo>", "remo
   PR below merges. A failure stops it there: the layers below are merged, the
   ones above are untouched, and running it again carries on.
 - `caos-std/ci-status` prints the checks of one branch: `branch` is a branch
-  name, a commit, or with `stack` a layer (`02-tests` or `tests`). Its first
-  line is the verdict, and failing checks are listed first.
+  name, a commit, or, with the stack as `root`, a layer (`02-tests` or
+  `tests`). Its first line is the verdict, and failing checks are listed first.
 
 ### Waiting for CI
 
@@ -423,14 +434,14 @@ and pick it up with `result`, so the wait does not hold up other work:
 
 ```text
 start(path="caos-std/ci-status", arguments={
-  "stack": "sources/<repo>", "branch": "02-tests", "wait-min": "30"})
+  "root": "sources/<repo>", "branch": "02-tests", "wait-min": "30"})
 ... other work ...
 result(ticket=<ticket>)
 ```
 
-Every call reads GitHub afresh: `ci-status` runs inside the step, which is
-keyed on the call itself, so the same arguments after a new push are a new
-read, not a cached answer. A check that has not been created yet is not
+Every call reads GitHub afresh: `ci-status` declares `@request-id`, which the
+harness fills with the call's own id, so the same arguments after a new push
+are a new read, not a cached answer. A check that has not been created yet is not
 waited for: right after a push the answer can be `no checks`.
 
 ### The repository's squash setting
@@ -521,7 +532,7 @@ to that text.
 ### Acting on it
 
 Edit the same source tree the PR was published from, then publish to the same
-branch with `publish_source` (no `force`: new commits on top are a
+branch with `caos-std/publish-source` (no `force`: new commits on top are a
 fast-forward). Re-fetch the comments afterwards in case more arrived while you
 worked.
 
@@ -539,19 +550,19 @@ comment is only visible once its author submits, so check the result with a
 
 - **Uncertain push or lease conflict.** A remote can accept a push before the
   connection drops. Read the branch with `GET /repos/{owner}/{repo}/branches/{branch}`
-  (or `import_source` it at a fresh path): if it is your commit, the push
+  (or `import-source` it at a fresh name): if it is your commit, the push
   completed. If it moved to something else, another change landed; import it,
   merge, test, and publish again. Do not blindly retry.
 - **A `github` write with no response.** It may still have arrived. `GET` the
   PR first. GitHub refuses a duplicate PR and a repeated base change is a
   no-op.
-- **Remote changed under you.** `import_source` the new head at a fresh path
+- **Remote changed under you.** `import-source` the new head at a fresh name
   and `merge` it in. Importing and merging are never hidden inside a push.
 
 ## Authentication
 
 The GitHub token is a secret in the caos server's secret store, not part of
-any repo. `import_source`, `publish_source` and `caos-std/github` all use it
+any repo. `caos-std/github` uses it, and `import-source`, `publish-source` and the stack tools reach GitHub through it
 (public imports need none). Credentials apply only to `github.com` on the
 default HTTPS port and never appear in URLs, config, arguments or logs. A
 scoped token only reaches the repositories it was granted, and `caos-std/github`
@@ -562,10 +573,13 @@ reach usually means the grant is missing.
 
 - This file is `std/GIT.md`, upper case. `read` and `ls` cannot see `caos-std/`
   directly: `eval_path(path="caos-std")` gives a tree hash, then
-  `ls(root=<hash>)` and `read(file-path="GIT.md", root=<hash>)`. A lowercase
+  `ls(root=<hash>)` and `read(root="<hash>/GIT.md")`. A lowercase
   `git.md` is "no such path".
-- `edit` takes `file-path`, `old-string` and `new-string` (hyphens, not
-  underscores), and the old string must occur exactly once.
+- Every file tool takes `root`, the path it works on, relative to the session:
+  the file for `read`, `write`, `edit` and `remove`; the directory holding both
+  paths for `copy` and `move`, whose `from` and `to` are relative to it.
+- `edit` takes `old-string` and `new-string` (hyphens, not underscores), and
+  the old string must occur exactly once.
 - `theirs` for `merge` is a full commit hash or the path of a source tree in
   the session, never a branch name.
 - `copy` and `move` refuse an existing destination; `remove` first. `move`
@@ -582,8 +596,8 @@ reach usually means the grant is missing.
 - An import is an unchanged snapshot. It never merges into or advances
   another source tree.
 - Ignored scratch files can ride along in a source during work, and then block
-  `publish_source`, which lists them. Clean them before publishing, or pass
-  `allow_ignored=true` if they belong in the branch.
+  `publish-source` and `stack-publish`, which list them. Clean them before publishing, or pass
+  `allow-ignored=true` if they belong in the branch.
 - `bash-tool` runs over a scratch copy: declare every existing path it reads
   in `paths`. Use `read`, `grep`, `copy`, `move` and `remove` for those jobs.
 - Subagents have no file tools. Do any reading of a saved large result
@@ -594,7 +608,7 @@ reach usually means the grant is missing.
 - `design/stacks.md` – the stack model and the full operation walk-through.
 - `design/stack-publish.md` – `stack-publish` and `move-sed`: the stack
   directory as the specification, pins, GitHub stacks, resuming.
-- `design/agent-publish.md` – `publish_source`: leases, `force`, `.gitignore`
+- `design/agent-publish.md` – `publish-source`: leases, `force`, `.gitignore`
   rejection, uncertain results.
 - `design/agent-github.md` – import, `caos-std/github`, PRs for a stack, the
   token.

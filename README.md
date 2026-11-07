@@ -28,10 +28,11 @@ functions, cached by redis
       reader:@@=git+caos://local?ref=refs/caos/dev&dir=std/llm-step
       reader:@@=git+caos://local?ref=refs/caos/dev&dir=std/github
       ```
-      The first reader lets `import_source` and `publish_source` use the token;
-      the second lets `caos-std/github` use it. With only the first, those work
-      and `caos-std/github` answers `401` ("No github-token secret is granted to
-      std/github").
+      The first reader lets `llm-step` fetch a session's content from a private
+      repository; the second lets `caos-std/github` use the token, and through
+      it `import-source`, `publish-source`, `ci-status` and the stack tools.
+      Without the second, those answer `401` ("No github-token secret is
+      granted to std/github").
   - If you have a softmax token, do the same as above but:
     - Name the file `softmax-token`
     - Set the reader to `reader:@@=git+https://github.com/Metta-AI/caos-softmax?ref=refs/heads/main&dir=tools/gota`
@@ -956,8 +957,8 @@ and its complete history directly into the server's object store. It prints
 the commit hash. Use --github-token-file=PATH for private repositories.
 Resolve branch names before calling; retry with the same hash.
 
-The agent's import_source tool also accepts branch names and defaults to the
-remote's default branch. It saves the resolved hash in session progress
-before invoking import-git, then attaches the snapshot and provenance at the
-requested unused path. Use /import for local checkouts.
+The agent's `caos-std/import-source` tool also accepts branch names and
+defaults to the remote's default branch. It imports the commit through
+`std/github` and returns the snapshot and its provenance under an unused name
+in its `root` directory. Use /import for local checkouts.
 

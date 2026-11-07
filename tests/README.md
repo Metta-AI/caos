@@ -19,9 +19,9 @@ server, checking exact-commit imports, authentication, complete history,
 incremental transfers and retries. It also checks leased pushes, lost replies,
 concurrent updates, code-history preservation and publication guards. It needs no external service.
 
-The llm-import entry exercises agent-driven importing in an empty session,
-including provenance, readable history, occupied destinations, and invalid
-sources. Pinning and replay are also covered by llm-step's unit tests.
+The llm-import-path entry exercises agent-driven importing in an empty session
+through `caos-std/import-source`, including provenance, readable history,
+occupied destinations, and invalid sources and revisions.
 
 # Writing a test
 

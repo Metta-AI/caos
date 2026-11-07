@@ -235,7 +235,7 @@ func launch(i int) {
 	}
 	w.Step(fmt.Sprintf("case %d: %s", i, path))
 	request := caos("prepare-request", "--base:hash="+caos("hash", "/cas/args/squash"),
-		"--in:@=/cas/conv", "--plan="+path)
+		"--root:@=/cas/conv", "--plan="+path)
 	caos("run-request-then", request, "--then:hash="+next(i))
 }
 
@@ -246,16 +246,15 @@ func check(i int) {
 	}
 	const r = "/cas/args/result"
 	caos("get", r)
-	for _, part := range []string{"prop", "out"} {
-		_, err := os.Lstat(filepath.Join(r, part))
-		w.True(err == nil, "case %s: the result has no %s", c.name, part)
-	}
-	out := read(filepath.Join(r, "out"))
+	_, err := os.Lstat(filepath.Join(r, "stdout"))
+	w.True(err == nil, "case %s: the result has no stdout", c.name)
+	out := read(filepath.Join(r, "stdout"))
 	_, failedErr := os.Lstat(filepath.Join(r, "failed"))
 	failed := failedErr == nil
-	prop := caos("hash", filepath.Join(r, "prop"))
+	_, rootErr := os.Lstat(filepath.Join(r, "root"))
 	if c.into != "" {
-		w.True(!failed, "case %s was refused: %s", c.name, out)
+		w.True(!failed && rootErr == nil, "case %s was refused: %s", c.name, out)
+		prop := caos("hash", filepath.Join(r, "root"))
 		session("/tmp/expect", c.into+"=squashed")
 		caos("put", "/tmp/expect", "/cas/expect")
 		w.True(prop == caos("hash", "/cas/expect"),
@@ -263,14 +262,14 @@ func check(i int) {
 		for _, commit := range squashed {
 			w.True(strings.Contains(out, commit), "case %s: out does not name %s: %s", c.name, commit, out)
 		}
-		_, err := os.Lstat(filepath.Join(r, "message"))
-		w.True(err == nil, "case %s: no commit message for the session", c.name)
+		_, err := os.Lstat(filepath.Join(r, "commit-message"))
+		w.True(err == nil, "case %s: no commit message", c.name)
 		fmt.Fprintf(os.Stderr, "  ok: %s = {01-core: C1, 02-tests: C2, 03-docs: C3}, nothing else changed\n", c.into)
 		return
 	}
 	w.True(failed, "case %s was not refused: %s", c.name, out)
 	w.True(strings.HasPrefix(out, "FAILED: "), "case %s has no FAILED banner: %s", c.name, out)
-	w.True(prop == conv, "case %s: a refusal changed the session", c.name)
+	w.True(rootErr != nil, "case %s: a refusal answered a root", c.name)
 	for _, s := range c.says {
 		w.True(strings.Contains(out, s), "case %s does not say %q: %s", c.name, s, out)
 	}

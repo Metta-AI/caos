@@ -128,26 +128,37 @@ impl State<GitStore> {
 
     /// Publish a code commit before a session record names it. The ref is
     /// content-addressed, so an existing equal value is the same publication.
+    ///
+    /// RETRIED, for the create race between clients publishing one commit:
+    /// both read an advertisement without the ref, both plan a create, and the
+    /// loser dies on "cannot lock ref …: reference already exists". The next
+    /// attempt sees the winner's ref in the advertisement and is a no-op. Not
+    /// settled by reading the ref back: `refs/caos/req/` is hidden from
+    /// upload-pack, so a fetch answers "absent" to every loser. More than once,
+    /// with a widening pause, because the winner's update may not have landed
+    /// yet (`push_closure` in crates/caos measured the same race).
     pub fn push_code(&mut self, commit: &Oid) -> Result<(), String> {
         self.store.ensure_local(commit)?;
         self.store.read_commit(commit).map_err(String::from)?;
         let refname = format!("refs/caos/req/{commit}");
-        let pushed = self.store.push(&[RefUpdate {
-            refname: refname.clone(),
-            expected: None,
-            new: Some(commit.clone()),
-        }]);
-        crate::timing::phase("push code");
-        match pushed {
-            Ok(()) => Ok(()),
-            Err(push_error) => match self.store.fetch_ref(&refname)? {
-                Some(current) if current == *commit => Ok(()),
-                Some(current) => Err(format!(
-                    "content-addressed code ref {refname} names {current}, not {commit}"
-                )),
-                None => Err(push_error),
-            },
+        let mut last = String::new();
+        for attempt in 0..4 {
+            let pushed = self.store.push(&[RefUpdate {
+                refname: refname.clone(),
+                expected: None,
+                new: Some(commit.clone()),
+            }]);
+            match pushed {
+                Ok(()) => {
+                    crate::timing::phase("push code");
+                    return Ok(());
+                }
+                Err(error) => last = error,
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1)));
         }
+        crate::timing::phase("push code");
+        Err(format!("publishing code ref {refname}: {last}"))
     }
 
     pub fn fetch_object(&mut self, oid: &Oid) -> Result<(), String> {

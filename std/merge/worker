@@ -7,8 +7,9 @@
 #
 # The merge worker (SPEC "Merging and conflict resolution"). The caos runner
 # execs us as /worker with the args materialized under /cas/args:
-#   wc     (:commit=)  the source tree commit to merge into (the current side), bound
-#                      by the launch because the tool declares `@scope source-tree`
+#   root   (:commit=)  the source tree commit to merge into (the current side):
+#                      the tool declares `@root`, and the root is a source tree
+#                      (design/tool-contract.md)
 #   theirs (:commit=)  the commit to merge in
 #   merge-base (:commit=)  optional: the merge base to use instead of the one
 #                      git finds, e.g. the old tip of the layer below when
@@ -20,10 +21,26 @@
 # conflicts (see SPEC). M becomes the run's result at /cas/out.
 set -euo pipefail
 
+# A refusal is a value the model can act on: the reason, and `failed`.
+refuse() {
+  local res=/tmp/merge-result
+  rm -rf "$res"; mkdir -p "$res"
+  printf 'merge: %s\n' "$1" > "$res/stdout"
+  printf 'merge refused\n' > "$res/failed"
+  caos put "$res" /cas/out
+  exit 0
+}
+if [ ! -e /cas/args/root ] && [ ! -L /cas/args/root ]; then
+  refuse "nothing is at the root path: root is the source tree to merge into, such as sources/<repo>/02-layer"
+fi
+if [ "$(caos kind /cas/args/root)" != commit ]; then
+  refuse "the root is not a source tree: merge advances a source tree (a code reference), such as sources/<repo>/02-layer"
+fi
+
 # The commit args materialize as raw commit-object files; `caos hash` reads the
 # recorded id without fetching content — and the id is all we need, since the
 # objects themselves come from the server over git below.
-ours=$(caos hash /cas/args/wc)
+ours=$(caos hash /cas/args/root)
 theirs=$(caos hash /cas/args/theirs)
 base=()
 if [ -e /cas/args/merge-base ]; then
@@ -103,11 +120,12 @@ commit=/tmp/merge-commit
 } > "$commit"
 caos put-commit "$commit" /cas/mergecommit
 
-# The writer result: `{prop, out}` (SPEC, "CaosTools"). `prop` is the COMMIT
-# above rather than a tree, because a merge is the one case that needs a second
-# parent -- every other writer hands back a tree and lets the harness mint.
+# The writer result: `{stdout, root}` (design/tool-contract.md). `root` is the
+# COMMIT above rather than a tree, because a merge needs a second parent --
+# every other writer of a source tree hands back a tree and lets the harness
+# commit it.
 #
-# `out` IS WRITTEN HERE, not by the harness. It used to be composed in llm-step
+# `stdout` IS WRITTEN HERE, not by the harness. It used to be composed in llm-step
 # from `.caos/conflicts`, which meant the tool's own answer depended on who ran
 # it; the same reasoning already put this tool's `help` in its `.caos-expr`.
 res=/tmp/merge-result
@@ -115,7 +133,7 @@ rm -rf "$res"; mkdir -p "$res"
 if [ "$code" = 1 ]; then
   # A quoted heredoc: this prose contains apostrophes and backticks, and
   # printf with single quotes turns it into unreadable '"'"' escapes.
-  cat > "$res/out" <<'CONFLICTS'
+  cat > "$res/stdout" <<'CONFLICTS'
 merge produced conflicts. The source tree now carries git's inline conflict
 markers in the affected files, plus .caos/conflicts (git's unmerged notation,
 richer than markers). Resolve each path -- edit the file, reading a stage's
@@ -126,11 +144,11 @@ automatically. Run relevant checks.
 
 .caos/conflicts:
 CONFLICTS
-  cat "$work/.caos/conflicts" >> "$res/out"
+  cat "$work/.caos/conflicts" >> "$res/stdout"
   # A conflict is NOT a failed call: the proposal is wanted and the model is
   # being asked to finish it, so no `failed` entry.
 else
-  printf 'merge completed cleanly; the source tree is the merged result.\n' > "$res/out"
+  printf 'merge completed cleanly; the source tree is the merged result.\n' > "$res/stdout"
 fi
-ln -s /cas/mergecommit "$res/prop"
+ln -s /cas/mergecommit "$res/root"
 caos put "$res" /cas/out

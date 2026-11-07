@@ -1,0 +1,8 @@
+# tests/root-tools, as an ENTRY: evaluating this directory yields the test's
+# ARG TREE, which dev/run-test then runs.
+#
+# The root contract end to end (design/tool-contract.md, "`root`"): the file
+# tools, reached at paths inside a source tree, run through llm-step's real
+# tool path in tools-only runs, and the session is checked afterwards. No model
+# is scripted: the stub's fixture directory is empty.
+curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --read:@=DEEP-DEPS/read --ls:@=DEEP-DEPS/ls --write:@=DEEP-DEPS/write --edit:@=DEEP-DEPS/edit --move:@=DEEP-DEPS/move --remove:@=DEEP-DEPS/remove --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --tool:@=DEEP-DEPS/llm-test-tool --common:@=DEEP-DEPS/llm-test/worker-common.sh

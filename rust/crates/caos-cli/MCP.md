@@ -81,7 +81,7 @@ first, so `tools/list` is a constant and a client that reads it once, or ignores
 | `run(path, arguments)` | run the tool at a path and wait for its output. |
 | `start(path, arguments)` | begin the same call and return a ticket. The same call always has the same ticket, and starting one that has finished does not run it again. It is `run` without the wait: `run` starts the call and waits for its ticket, and the ticket is the one `caos-cli run` prints, so `caos-cli watch` takes it. |
 | `result(ticket)` | pending, or the output, or how it failed. Asking never runs anything. |
-| `eval-path(path)` | evaluate a path and return the hash of what it produces (`caos-std` exists only this way). Pass the hash as `in` to `read`, `ls` or `grep` to look inside it. |
+| `eval-path(path)` | evaluate a path and return the hash of what it produces (`caos-std` exists only this way). Pass `<hash>[/<path>]` as `root` to `read`, `ls` or `grep` to look inside it. |
 
 The model learns the rest from the server's `instructions`, which the handshake
 carries and a client puts in front of the model, and from `help`. Both say where the

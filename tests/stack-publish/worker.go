@@ -137,7 +137,7 @@ func use(id, name string, input map[string]any) map[string]any {
 
 func shell(id, cmd string, paths ...string) map[string]any {
 	return use(id, "run_tool", map[string]any{"path": "tools/sh",
-		"arguments": map[string]any{"cmd": cmd, "paths": paths}})
+		"arguments": map[string]any{"root": ".", "cmd": cmd, "paths": paths}})
 }
 
 func write(id, path, content string) map[string]any {
@@ -247,17 +247,17 @@ func main() {
 			write("tu_d6", "orphan/01-a.pr.md", "A\n"),
 			write("tu_d7", "orphan/03-c.pr.md", "C\n"))
 		respond(3,
-			publish("tu_dry", map[string]any{"stack": "mystack", "repository": invalid, "trunk": "main", "dry-run": "true"}),
-			publish("tu_prefix", map[string]any{"stack": "mystack", "repository": invalid, "trunk": "main", "dry-run": "true", "branch-prefix": "me/"}),
-			publish("tu_pub", map[string]any{"stack": "mystack", "repository": invalid, "trunk": "main"}),
-			publish("tu_notrunk", map[string]any{"stack": "mystack", "repository": invalid}),
-			publish("tu_norepo", map[string]any{"stack": "mystack", "trunk": "main"}),
-			publish("tu_gap", map[string]any{"stack": "gap", "repository": invalid, "trunk": "main"}),
-			publish("tu_unmerged", map[string]any{"stack": "unmerged", "repository": invalid, "trunk": "main"}),
-			publish("tu_orphan", map[string]any{"stack": "orphan", "repository": invalid, "trunk": "main"}),
-			publish("tu_bare", map[string]any{"stack": "bare", "repository": invalid, "trunk": "main"}),
-			publish("tu_nowhere", map[string]any{"stack": "nowhere", "repository": invalid, "trunk": "main"}),
-			publish("tu_badarg", map[string]any{"stack": "mystack", "repository": invalid, "trunk": "main", "squash": "true"}))
+			publish("tu_dry", map[string]any{"root": "mystack", "repository": invalid, "trunk": "main", "dry-run": "true"}),
+			publish("tu_prefix", map[string]any{"root": "mystack", "repository": invalid, "trunk": "main", "dry-run": "true", "branch-prefix": "me/"}),
+			publish("tu_pub", map[string]any{"root": "mystack", "repository": invalid, "trunk": "main"}),
+			publish("tu_notrunk", map[string]any{"root": "mystack", "repository": invalid}),
+			publish("tu_norepo", map[string]any{"root": "mystack", "trunk": "main"}),
+			publish("tu_gap", map[string]any{"root": "gap", "repository": invalid, "trunk": "main"}),
+			publish("tu_unmerged", map[string]any{"root": "unmerged", "repository": invalid, "trunk": "main"}),
+			publish("tu_orphan", map[string]any{"root": "orphan", "repository": invalid, "trunk": "main"}),
+			publish("tu_bare", map[string]any{"root": "bare", "repository": invalid, "trunk": "main"}),
+			publish("tu_nowhere", map[string]any{"root": "nowhere", "repository": invalid, "trunk": "main"}),
+			publish("tu_badarg", map[string]any{"root": "mystack", "repository": invalid, "trunk": "main", "squash": "true"}))
 		respond(4, map[string]any{"type": "text", "text": "published"})
 
 		w.Step("the turn")
@@ -283,7 +283,7 @@ func main() {
 		dry := seen(4, "tu_dry")
 		note("stack-publish dry-run, as the model saw it:\n%s", dry)
 		w.True(!strings.HasPrefix(dry, "ERROR:"), "the dry run was refused: %s", dry)
-		says("dry run", dry, "dry run", "repository "+invalid, "trunk main",
+		says("dry run", dry, "dry run", "repository "+invalid, "trunk main", "the remote heads were not read",
 			"01-feature  feature  ", "  base main  PR title: "+title1,
 			"02-tests  tests  ", "  base feature  PR title: "+title2)
 		w.True(!strings.Contains(dry, "99-dirty"), "the undescribed 99-dirty was planned: %s", dry)
@@ -294,7 +294,7 @@ func main() {
 		pub := seen(4, "tu_pub")
 		note("stack-publish against an unreachable remote: %s", pub)
 		w.True(strings.HasPrefix(pub, "ERROR:"), "an unreachable remote was not an error: %s", pub)
-		says("publish", pub, "remote branch lookup failed", "for branch feature", "nothing was pushed")
+		says("publish", pub, "reading the refs of "+invalid, "for branch feature", "nothing was pushed")
 
 		w.Step("refusals, each before the remote is read")
 		for _, c := range []struct {
@@ -303,17 +303,17 @@ func main() {
 		}{
 			{"tu_notrunk", []string{"no trunk", "pass trunk"}},
 			{"tu_norepo", []string{"no repository", "pass repository"}},
-			{"tu_gap", []string{"gap/02-b has a description but gap/01-a below it has none", "gap/01-a.pr.md"}},
-			{"tu_unmerged", []string{"unmerged/02-b does not contain unmerged/01-a", "caos-std/merge", `"theirs": "unmerged/01-a"`}},
-			{"tu_orphan", []string{"orphan/03-c.pr.md describes no layer"}},
-			{"tu_bare", []string{"no layer in bare has a .pr.md description"}},
-			{"tu_nowhere", []string{"stack nowhere"}},
-			{"tu_badarg", []string{"invalid stack-publish arguments", "squash"}},
+			{"tu_gap", []string{"02-b has a description but 01-a below it has none", "Write 01-a.pr.md"}},
+			{"tu_unmerged", []string{"02-b does not contain 01-a", "caos-std/merge", `"theirs": "<stack>/01-a"`}},
+			{"tu_orphan", []string{"03-c.pr.md describes no layer"}},
+			{"tu_bare", []string{"no layer in the stack has a .pr.md description"}},
+			{"tu_nowhere", []string{"nothing is at the root path"}},
+			{"tu_badarg", []string{"takes no \"squash\" argument"}},
 		} {
 			out := seen(4, c.id)
 			note("%s: %s", c.id, out)
 			w.True(strings.HasPrefix(out, "ERROR:"), "%s was not refused: %s", c.id, out)
-			w.True(!strings.Contains(out, "remote branch lookup"), "%s reached the remote before refusing: %s", c.id, out)
+			w.True(!strings.Contains(out, "reading the refs"), "%s reached the remote before refusing: %s", c.id, out)
 			says(c.id, out, c.says...)
 		}
 

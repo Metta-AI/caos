@@ -42,7 +42,10 @@ run_tools_only() {
       | jq -r --arg id "$call" 'select(.id == $id) | .status') || status=""
     case "$status" in
       complete) return 0 ;;
-      failed | cancelled) fail "call $call ended $status" ;;
+      failed | cancelled)
+        $TOOL tool-observation --repo /tmp/repo --head "$head" --id "$call" >&2 || true
+        fail "call $call ended $status"
+        ;;
     esac
     sleep 0.2
   done
@@ -83,7 +86,7 @@ grep -qF "hello tools" /tmp/read.observation || fail "the read did not return th
 
 stage "a second call, in its own run, mutating the source tree"
 declare_call toolu_write run_tool \
-  '{"arguments":{"cmd":"echo written > out.txt"},"path":"main/tools/sh"}'
+  '{"arguments":{"root":"main","cmd":"echo written > out.txt"},"path":"main/tools/sh"}'
 run_tools_only toolu_write
 $TOOL tool-observation --repo /tmp/repo --head "$head" \
   --id toolu_write > /tmp/write.observation \
