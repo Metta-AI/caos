@@ -957,7 +957,7 @@ impl Transport for GitTransport {
         let remote = self.repo.find_remote(CAOS_REMOTE).map_err(|e| {
             format!(
                 "no `{CAOS_REMOTE}` git remote (add it with \
-                 `git remote add {CAOS_REMOTE} <server-url>`): {e}"
+                 `git remote add {CAOS_REMOTE} <server-url>`, or pass `--server=<url>`): {e}"
             )
         })?;
         let url = remote
