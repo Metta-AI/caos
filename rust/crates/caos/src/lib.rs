@@ -1213,7 +1213,7 @@ impl GitTransport {
         // proceeding anyway` and the full closure back.
         let negotiate = self.is_commit_object(hash);
         let mut args: Vec<&str> = push_negotiation_args(negotiate);
-        args.extend(["push", "--porcelain", "--progress", CAOS_REMOTE, &refspec]);
+        args.extend(["push", "--porcelain", "--progress", self.remote(), &refspec]);
 
         let started = std::time::Instant::now();
         let outcome = self.git_capture_stderr(&args);
