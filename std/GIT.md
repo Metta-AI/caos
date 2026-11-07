@@ -112,8 +112,10 @@ it fast-forwards the branch; the PR follows.
   observes the remote again, so importing the same branch at a fresh path gives
   you its new tip. Public repositories need no token.
 - The destination path and its `.source.json` sibling must both be unused.
-  To import a newer tip while `00-base` exists, import it at a fresh path such
-  as `sources/<repo>/00-base-2` (see "Updating the base").
+  To bring a stack's `00-base` to a newer tip, run `caos-std/stack-sync`,
+  which fetches the trunk and every layer's branch itself (see "Updating the
+  base"); do not import first. Import a newer tip at a fresh path such as
+  `sources/<repo>/00-base-2` only for a source tree that is not a stack.
 - Read the imported repo's own `AGENTS.md` / `CLAUDE.md` before editing: they
   govern that code.
 - The commits inside a branch do not matter, only its net diff: branches are
