@@ -210,11 +210,14 @@ Bottom to top:
    is imported and becomes `00-base`; `00-base.source.json` gets the new commit
    and observation time.
 2. **Each layer**, in name order. A described layer has a branch; its remote
-   head R is read.
+   head R is read. Unless R is the layer's tip, R is imported before anything
+   reads it, when the session's store does not hold it: a commit someone else
+   pushed is on GitHub but not in the server's store, and fetching it from the
+   server fails ("not our ref"). The agent never imports R itself.
    - R absent: not published yet. R equal to the layer's tip: in sync. R an
      ancestor of the tip: local edits are ahead, and publishing will
      fast-forward. Nothing to do in any of these.
-   - Otherwise the branch was rewritten or pushed to. R is imported. If the
+   - Otherwise the branch was rewritten or pushed to. If the
      tip, or a first-parent ancestor of it, has R's exact tree, R is a rewrite
      of that commit (GitHub's rebase after a merge, when the trunk did not
      move otherwise): it is adopted. With no local edits the layer simply
