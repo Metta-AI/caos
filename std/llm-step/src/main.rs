@@ -1076,8 +1076,9 @@ fn op_call(call: &Call) -> Call {
 
 /// Perform a step operation (`@op` in a tool's help). Each owns its call's
 /// lifecycle: it writes the call's start, the records it exists for, and the
-/// call's completion itself. `started` is the call's record when this is a RESUME
-/// of an operation that began and has not finished.
+/// call's completion itself. `started` is the call's record when the step picks
+/// up an `agent-wait` that began in an earlier invocation; no other operation is
+/// ever run a second time (design/tool-contract.md, "No automatic resume").
 ///
 /// Returns whether the step should carry on at once. The one that does not is
 /// `agent-wait`, which dispatches a join on the child's relay and waits for its
@@ -1131,25 +1132,15 @@ fn op_marker_path(site: &CallSite<'_>) -> String {
     )
 }
 
-/// The operation a STARTED `run_tool` call is in the middle of. A call resumed
-/// after a restart has only its record to go on, and re-evaluating the tool's path
-/// to learn the operation would be a build: so an operation says what it is in a
-/// payload of its own start, or by the pin it wrote before doing anything
-/// irreversible.
+/// The operation a STARTED `run_tool` call is in the middle of, as the marker in
+/// its start says. Only `agent-wait` is ever picked up again from here (a join
+/// spans step invocations); re-evaluating the tool's path to learn the operation
+/// would be a build, which is why the start carries it.
 fn started_op(view: &Session<'_>, site: &CallSite<'_>) -> Option<String> {
-    if let Ok(bytes) = view.payload(&op_marker_path(site)) {
-        if let Ok(Value::String(op)) = serde_json::from_slice::<Value>(&bytes) {
-            return Some(op);
-        }
-    }
-    if view.payload(&import_source::pin_path(site)).is_ok() {
-        Some("import-source".to_string())
-    } else if view.payload(&publish_source::pin_path(site)).is_ok() {
-        Some("publish-source".to_string())
-    } else if view.payload(&stack_publish::pin_path(site)).is_ok() {
-        Some("stack-publish".to_string())
-    } else {
-        None
+    let bytes = view.payload(&op_marker_path(site)).ok()?;
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(Value::String(op)) => Some(op),
+        _ => None,
     }
 }
 
@@ -1166,28 +1157,26 @@ fn drive_call(
         .tool(&call.id)?
     {
         if existing.status == CallStatus::Started {
+            // A subagent join spans step invocations by design: the step
+            // dispatches a join on the child's relay and is called back when
+            // the child finishes, so finding one started is the normal case.
+            if existing.name == subagents::WAIT_TOOL {
+                dispatch_wait_started(state, request, call, &existing)?;
+                return Ok(false);
+            }
             if existing.name == "run_tool" {
                 let inner = op_call(call);
                 let op_site = CallSite::new(request, declaration, &inner);
-                let op = started_op(&state.session()?, &op_site);
-                if let Some(op) = op {
-                    return run_op(cfg, &op, state, &op_site, Some(&existing));
+                if started_op(&state.session()?, &op_site).as_deref() == Some("agent-wait") {
+                    return run_op(cfg, "agent-wait", state, &op_site, Some(&existing));
                 }
             }
-            if existing.name == "publish_source" {
-                publish_source::execute(state, &site)?;
-                return Ok(true);
-            }
-            if existing.name == "import_source" {
-                import_source::execute(state, &site)?;
-                return Ok(true);
-            }
-            if existing.name == subagents::WAIT_TOOL {
-                dispatch_wait_started(state, request, call, &existing)?;
-            } else {
-                dispatch_started(state, request, call, &existing)?;
-            }
-            return Ok(false);
+            // Anything else found started was being run by a step that stopped
+            // before it finished. It is never run again behind the agent's back
+            // (design/tool-contract.md, "No automatic resume"): it is answered
+            // as unfinished, and the agent decides whether to call again.
+            close_unfinished(state, &existing)?;
+            return Ok(true);
         }
         return Ok(true);
     }
@@ -2254,6 +2243,44 @@ fn completed_record(
         files_outcome: None,
         ..started.clone()
     }
+}
+
+/// What a call left started by a step that stopped is answered with.
+const UNFINISHED: &str = "this call did not finish: the step running it stopped before it completed. \
+It was not run again. Call it again if you still need its result; for anything that changes \
+something outside caos (a push, an import, a GitHub request), look at the remote first.";
+
+/// Close a call that a previous step left started, as failed with
+/// [`UNFINISHED`]. Concurrent completion wins: a call that is terminal by the
+/// time this looks again is left alone.
+fn close_unfinished<S: progress::RefStore>(
+    state: &mut progress::State<S>,
+    started: &CallRecord,
+) -> Result<(), String> {
+    let block = error_block(&started.id, UNFINISHED);
+    for _ in 0..progress::MAX_APPEND_ATTEMPTS {
+        state.reload()?;
+        if state
+            .session()?
+            .tool(&started.id)?
+            .is_some_and(|record| record.is_terminal())
+        {
+            return Ok(());
+        }
+        let record = completed_record(
+            started,
+            ToolResult::Failed {
+                error: observation_path(started),
+            },
+            None,
+        );
+        let expected = state.head().clone();
+        let transition = tool_complete_transition(record, &block, Vec::new())?;
+        if let progress::TryAppend::Appended(_) = state.try_append_at(&expected, transition)? {
+            return Ok(());
+        }
+    }
+    Err("session kept changing while closing an unfinished call".into())
 }
 
 fn complete_started_failed(
@@ -4417,6 +4444,79 @@ mod tests {
         let error = lookup_theirs(Some(&refs), Some("missing")).unwrap_err();
         assert!(error.contains("main") && error.contains("origin/main"));
     }
+    /// A call a previous step left started is answered as unfinished, never run
+    /// again; and a step that finds another one finished it first leaves that
+    /// answer alone.
+    #[test]
+    fn a_call_left_started_is_closed_as_unfinished() {
+        for concurrent in [false, true] {
+            let args = json!({"path":"caos-std/github","arguments":{}});
+            let golden = golden_with_first("run_tool", args.clone()).unwrap();
+            let call = Call {
+                id: "first".into(),
+                name: "run_tool".into(),
+                input: args,
+            };
+            let site = CallSite::at(&golden.request, &call, ASSISTANT_ID);
+            let mut started = site.stub(None);
+            started.status = CallStatus::Started;
+            let mut objects = golden.store;
+            let head = append_memory(
+                &mut objects,
+                &golden.head,
+                Transition::ToolStart {
+                    record: started.clone(),
+                    payloads: Vec::new(),
+                },
+            )
+            .unwrap();
+            // The other step's answer, landing between this step's look and its push.
+            let race = concurrent.then(|| {
+                let record = completed_record(
+                    &started,
+                    ToolResult::Complete {
+                        observation: observation_path(&started),
+                        proposal: None,
+                    },
+                    None,
+                );
+                tool_complete_transition(
+                    record,
+                    &result_block("first", "done", false),
+                    Vec::new(),
+                )
+                .unwrap()
+            });
+            let store = ImportStore {
+                objects,
+                head: head.clone(),
+                race,
+                lost_ack: false,
+            };
+            let mut state = progress::State::from_store(
+                store,
+                "refs/conversations/session/head".into(),
+                head,
+            )
+            .unwrap();
+            close_unfinished(&mut state, &started).unwrap();
+            state.reload().unwrap();
+            let record = state.session().unwrap().tool("first").unwrap().unwrap();
+            assert_eq!(
+                record.status,
+                if concurrent {
+                    CallStatus::Complete
+                } else {
+                    CallStatus::Failed
+                }
+            );
+            // Looking again changes nothing.
+            let before = state.head().clone();
+            close_unfinished(&mut state, &started).unwrap();
+            assert_eq!(*state.head(), before);
+        }
+    }
+
     struct ImportStore {
         objects: MemoryStore,
         head: Oid,
