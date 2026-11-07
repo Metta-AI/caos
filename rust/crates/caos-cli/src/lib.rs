@@ -285,7 +285,7 @@ fn signature(username: &str) -> Result<Signature, String> {
 }
 
 fn open_store(t: &GitTransport) -> Result<GitStore, String> {
-    GitStore::open(t.work_dir(), Some(CAOS_REMOTE))
+    GitStore::open(t.work_dir(), Some(t.remote()))
 }
 
 /// The session's head as the server holds it, with its objects local.
