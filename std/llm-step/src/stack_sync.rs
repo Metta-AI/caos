@@ -322,10 +322,9 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
             short(&stack.base)
         ));
     } else {
-        if let Err(error) = import_commit(&repository, &trunk_head, token_file) {
+        if let Err(error) = import_missing(state.store(), &repository, &trunk_head, token_file) {
             return site.fail(state, &format!("stack-sync refused; nothing changed: {error}"));
         }
-        state.store().ensure_local(&trunk_head)?;
         files.push((
             format!("{dir}/00-base"),
             Some((Mode::Commit, trunk_head.encode_line())),
