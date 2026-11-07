@@ -636,16 +636,24 @@ impl GitTransport {
             })?
             .canonicalize()
             .map_err(|e| format!("resolving the git working tree: {e}"))?;
+        let remote = server_override().unwrap_or(CAOS_REMOTE).to_string();
         Ok(Self {
             repo,
             git_dir,
             work_dir,
+            remote,
         })
     }
 
     /// The worktree this transport and its subprocess Git commands operate on.
     pub fn work_dir(&self) -> &Path {
         &self.work_dir
+    }
+
+    /// The remote argument for this transport's Git network commands: the
+    /// `caos` remote's name, or the `--server` URL that overrides it.
+    pub fn remote(&self) -> &str {
+        &self.remote
     }
 
     /// Verify that the configured CAOS server accepts connections.
