@@ -124,7 +124,10 @@ impl Config {
     fn server(&self) -> Result<String, String> {
         self.server
             .clone()
-            .ok_or_else(|| "no caos server: pass --server=<url>".to_string())
+            .ok_or_else(|| {
+                "no caos server: pass it before the command, `caos-cli --server=<url> mcp ...`"
+                    .to_string()
+            })
     }
 }
 
