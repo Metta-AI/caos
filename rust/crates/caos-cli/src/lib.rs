@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use caos::{
     compute_client_request_with_secrets, curry_client_object, eval_cli_image_arg,
-    run_client_request_with_secrets, GitTransport, Secrets, Transport, CAOS_REMOTE,
+    run_client_request_with_secrets, GitTransport, Secrets, Transport,
 };
 use session_protocol::v3::apply::{apply, client_signature, mint, Transition};
 use session_protocol::v3::legacy;
