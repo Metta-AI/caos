@@ -38,6 +38,12 @@ import (
 // worth failing over.
 const sharedStep = "CAOS_MCP_ARGS_HERE"
 
+// The placeholder the shared assets carry BEFORE `mcp`, where the client's
+// global `--server=<url>` goes: the client takes the server only ahead of the
+// command (`caos --server=<url> mcp hook ...`). It becomes nothing when no
+// server is named.
+const sharedServer = "CAOS_SERVER_ARG_HERE"
+
 func say(format string, a ...any) {
 	fmt.Fprintf(os.Stderr, "caos-install: "+format+"\n", a...)
 }
