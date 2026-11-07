@@ -664,11 +664,16 @@ impl GitTransport {
     /// low-level Git transport error into one concise diagnosis.
     pub fn ensure_server_reachable(&self) -> Result<(), String> {
         let url = self.server_url()?;
+        let overridden = self.remote != CAOS_REMOTE;
         check_server_reachable(&url).map_err(|error| {
-            format!(
-                "{error}\n\
-                 check that it is running and that the `{CAOS_REMOTE}` git remote points to the right URL"
-            )
+            if overridden {
+                format!("{error}\ncheck that it is running and that --server names the right URL")
+            } else {
+                format!(
+                    "{error}\n\
+                     check that it is running and that the `{CAOS_REMOTE}` git remote points to the right URL"
+                )
+            }
         })
     }
 
