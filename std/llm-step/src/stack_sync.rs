@@ -161,6 +161,22 @@ fn import_commit(repository: &str, commit: &Oid, token_file: Option<&str>) -> Re
     Ok(())
 }
 
+/// Import `commit` unless the session's store already holds it. A remote head
+/// the server has never seen cannot be fetched from it ("not our ref"), so
+/// this must come before anything that reads the commit.
+fn import_missing(
+    store: &GitStore,
+    repository: &str,
+    commit: &Oid,
+    token_file: Option<&str>,
+) -> Result<(), String> {
+    if store.has_local(commit)? {
+        return Ok(());
+    }
+    import_commit(repository, commit, token_file)?;
+    store.ensure_local(commit)
+}
+
 fn observe(repository: &str, branch: &str, token: Option<&str>) -> Result<Option<Oid>, String> {
     git_locator::publish::read_branch(repository, branch, token)
         .and_then(|head| head.map(|h| Oid::parse(&h, "remote head")).transpose())
@@ -361,79 +377,80 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
                     Ok(None) => notes.push(format!("{branch}: not published")),
                     Ok(Some(remote)) if remote == tip => notes.push(format!("{branch}: in sync")),
                     Ok(Some(remote)) => {
-                        if state.store().is_ancestor(&remote, &tip)? {
-                            notes.push(format!("{branch}: local edits ahead of the remote"));
-                        } else {
-                            match import_commit(&repository, &remote, token_file) {
-                                Err(error) => stopped = Some(error),
-                                Ok(()) => {
-                                    state.store().ensure_local(&remote)?;
-                                    let remote_tree = state
-                                        .store()
-                                        .read_commit(&remote)
-                                        .map_err(String::from)?
-                                        .tree;
-                                    match rewrite_of(state.store(), &tip, &remote_tree, 500)? {
-                                        Some(same) if same == tip => {
-                                            tip = remote.clone();
+                        // A commit someone else pushed is on the remote but not
+                        // yet in the server's store, where is_ancestor and the
+                        // merges look for it: import it first.
+                        match import_missing(state.store(), &repository, &remote, token_file) {
+                            Err(error) => stopped = Some(error),
+                            Ok(()) if state.store().is_ancestor(&remote, &tip)? => {
+                                notes.push(format!("{branch}: local edits ahead of the remote"));
+                            }
+                            Ok(()) => {
+                                let remote_tree = state
+                                    .store()
+                                    .read_commit(&remote)
+                                    .map_err(String::from)?
+                                    .tree;
+                                match rewrite_of(state.store(), &tip, &remote_tree, 500)? {
+                                    Some(same) if same == tip => {
+                                        tip = remote.clone();
+                                        notes.push(format!(
+                                            "{branch}: rewritten remotely with the same content, adopted {}",
+                                            short(&remote)
+                                        ));
+                                    }
+                                    Some(same) => match merge_into(
+                                        state.store_mut(),
+                                        &same,
+                                        &tip,
+                                        &remote,
+                                        &format!("stack-sync: adopt the rewritten {branch}\n"),
+                                    )? {
+                                        Merged::Clean(commit) => {
+                                            tip = commit;
                                             notes.push(format!(
-                                                "{branch}: rewritten remotely with the same content, adopted {}",
+                                                "{branch}: rewritten remotely, adopted {} under the local edits",
                                                 short(&remote)
                                             ));
                                         }
-                                        Some(same) => match merge_into(
+                                        Merged::Conflict(paths) => {
+                                            stopped = Some(format!(
+                                                "{branch}: adopting the rewritten remote {remote} conflicts in {}. {}",
+                                                paths.join(", "),
+                                                merge_hint(&path, &remote)
+                                            ))
+                                        }
+                                    },
+                                    None => match state.store().merge_base(&tip, &remote)? {
+                                        None => {
+                                            stopped = Some(format!(
+                                                "{branch}: the remote head {remote} shares no history with the layer. {}",
+                                                merge_hint(&path, &remote)
+                                            ))
+                                        }
+                                        Some(base) => match merge_into(
                                             state.store_mut(),
-                                            &same,
+                                            &base,
                                             &tip,
                                             &remote,
-                                            &format!("stack-sync: adopt the rewritten {branch}\n"),
+                                            &format!("stack-sync: merge the remote {branch}\n"),
                                         )? {
                                             Merged::Clean(commit) => {
                                                 tip = commit;
                                                 notes.push(format!(
-                                                    "{branch}: rewritten remotely, adopted {} under the local edits",
+                                                    "{branch}: merged the remote's changes ({})",
                                                     short(&remote)
                                                 ));
                                             }
                                             Merged::Conflict(paths) => {
                                                 stopped = Some(format!(
-                                                    "{branch}: adopting the rewritten remote {remote} conflicts in {}. {}",
+                                                    "{branch}: merging the remote {remote} conflicts in {}. {}",
                                                     paths.join(", "),
                                                     merge_hint(&path, &remote)
                                                 ))
                                             }
                                         },
-                                        None => match state.store().merge_base(&tip, &remote)? {
-                                            None => {
-                                                stopped = Some(format!(
-                                                    "{branch}: the remote head {remote} shares no history with the layer. {}",
-                                                    merge_hint(&path, &remote)
-                                                ))
-                                            }
-                                            Some(base) => match merge_into(
-                                                state.store_mut(),
-                                                &base,
-                                                &tip,
-                                                &remote,
-                                                &format!("stack-sync: merge the remote {branch}\n"),
-                                            )? {
-                                                Merged::Clean(commit) => {
-                                                    tip = commit;
-                                                    notes.push(format!(
-                                                        "{branch}: merged the remote's changes ({})",
-                                                        short(&remote)
-                                                    ));
-                                                }
-                                                Merged::Conflict(paths) => {
-                                                    stopped = Some(format!(
-                                                        "{branch}: merging the remote {remote} conflicts in {}. {}",
-                                                        paths.join(", "),
-                                                        merge_hint(&path, &remote)
-                                                    ))
-                                                }
-                                            },
-                                        },
-                                    }
+                                    },
                                 }
                             }
                         }
