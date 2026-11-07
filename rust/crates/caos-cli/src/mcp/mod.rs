@@ -100,8 +100,11 @@ impl Config {
                 })?);
             } else if argument == "--agents-md" {
                 config.agents_md = true;
-            } else if let Some(url) = argument.strip_prefix("--server=") {
-                config.server = Some(url.to_string());
+            } else if argument == "--server" || argument.starts_with("--server=") {
+                return Err(format!(
+                    "{argument}: the server is a global flag, named before the command: \
+                     `caos-cli --server=<url> mcp ...`"
+                ));
             } else if let Some(locator) = argument.strip_prefix("--base:@@=") {
                 config.base = Some(locator.to_string());
             } else if argument.starts_with("--base=") || argument.starts_with("--base:") {
