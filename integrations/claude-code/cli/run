@@ -49,7 +49,9 @@ if [ -z "$step" ]; then
     fi
     step="git+caos://local?rev=${dev_sha}&dir=std/llm-step"
 fi
-mcp_args=("--server=$server" "--llm-step:@@=$step")
+# The server is the client's global flag and goes BEFORE `mcp`; the rest after.
+server_args=("--server=$server")
+mcp_args=("--llm-step:@@=$step")
 if [ -n "${CAOS_BASE:-}" ]; then
     mcp_args+=("--base:@@=$CAOS_BASE")
 fi
