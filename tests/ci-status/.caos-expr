@@ -1,0 +1,7 @@
+# tests/ci-status, as an ENTRY: evaluating this directory yields the test's
+# ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST of std/ci-status's `check` stage: the verdict it works out from
+# what std/github answered. The answers are made here, so nothing reaches
+# GitHub; the refusals before any read are covered by tests/stack-merge-to-master.
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --ci-status:@=DEEP-DEPS/ci-status

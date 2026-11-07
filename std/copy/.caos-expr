@@ -3,11 +3,11 @@
 # from the tree the build sees: editing the docs re-keys this tool's ArgTree and
 # nothing it builds from.
 HELP=<<END
-Copy a file or directory to a new path, creating any missing parent directories. The destination must not exist. The copy is the entry itself: a source tree stays a source tree, with its history. Prefer this over cp via bash: it needs no `paths` declaration.
-@param from Path to copy, such as sources/repo/00-base.
-@param to Path of the copy, such as feature/01-change.
+Copy a file or directory to a new path, creating any missing parent directories. `root` is a directory holding both paths, such as sources/repo for a stack's layers (`.` for the whole session); `from` and `to` are relative to it. The destination must not exist. The copy is the entry itself: a source tree stays a source tree, with its history. Prefer this over cp via bash.
+@param from Path to copy, relative to root, such as 00-base.
+@param to Path of the copy, relative to root, such as 99-dirty.
 @writer
-@in
+@root
 END
 IMAGE=run --base:@=DEEP-DEPS/rustc --src:@=DEEP-DEPS/files
 curry --base=$IMAGE --op=copy --help=$HELP

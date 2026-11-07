@@ -179,14 +179,10 @@ describes it and `run_tool` runs it. Registering it as well would be a second wa
 to call one thing, and the two can disagree about which version runs — the
 harness's copy against the tree's. So the registry holds only what implements no
 entry and therefore has no path: the file tools, `grep`, the git readers, the
-subagent and async tools, `import_source`, `publish_source`, and
-`tool_help`/`run_tool` themselves. `std/README.md` is the index for the rest.
-
-`merge` is the one exception, and the reason is what its target is. Every other
-std tool reads a TREE, which `@in` lets a caller name; `merge` writes a merge
-commit INTO a source tree and so needs that tree's commit as `ours`. Nothing but
-the step's own routing supplies one and `run_tool` names no source tree, so merge
-cannot be reached by path yet and registering it is the only way to have it.
+subagent and async tools, and `tool_help`/`run_tool` themselves. `std/README.md`
+is the index for the rest. Importing and publishing are std entries
+(`caos-std/import-source`, `caos-std/publish-source` and the stack tools), so
+nothing registers them.
 
 ## Resolution
 
@@ -203,10 +199,10 @@ semantics. Thus a root expression may generate a `tools/check` directory absent
 from the stored tree: both tools can reach and evaluate it.
 
 Resolution uses the current session snapshot on every call. The
-definition's evaluated tree is separate from the input: what invocation binds as
-`in` is the original selected source tree — or the original session tree
-when no source-tree prefix was selected — and it binds it ONLY for a tool that
-declared `@in`.
+definition's evaluated tree is separate from the input: where a tool sits
+decides which definition runs, never what it runs over. A tool that declared
+`@root` is given the object at its `root` path and nothing else of the session;
+one that did not is given only its arguments.
 
 Resolution is the SERVER's. `caos mcp` records the call and hands it to the
 step, which asks for the tool's path exactly as `eval_path` does — an
@@ -244,23 +240,31 @@ with none gets a placeholder); `@param` tags declare the parameters:
 The bracketed name is the one extension over stock javadoc, which has no
 notion of an optional parameter.
 
-Four bare tags are flags:
+These bare tags are flags:
 - `@writer` — this tool PROPOSES A CHANGE to the tree it is run on, rather
   than returning a value. Absent means READ-ONLY, which is the default because
   it is the safe reading of a tool that forgot to say
-- `@in` — bind the tree it is run on as `in`. Absent means DO NOT, and that is
-  the point: see "Receiving args"
-- `@git` — bind the input as a COMMIT (`wc`) plus the turn's ref snapshot
-  (`refs`), for a tool that must walk HISTORY rather than read content: `in` is
-  a tree, and a tree cannot say what its parent was, what the last commit
-  changed, or what `main` points at. Off by default because `wc` changes on
-  every accepted edit while the tree often does not, so binding it would make
-  every call a miss for a commit the tool never reads
-- `@call` — bind the tool call's id as `call`. Results are kept by their
-  arguments, so without it two calls with the same arguments share one result;
-  a tool that talks to an outside service needs each call to be its own run.
-  The id is unique to the call and the same when a call is recovered, so a
-  retry still gets the stored result
+- `@root` — the tool takes a REQUIRED `root` parameter, a path relative to the
+  session, and is given the object there as `/cas/args/root`: a blob for a
+  file, a tree for a directory, a commit for a gitlink (which is how a reader
+  walks history), and nothing when nothing is there. No other part of the
+  session reaches it; another tree it needs is a `{tree}` or `{commit}`
+  parameter (design/tool-contract.md, "`root`"). Absent means the tool reads
+  nothing of the session: see "Receiving args"
+- `@request-id` — the tool reads or changes something outside caos, so a
+  result must never be reused by a later call that merely has the same
+  arguments. It gets an optional `request-id` parameter, which the harness
+  fills with the tool call's id when the caller leaves it out. A caller may
+  pass its own value to share one result between calls on purpose
+  (design/tool-contract.md, "`@request-id`")
+- `@op <name>` — the tool is an OPERATION OF THE STEP, run in process because
+  it writes the session's own records: the subagent and async entries
+  (`agent-spawn`, `agent-wait`, `agent-harvest`, `run-async`)
+
+`@in`, `@git`, `@scope` and `@call` were removed (design/tool-contract.md,
+"Tags"): `@root` replaced the first three and `@request-id` the last. A help
+that still declares one is reported with what replaced it, and the tag is
+ignored.
 
 The tags live in the help rather than as their own args so that `tool_help` can
 report it WITHOUT EVALUATING: "will this change my tree?" is the second most
@@ -273,8 +277,8 @@ proposal is discarded as a value, so the edit simply does not happen, with no
 error anywhere. `@params x` is likewise not `@param` with `s x` after it; it
 once minted an arg named `s` and lost the real one.
 
-Arg names are `[a-z][a-z0-9-]*`. `in`, `worker1`, `base`, `salt`, `wc`, `refs`
-and `help` are refused: the interpreter, or the tool's own expression, binds
+Arg names are `[a-z][a-z0-9-]*`. `worker1`, `base`, `salt` and `help` are
+refused: the interpreter, or the tool's own expression, binds
 those itself and currying SHALL fail on a rebind. A malformed `@param` tag is
 skipped with a message, never silently turned into an arg the model cannot use.
 
@@ -312,13 +316,13 @@ needed for one. `tool_help` states each one's name,
 whether it is required, and its documentation as prose rather than as a JSON
 schema — the model reads it, and a schema dump is the registry that was just
 removed. A tool with no `@param` tags takes no parameters, and one that
-declares no `@in` either has no input beyond its own expression.
+declares no `@root` either has no input beyond its own expression.
 
 ## Invocation
 
 - The job is `curry(<tool arg tree>, <declared args>)`, where
-  `<tool arg tree>` is what evaluating the tool's path yields — run over the
-  tree as `--in` only if the tool declared `@in`
+  `<tool arg tree>` is what evaluating the tool's path yields, and the
+  declared args include the object at `root` for a tool that declared `@root`
 - Evaluation happens where blocking is legal. A worker may not block, so the
   agent's harness tail-calls `eval-path-then` and curries in the callback
   (design/map-then.md); `caos-cli run-tool` evaluates directly. Both land on
@@ -330,52 +334,20 @@ declares no `@in` either has no input beyond its own expression.
 ## Receiving args
 
 - A bound arg lands at `/cas/args/<name>`, a lazy placeholder like any other
-  arg — `caos get` it before reading. **`/cas/args/in`, not `/cas/in`**
+  arg — `caos get` it before reading. **`/cas/args/root`, not `/cas/root`**
 - An omitted optional arg simply does not exist; test with `[ -e ]`
 - Values are never shell-interpolated. They are argv elements to `caos curry`,
   then bytes in a file
 - An `{array}` parameter arrives as one blob of NEWLINE-SEPARATED elements
 
-**`in` is bound only for a tool that declared `@in`**, and the reason is the
-cache key. A tree is the biggest thing that can enter an ArgTree, so binding
-one a tool never reads makes it re-key on every edit to a tree it ignores:
-`caos-test-result`, whose entire input is a hash, could not hit the memo twice
-in a row. `grep` has always done this right — it binds only the scope it
-searches, which is why a scoped grep is cheap — and every reader now follows it.
-
-A tool whose `in` is something it BUILDS rather than the tree it was run on
-declares no `@in`: `grep`'s is the scope it searches, bound by its own dispatch.
-
-**`@in` makes the input a PARAMETER, so a caller can redirect it.** The tag
-gives the tool an optional `{tree}` argument named `in`, listed by `tool_help`;
-supplying it runs the tool over THAT tree, and omitting it falls back to the
-tree the tool's own path selected. Without this the input is derived from where
-a tool happens to SIT, which is wrong for any tool the session itself
-generated — a `caos-build` mounted at `caos-std/` could only ever build
-`caos-std/`, never the source tree you meant. A tool may not declare `@param
-in` by hand: `in` is what the interpreter binds, and `@in` is how to ask for it.
-
-However it arrives, `in` is bound in exactly ONE place — the request — because
-`caos curry` refuses a rebind, and binding the caller's tree onto the tool's
-curry while the request bound the default would be exactly that.
-
-**`@git` reaches only a DISPATCHED READER, and both halves matter.** An
-in-process built-in is handed the session's store directly and ignores the
-tag — `log`, `show` and `diff` declared it for years and it did nothing for
-them. And a WRITER's input commit is not a caller's to choose: its proposal must
-descend from the commit whose pointer is being advanced, so the input commit is
-pinned to the scope rather than offered as a parameter. `merge`, the one tool
-that really needs it, takes it as `ours` bound by the launch — "a model naming
-it would be naming the session it is already in" — which is also why the
-generic tag has no users: the tool that needed the input commit predates it and
-binds it under a name of its own.
-
-So the four combinations are not symmetric:
-
-| | tree | commit |
-|---|---|---|
-| reader's input | `@in` — defaulted, overridable | `@git` — what it is for; no users yet |
-| writer's input | — | pinned to the scope, never a parameter |
+**Only a `@root` tool receives anything of the session, and only the object
+at its root.** A tree is the biggest thing that can enter an ArgTree, and the
+ArgTree is the cache key, so binding one a tool never reads makes it re-key on
+every edit to a tree it ignores: `caos-test-result`, whose entire input is a
+hash, could not hit the memo twice in a row. For the same reason a `@root`
+tool's key is its root object and its arguments, so `edit` re-keys only when
+its own file changes. The registered `grep` binds only the scope it searches,
+by its own dispatch.
 
 ## Returning a result
 
@@ -399,8 +371,13 @@ TOOL taking a hash (`caos-test` and `caos-test-result`), not as richer printing.
 
 ## Writers
 
-A tool that declares `@writer` PROPOSES A CHANGE to the tree it was run on
-instead of returning a value. Its result is `{prop, out, message?, failed?}`:
+A tool that declares `@writer` PROPOSES A CHANGE instead of returning a value.
+With `@root`, which every std writer declares, its result is a tree of
+`stdout`, `failed`, `root` or `deleted`, and `commit-message`; the harness puts
+the new object at the root path and rewrites everything above it
+(design/tool-contract.md, "The result" and "Applying a writer's result"). A
+writer without `@root` still returns the older `{prop, out, message?,
+failed?}`, applied to the tree its path selected:
 
 - `prop` — the proposal. A TREE, and the harness mints the commit, which is
   what lets almost every writer never handle a commit at all; or a COMMIT, for
@@ -818,18 +795,15 @@ commit to /git/import and prints its hash. It optionally reads a token file
 specified by --github-token-file=PATH and forwards it in a sensitive header.
 Ref resolution, provenance, and session attachment belong to callers.
 
-The inline `import_source(source, revision?, into)` tool resolves a remote
-revision in the agent container. Before importing objects it records the
-commit and provenance as an import.json payload in tool.start. Inline starts
-may omit a compute task; ordinary dispatched starts still name their task.
-A resumed call uses the saved hash, and concurrent attempts accept the first
-persisted observation. A new tool call observes the remote again.
-
-After import, the tool atomically adds the gitlink, sibling .source.json
-provenance and completed tool result. It rejects occupied destinations.
-The tool is available in an empty session. Local paths use /import.
-Only github.com on the default HTTPS port receives the mounted GitHub token
-automatically.
+`caos-std/import-source` (`root`, `source`, `revision?`, `into`) is an
+ordinary writer (design/tool-contract.md). It resolves the revision and
+imports the commit through `std/github`'s `import` operation, the one image
+the GitHub token is granted to, and returns its root directory holding the new
+gitlink and its sibling `.source.json` provenance; the harness applies that as
+one change. Nothing is recorded before the import, and every call observes the
+remote again. It rejects occupied destinations, works in an empty session, and
+takes HTTPS repositories only; local paths use /import. Only github.com on the
+default HTTPS port receives the GitHub token.
 
 ## Remote Git imports
 
@@ -995,8 +969,9 @@ revision (and made the history tools' hashes readable the same way).
 ## Publication
 
 The agent publishes (design/agent-github.md, "PRs"); the client has no publish
-command. `publish_source` pushes one named gitlink's exact commit to an explicit
-repository and branch, sent by the server from its own store, and
+command. `caos-std/stack-publish` pushes every layer of a stack and opens or
+updates its PRs; `caos-std/publish-source` pushes one gitlink's exact commit to
+an explicit repository and branch, sent by the server from its own store, and
 `caos-std/github` opens or updates the PR. A stack is squashed to one commit
 per layer and published bottom to top, each layer's PR based on the branch
 below ([Stacks](design/stacks.md)). No snapshot has a special working or

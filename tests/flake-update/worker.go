@@ -38,14 +38,23 @@ func next(stage string) string {
 		"--update:@=/cas/args/update", "--flake:@=/cas/args/flake")
 }
 
-// result is the run's result, which must be the lock alone: a blob of JSON.
+// result is the run's result, whose stdout must be the lock alone: JSON
+// (the root contract's answer, design/tool-contract.md).
 func result() (raw []byte, lock map[string]any) {
 	const r = "/cas/args/result"
 	w.Get(r)
-	w.True(w.Check(os.Lstat(r)).Mode().IsRegular(), "the result is not a blob")
-	raw = w.Check(os.ReadFile(r))
+	w.True(w.Check(os.Lstat(r)).IsDir(), "the result is not a tree")
+	w.True(!w.Exists(r+"/failed"), "the update failed: %s", w.Read(r+"/stdout"))
+	raw = []byte(w.Read(r + "/stdout"))
 	w.Must(json.Unmarshal(raw, &lock))
 	return raw, lock
+}
+
+// update runs std/flake-update over the tree at `root`, with `args`, and
+// checks it in stage `then`.
+func update(root, then string, args ...string) {
+	request := w.Caos(append([]string{"prepare-request", "--base:@=/cas/args/update", "--root:@=" + root}, args...)...)
+	w.Caos("run-request-then", request, "--then:hash="+next(then))
 }
 
 // systems is the fixture input's node in a lock.
@@ -62,9 +71,7 @@ func main() {
 		switch stage {
 		case "":
 			w.Step("lock from flake.nix alone")
-			w.Caos("run-then", "/cas/args/flake",
-				"--run:hash="+w.Caos("curry", "--base:@=/cas/args/update"),
-				"--then:hash="+next("locked"))
+			update("/cas/args/flake", "locked")
 
 		case "locked":
 			raw, lock := result()
@@ -82,9 +89,7 @@ func main() {
 			w.Must(os.WriteFile(filepath.Join(dir, "flake.nix"), []byte(w.Read("/cas/args/flake/flake.nix")), 0o644))
 			w.Must(os.WriteFile(filepath.Join(dir, "flake.lock"), raw, 0o644))
 			w.Put(dir, "/cas/flake2")
-			w.Caos("run-then", "/cas/flake2",
-				"--run:hash="+w.Caos("curry", "--base:@=/cas/args/update", "--input=systems", "--rev="+pin),
-				"--then:hash="+next("pinned"))
+			update("/cas/flake2", "pinned", "--input=systems", "--rev="+pin)
 
 		case "pinned":
 			_, lock := result()

@@ -64,8 +64,8 @@ pub use eval::cli_eval_path;
 /// say — `caos-cli get <hash> <path>` checks it out.
 ///
 /// Conventions on the result: a BLOB result is printed verbatim (a tool whose
-/// answer is text, like `test-result`), and a `report` file is printed (a
-/// FAILED banner fails the command). Everything else just gets the printed
+/// answer is text, like `test-result`), and a `stdout` file is printed (a
+/// `failed` marker fails the command). Everything else just gets the printed
 /// result hash. Exactly what an agent is shown for the same call — the report
 /// is the tool's whole answer to both, so neither reader sees more than the
 /// other.
@@ -114,7 +114,16 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
     // gets the tree under test and builds from source; handing it prebuilt host
     // binaries would couple every invocation to the deploy and let the suite
     // pass against something other than the tree it was given.
-    let mut all: Vec<String> = vec!["--in:@=.".to_string()];
+    //
+    // The worktree is `root` (design/tool-contract.md, "The argument") unless
+    // the caller names one.
+    let names_root = kvs
+        .iter()
+        .any(|kv| kv.starts_with("--root=") || kv.starts_with("--root:"));
+    let mut all: Vec<String> = Vec::new();
+    if !names_root {
+        all.push("--root:@=.".to_string());
+    }
     all.extend(kvs.iter().cloned());
     let (kind, result) = run_request(t, &base, None, &all, &Secrets::current())?;
     // The result's identity, on stdout, so a script can thread it onward — the
@@ -125,8 +134,8 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
 }
 
 /// Print a tool result's report conventions, reading ONLY the objects they
-/// name: the top tree and a `report` blob, or the result itself when it is one.
-/// A tool with no `report` (`build` returns an image) costs exactly one object.
+/// name: the top tree and its `stdout` blob, or the result itself when it is one.
+/// A tool with no `stdout` (`build` returns an image) costs exactly one object.
 fn report_conventions(t: &dyn Transport, name: &str, result: &str) -> Result<(), String> {
     let Some(entries) = fetch_tree_entries(t, result)? else {
         // Not a tree: the tool's whole answer IS the blob. Print it — the same
@@ -148,17 +157,17 @@ fn report_conventions(t: &dyn Transport, name: &str, result: &str) -> Result<(),
             .find(|e| entry_name(e) == want.as_bytes())
             .map(|e| e.oid.to_string())
     };
-    let Some(report) = find(&entries, "report") else {
+    let Some(stdout) = find(&entries, "stdout") else {
         return Ok(());
     };
-    // The report is printed verbatim, so read the blob rather than
+    // `stdout` is printed verbatim, so read the blob rather than
     // fetch_blob_string (which trims).
-    let (_, text) = t.get_object(&report)?;
-    let text = String::from_utf8(text).map_err(|_| format!("{name}'s report is not UTF-8"))?;
+    let (_, text) = t.get_object(&stdout)?;
+    let text = String::from_utf8(text).map_err(|_| format!("{name}'s stdout is not UTF-8"))?;
     eprintln!();
     eprint!("{text}");
 
-    // THE REPORT IS THE WHOLE OUTPUT. There used to be a second pass here that
+    // `stdout` IS THE WHOLE OUTPUT. There used to be a second pass here that
     // walked `results/<rec>` and dumped the full `output` of every record whose
     // verdict wasn't a PASS. Once the report itself carried each failure's tail
     // and its record hash, that printed the same failure twice — and, worse,
@@ -166,8 +175,8 @@ fn report_conventions(t: &dyn Transport, name: &str, result: &str) -> Result<(),
     // callers is that a tool cannot behave differently depending on who ran it.
     // The full output is one `run-tool caos-test-result <hash>` away, which the
     // report says.
-    if text.contains("FAILED") {
-        return Err(format!("{name} reported FAILED"));
+    if find(&entries, "failed").is_some() {
+        return Err(format!("{name} failed"));
     }
     Ok(())
 }

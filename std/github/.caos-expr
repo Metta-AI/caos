@@ -1,21 +1,40 @@
-# The `github` tool (design/agent-github.md, "PRs"): the std/go worker image with
-# this directory's program curried onto it, plus the `help` it is described by.
+# The `github` tool (design/agent-github.md, "PRs"; design/tool-contract.md,
+# "One grant"): the std/go worker image with this directory's program curried
+# onto it, plus the `help` it is described by. The github-token is granted to
+# this image, and the other git tools mount it as DEEP-DEPS/github and hand it
+# their remote work, so this one grant covers them all.
+#
 # A reader with no `@in`: its ArgTree is its arguments and nothing else, so
-# `@call` adds the tool call's id to make each call its own run. A caller
-# outside llm-step passes `--call=<any unused value>` itself.
+# `@request-id` makes each call its own run. A caller outside llm-step passes
+# `--request-id=<any unused value>` itself.
 HELP=<<END
-Call the GitHub API at api.github.com, with the granted github-token: everything
-about a PR except its commits, which publish_source pushes. Find a branch's open
-PR, open one, change its base, link PRs as a stack. Nothing is checked out.
+Call the GitHub API at api.github.com with the granted github-token, or run a
+batch of GitHub operations. Everything about a PR except its commits: find a
+branch's open PR, open one, change its base, link PRs as a stack. Nothing is
+checked out.
 
-The result is the HTTP status line, then the response body, cut if long. A
-response of any status is a result; the run fails only when none came back,
-and then a write may still have arrived: read the affected state with a GET
-before sending it again.
+One call: method, path and optional body. The result is the HTTP status line,
+then the response body, cut if long. A response of any status is a result; the
+run fails only when none came back, and then a write may still have arrived:
+read the affected state with a GET before sending it again.
 
-@param method GET, POST, PATCH, PUT or DELETE.
-@param path API path with any query string, such as /repos/owner/repo/pulls?head=owner:branch&state=open. GraphQL is POST /graphql.
+A batch instead: batch is a JSON array of operations, run in order, stopping at
+the first that is not ok. Each is one of:
+  {"op":"api","method":"GET","path":"/repos/o/r/pulls","body":{},"ok_status":[404]}
+    one call; ok on a 2xx status or one listed in ok_status
+  {"op":"head","repository":"https://github.com/o/r.git","branch":"main"}
+    the branch's commit as head, or null when it does not exist
+  {"op":"push","repository":"...","commit":"<full hash>","branch":"topic","expected":"<full hash, or absent>","force":false,"allow_ignored":false}
+    push the commit, leased on expected (the head you saw); ok when the branch is at the commit
+  {"op":"import","repository":"...","revision":"main"}
+    fetch a branch, refs/... name or full hash into caos; ok with its commit
+The result is a JSON array, one object per operation: op, ok, error when it
+could not be done, what it found, and skipped for those after a stop.
+
+@param [method] GET, POST, PATCH, PUT or DELETE. With path; not with batch.
+@param [path] API path with any query string, such as /repos/owner/repo/pulls?head=owner:branch&state=open. GraphQL is POST /graphql.
 @param [body] JSON request body, such as {"title":"Add the parser","head":"parser","base":"main","body":"Why."}.
-@call
+@param [batch] A JSON array of operations, described above, in place of method, path and body.
+@request-id
 END
 curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --help=$HELP

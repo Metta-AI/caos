@@ -1,9 +1,8 @@
-// tests/std-grep — a WORKER test of std/grep, which runs the rgrep fold over a
-// scope and renders its sparse result as `path:linenum:line`.
-//
-// The tree has a SOURCE TREE in it (a commit entry, `feature/dirty`), because a
-// search that stops at a code reference is not the tool: matches inside one must
-// come back under their session path.
+// tests/std-grep — a WORKER test of std/grep under the root contract
+// (design/tool-contract.md): the scope is the object bound as `root` (a
+// directory, a source tree's commit, or a file), matches come back as
+// `path:linenum:line` relative to it, and every answer is a tree: `stdout`, and
+// `failed` on a mistake.
 package main
 
 import (
@@ -37,13 +36,23 @@ func write(path, text string) {
 	w.Must(os.WriteFile(path, []byte(text), 0o644))
 }
 
-// grep runs the tool over a tree and returns what it answered: the text of a
-// blob, or for a tree its `report`.
-func grep(tree string, params ...string) (kind, text string) {
+// at is the object at a path inside a tree (through a source tree's code).
+func at(tree, path string) string {
+	seq++
+	dest := fmt.Sprintf("/cas/at-%d", seq)
+	run("caos", "resolve", tree, path, dest)
+	return run("caos", "hash", dest)
+}
+
+// grep runs the tool with `root` bound to an object (none for "") and returns
+// its stdout and whether it failed.
+func grep(root string, params ...string) (text string, failed bool) {
 	seq++
 	form := url.Values{}
 	form.Set("base:hash", run("caos", "hash", "/cas/args/grep"))
-	form.Set("in:hash", tree)
+	if root != "" {
+		form.Set("root:hash", root)
+	}
 	form.Set("salt", fmt.Sprintf("std-grep-%d-%d", os.Getpid(), seq))
 	for i := 0; i < len(params); i += 2 {
 		form.Set(params[i], params[i+1])
@@ -54,15 +63,18 @@ func grep(tree string, params ...string) (kind, text string) {
 	body := strings.TrimSpace(string(w.Check(io.ReadAll(resp.Body))))
 	w.True(resp.StatusCode == 200, "grep: HTTP %d: %s", resp.StatusCode, body)
 	kind, hash, found := strings.Cut(body, " ")
-	w.True(found, "grep answered %q", body)
+	w.True(found && kind == "tree", "grep answered %q, not a result tree", body)
 	dir := fmt.Sprintf("/cas/r-%d", seq)
 	run("caos", "get-hash", hash, dir)
 	run("caos", "get", dir)
-	if kind == "blob" {
-		return kind, string(w.Check(os.ReadFile(dir)))
-	}
-	run("caos", "get", dir+"/report")
-	return kind, string(w.Check(os.ReadFile(dir + "/report")))
+	run("caos", "get", dir+"/stdout")
+	_, err = os.Lstat(dir + "/failed")
+	return string(w.Check(os.ReadFile(dir + "/stdout"))), err == nil
+}
+
+func ok(text string, failed bool) string {
+	w.True(!failed, "grep failed: %s", text)
+	return text
 }
 
 func main() {
@@ -77,6 +89,7 @@ func main() {
 		tree := run("caos", "hash", "/cas/code")
 		write("/tmp/commit", "tree "+tree+"\nauthor t <t@caos> 1 +0000\ncommitter t <t@caos> 1 +0000\n\nthe source tree\n")
 		run("caos", "put-commit", "/tmp/commit", "/cas/commit")
+		commit := run("caos", "hash", "/cas/commit")
 		write("/tmp/ws/notes.txt", "hello\nworld\ntwo more\n")
 		w.Must(os.MkdirAll("/tmp/ws/feature", 0o755))
 		w.Must(os.Symlink("/cas/commit", "/tmp/ws/feature/dirty"))
@@ -84,33 +97,32 @@ func main() {
 		ws := run("caos", "hash", "/cas/ws")
 
 		w.Step("matches come back as path:line:text, through the source tree")
-		kind, text := grep(ws, "pattern", "two")
-		w.True(kind == "blob", "a search answers a blob, got a %s: %s", kind, text)
+		text := ok(grep(ws, "pattern", "two"))
 		want := "feature/dirty/README.md:2:two\nfeature/dirty/src/lib.txt:2:two libs\nnotes.txt:3:two more"
 		w.True(text == want, "grep two:\n%s\nwant:\n%s", text, want)
 
-		w.Step("a scope narrows the search, to a directory or a file")
-		_, text = grep(ws, "pattern", "two", "path", "feature/dirty/src")
-		w.True(text == "feature/dirty/src/lib.txt:2:two libs", "scoped to a directory: %q", text)
-		_, text = grep(ws, "pattern", "world", "path", "notes.txt")
-		w.True(text == "notes.txt:2:world", "scoped to a file: %q", text)
+		w.Step("the root narrows the search: a source tree, a directory, a file")
+		text = ok(grep(commit, "pattern", "two"))
+		w.True(text == "README.md:2:two\nsrc/lib.txt:2:two libs", "a source tree root: %q", text)
+		text = ok(grep(at(ws, "feature/dirty/src"), "pattern", "two"))
+		w.True(text == "lib.txt:2:two libs", "a directory root: %q", text)
+		text = ok(grep(at(ws, "notes.txt"), "pattern", "world"))
+		w.True(text == "2:world", "a file root: %q", text)
 
 		w.Step("a pattern is a regular expression")
-		_, text = grep(ws, "pattern", "^(one|three)$", "path", "feature")
-		w.True(text == "feature/dirty/README.md:1:one\nfeature/dirty/README.md:3:three", "alternation: %q", text)
+		text = ok(grep(commit, "pattern", "^(one|three)$"))
+		w.True(text == "README.md:1:one\nREADME.md:3:three", "alternation: %q", text)
 
 		w.Step("no matches is an answer, not an error")
-		kind, text = grep(ws, "pattern", "zzz-not-there")
-		w.True(kind == "blob" && text == "no matches", "no matches: %s %q", kind, text)
+		text = ok(grep(ws, "pattern", "zzz-not-there"))
+		w.True(text == "no matches", "no matches: %q", text)
 
 		w.Step("mistakes are values the model can act on")
-		kind, text = grep(ws, "pattern", "(")
-		w.True(kind == "tree" && strings.HasPrefix(text, "FAILED: invalid pattern"), "a bad pattern: %s %q", kind, text)
-		kind, text = grep(ws, "pattern", "x", "path", "no/such/dir")
-		w.True(kind == "tree" && strings.HasPrefix(text, "FAILED: no/such/dir"), "a missing path: %s %q", kind, text)
-		kind, text = grep(ws, "pattern", "x", "path", "../up")
-		w.True(kind == "tree" && strings.Contains(text, "`..` is not allowed"), "a parent path: %s %q", kind, text)
-		kind, text = grep(ws)
-		w.True(kind == "tree" && strings.Contains(text, "needs a string `pattern`"), "no pattern: %s %q", kind, text)
+		text, failed := grep(ws, "pattern", "(")
+		w.True(failed && strings.Contains(text, "invalid pattern"), "a bad pattern: %v %q", failed, text)
+		text, failed = grep("", "pattern", "x")
+		w.True(failed && strings.Contains(text, "nothing is at the root path"), "no root: %v %q", failed, text)
+		text, failed = grep(ws)
+		w.True(failed && strings.Contains(text, "needs a string `pattern`"), "no pattern: %v %q", failed, text)
 	})
 }

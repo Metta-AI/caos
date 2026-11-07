@@ -2412,18 +2412,7 @@ pub fn describe_tool_set(
         else {
             continue;
         };
-        if kind != "tree"
-            || [
-                "bash",
-                "grep",
-                "read",
-                "ls",
-                "write",
-                "edit",
-                "import_source",
-            ]
-            .contains(&name)
-        {
+        if kind != "tree" || ["bash", "grep", "read", "ls", "write", "edit"].contains(&name) {
             continue;
         }
         let Ok(expr) = t.git_capture(&["show", &format!("{hash}:.caos-expr")], None) else {
@@ -3331,8 +3320,9 @@ mod tests {
 
     #[test]
     fn agent_publication_records_load_as_summaries() {
-        // The agent's publish_source writes these records; the client no
-        // longer publishes, but it still reads them.
+        // Older sessions hold these records, written by the agent's former
+        // built-in publish_source; nothing writes them now, but the client
+        // still reads them.
         use session_protocol::v3::ids;
         use session_protocol::v3::publication::Outcome;
         use session_protocol::v3::records::{Descriptor, PublicationRecord};

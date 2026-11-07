@@ -6,8 +6,8 @@
 // The repository is a `.invalid` host, so the remote cannot be read: the sync
 // must get through every check, stop at reading the trunk, and change
 // nothing. The refusals (no trunk, no such directory, an unknown argument)
-// must come before the remote is read. The merge logic itself has unit tests
-// in llm-step (stack_sync.rs) over a real git store.
+// must come before the remote is read. The merge logic itself is tested
+// over real commits by tests/stack-sync-merge.
 package main
 
 import (
@@ -131,7 +131,7 @@ func use(id, name string, input map[string]any) map[string]any {
 
 func shell(id, cmd string, paths ...string) map[string]any {
 	return use(id, "run_tool", map[string]any{"path": "tools/sh",
-		"arguments": map[string]any{"cmd": cmd, "paths": paths}})
+		"arguments": map[string]any{"root": ".", "cmd": cmd, "paths": paths}})
 }
 
 func write(id, path, content string) map[string]any {
@@ -224,11 +224,11 @@ func main() {
 			write("tu_d1", "mystack/01-feature.pr.md", "Add the feature ("+salt+")\n"),
 			write("tu_d2", "mystack/02-tests.pr.md", "Test the feature ("+salt+")\n"))
 		respond(3,
-			sync("tu_sync", map[string]any{"stack": "mystack", "repository": invalid, "trunk": "main"}),
-			sync("tu_dry", map[string]any{"stack": "mystack", "repository": invalid, "trunk": "main", "dry-run": "true"}),
-			sync("tu_notrunk", map[string]any{"stack": "mystack", "repository": invalid}),
-			sync("tu_nowhere", map[string]any{"stack": "nowhere", "repository": invalid, "trunk": "main"}),
-			sync("tu_badarg", map[string]any{"stack": "mystack", "repository": invalid, "trunk": "main", "force": "true"}),
+			sync("tu_sync", map[string]any{"root": "mystack", "repository": invalid, "trunk": "main"}),
+			sync("tu_dry", map[string]any{"root": "mystack", "repository": invalid, "trunk": "main", "dry-run": "true"}),
+			sync("tu_notrunk", map[string]any{"root": "mystack", "repository": invalid}),
+			sync("tu_nowhere", map[string]any{"root": "nowhere", "repository": invalid, "trunk": "main"}),
+			sync("tu_badarg", map[string]any{"root": "mystack", "repository": invalid, "trunk": "main", "force": "true"}),
 			use("tu_ls", "ls", map[string]any{"path": "mystack"}))
 		respond(4, map[string]any{"type": "text", "text": "synced"})
 
@@ -257,7 +257,7 @@ func main() {
 			out := seen(4, id)
 			note("%s: %s", id, out)
 			w.True(strings.HasPrefix(out, "ERROR:"), "%s: an unreachable remote was not an error: %s", id, out)
-			says(id, out, "remote branch lookup failed", "for the trunk main", "nothing changed")
+			says(id, out, "reading the refs of "+invalid, "nothing changed")
 		}
 
 		w.Step("refusals, each before the remote is read")
@@ -266,13 +266,13 @@ func main() {
 			says []string
 		}{
 			{"tu_notrunk", []string{"no trunk", "pass trunk"}},
-			{"tu_nowhere", []string{"stack nowhere"}},
-			{"tu_badarg", []string{"invalid stack-sync arguments", "force"}},
+			{"tu_nowhere", []string{"nothing is at the root path"}},
+			{"tu_badarg", []string{"takes no \"force\" argument"}},
 		} {
 			out := seen(4, c.id)
 			note("%s: %s", c.id, out)
 			w.True(strings.HasPrefix(out, "ERROR:"), "%s was not refused: %s", c.id, out)
-			w.True(!strings.Contains(out, "remote branch lookup"), "%s reached the remote before refusing: %s", c.id, out)
+			w.True(!strings.Contains(out, "reading the refs"), "%s reached the remote before refusing: %s", c.id, out)
 			says(c.id, out, c.says...)
 		}
 

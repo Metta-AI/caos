@@ -19,9 +19,8 @@
 //! a failed worker.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use session_protocol::v3::git_store::HistoryQuery;
 use session_protocol::v3::{GitStore, ObjectStore, Oid};
@@ -47,16 +46,20 @@ enum Failure {
 
 use Failure::{Infra, User};
 
+/// The answer under the root contract (design/tool-contract.md): `{stdout}`.
 fn answer(text: &str) -> Result<(), String> {
-    let file = scratch("history-out")?.join("answer");
-    fs::write(&file, text).map_err(|e| format!("writing the answer: {e}"))?;
-    caos(["put", path(&file), "/cas/out"])
+    let dir = scratch("history-out")?;
+    fs::write(dir.join("stdout"), text).map_err(|e| format!("writing stdout: {e}"))?;
+    caos(["put", path(&dir), "/cas/out"])
 }
 
+/// A mistake the model can act on: `{stdout, failed}`.
 fn failed(message: &str) -> Result<(), String> {
     let dir = scratch("history-out")?;
-    fs::write(dir.join("report"), format!("FAILED: {message}\n"))
-        .map_err(|e| format!("writing the report: {e}"))?;
+    fs::write(dir.join("stdout"), format!("{message}\n"))
+        .map_err(|e| format!("writing stdout: {e}"))?;
+    fs::write(dir.join("failed"), "history failed\n")
+        .map_err(|e| format!("writing failed: {e}"))?;
     caos(["put", path(&dir), "/cas/out"])
 }
 
@@ -72,79 +75,42 @@ fn input(name: &str) -> Result<Option<String>, Failure> {
         .map_err(|e| User(format!("`{name}` is not UTF-8 text: {e}")))
 }
 
-fn split_path(raw: &str) -> Vec<String> {
-    raw.trim()
-        .trim_start_matches('/')
-        .split('/')
-        .filter(|c| !c.is_empty() && *c != ".")
-        .map(str::to_string)
-        .collect()
-}
 
-/// The commit of the source tree named by the `source-tree` argument.
+/// The commit of the source tree the call names as `root` (design/tool-contract.md):
+/// the harness binds the gitlink's commit itself.
 fn source_commit() -> Result<Oid, Failure> {
-    let raw = input("source-tree")?.ok_or_else(|| {
-        User(
-            "history needs `source-tree`: the path of the source tree, such as feature/01-change"
+    let root = arg("root");
+    if fs::symlink_metadata(&root).is_err() {
+        return Err(User(
+            "nothing is at the root path: root is the source tree whose history to read, \
+             such as sources/repo/01-layer"
                 .into(),
-        )
-    })?;
-    commit_at(&raw)
+        ));
+    }
+    commit_arg(&root, "the root")
 }
 
-/// The commit of the source tree at `raw`, a path in the `in` tree: the ENTRY AS
-/// STORED, not what resolving it makes of it (that walks through the commit to
-/// its code tree).
-fn commit_at(raw: &str) -> Result<Oid, Failure> {
-    let comps = split_path(raw);
-    if comps.is_empty() || comps.iter().any(|c| c == "..") {
-        return Err(User(format!("`source-tree` names no source tree: {raw:?}")));
-    }
-    let tree = cas_hash(&arg("in")).map_err(Infra)?;
-    let resolve = |relative: &str, into: &str| -> Result<PathBuf, Failure> {
-        let output = std::process::Command::new("caos")
-            .args(["resolve", &tree, relative, into])
-            .output()
-            .map_err(|e| Infra(format!("launching caos resolve: {e}")))?;
-        if output.status.success() {
-            Ok(PathBuf::from(into))
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let reason = stderr.trim_end();
-            Err(User(format!(
-                "{relative}: {}",
-                reason.strip_prefix("caos: ").unwrap_or(reason)
-            )))
-        }
-    };
-    // One landing place per lookup: `diff` resolves two paths, and `caos resolve`
-    // does not overwrite.
-    static LOOKUPS: AtomicUsize = AtomicUsize::new(0);
-    let landing = format!("/cas/history-parent-{}", LOOKUPS.fetch_add(1, Ordering::Relaxed));
-    let parent = resolve(&comps[..comps.len() - 1].join("/"), &landing)?;
-    let entry = parent.join(&comps[comps.len() - 1]);
-    if !entry.exists() {
-        return Err(User(format!("{} is not in this tree", comps.join("/"))));
-    }
-    if cas_kind(path(&entry)).map_err(Infra)? != "commit" {
+/// The commit bound at `at`, or the model's mistake when it is not one.
+fn commit_arg(at: &str, what: &str) -> Result<Oid, Failure> {
+    if cas_kind(at).map_err(Infra)? != "commit" {
         return Err(User(format!(
-            "{} is not a source tree (a code reference); history is a source tree's",
-            comps.join("/")
+            "{what} is not a source tree (a code reference); history is a source tree's"
         )));
     }
-    let hash = cas_hash(path(&entry)).map_err(Infra)?;
+    let hash = cas_hash(at).map_err(Infra)?;
     Oid::parse(&hash, "the source tree's commit").map_err(Infra)
 }
 
 /// A revision as git history takes it: `HEAD`/`wc`/`@` or a commit hash, then any
 /// `~N`/`^` ancestry.
 fn revision(store: &GitStore, head: &Oid, spec: &str) -> Result<Oid, Failure> {
-    // A path names another source tree in the session (`sources/foo/99-dirty`):
-    // its own commit, which may sit on a different line of history than `head`.
+    // This tool sees only its root, so another source tree is named by the
+    // harness-resolved `against` parameter, never by a path here.
     if spec.contains('/') {
-        let commit = commit_at(spec)?;
-        store.ensure_local(&commit).map_err(Infra)?;
-        return Ok(commit);
+        return Err(User(format!(
+            "{spec:?} looks like a path: pass a commit hash or HEAD with ~N or ^ here, \
+             and name another source tree to compare with as `against`"
+        )));
     }
     let split = spec.find(['~', '^']).unwrap_or(spec.len());
     let (base, suffix) = spec.split_at(split);
@@ -190,7 +156,13 @@ fn history(op: &str) -> Result<String, Failure> {
         "show" => (at("rev", "HEAD")?, HistoryQuery::Show),
         "diff" => {
             let to = at("to", "HEAD")?;
+            let against = arg("against");
             let from = match input("from")? {
+                _ if fs::symlink_metadata(&against).is_ok() => {
+                    let commit = commit_arg(&against, "`against`")?;
+                    store.ensure_local(&commit).map_err(Infra)?;
+                    commit
+                }
                 Some(spec) => revision(&store, &head, &spec)?,
                 None => match store
                     .read_commit(&to)
@@ -209,15 +181,4 @@ fn history(op: &str) -> Result<String, Failure> {
     store
         .history(&target, query, scope.as_deref())
         .map_err(User)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn paths_split_like_the_file_tools_split_them() {
-        assert_eq!(split_path("/feature//01-change/"), ["feature", "01-change"]);
-        assert!(split_path(" . ").is_empty());
-    }
 }

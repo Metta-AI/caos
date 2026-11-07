@@ -34,17 +34,23 @@ fn run() -> Result<(), String> {
     // It used to be an ENVELOPE — `in` holding `{tree, cmd, paths}` — built by
     // the step's own bash arm, back when the step registered this tool and bound
     // its input itself. Nothing builds that now.
-    let tree = arg("in");
-    if !Path::new(&tree).exists() {
-        return Err(format!(
-            "no input tree at {tree}: bash-tool runs over the tree bound as `in`"
-        ));
-    }
+    //
+    // Now it is `root` (design/tool-contract.md): the directory or source tree
+    // the call named, which a source tree's commit resolves to the code tree
+    // of. Absent is an empty directory, which the command can fill.
     let base = ARGS.to_string();
+    let root = arg("root");
     let cmd = read_blob(&format!("{base}/cmd"))?;
     let paths = read_paths(&format!("{base}/paths"))?;
     let work = scratch("work")?;
-    worker_common::files::materialize(&tree, &work, &paths)?;
+    if fs::symlink_metadata(&root).is_ok() {
+        let tree = "/cas/bash-root";
+        caos(["resolve", &worker_common::cas_hash(&root)?, "", tree])?;
+        if worker_common::cas_kind(tree)? != "tree" {
+            return refuse("the root is a file; bash-tool runs over a directory");
+        }
+        worker_common::files::materialize(tree, &work, &paths)?;
+    }
     let cwd = if Path::new(&format!("{base}/cwd")).exists() {
         read_blob(&format!("{base}/cwd"))?
     } else {
@@ -83,8 +89,10 @@ fn run() -> Result<(), String> {
     // Assemble the result value.
     let res = scratch("result")?;
     fs::write(res.join("exit"), format!("{exit}\n")).map_err(|e| format!("writing exit: {e}"))?;
-    fs::write(res.join("stdout"), tail(&out.stdout)).map_err(|e| format!("writing stdout: {e}"))?;
-    fs::write(res.join("stderr"), tail(&out.stderr)).map_err(|e| format!("writing stderr: {e}"))?;
+    fs::write(res.join("command-stdout"), tail(&out.stdout))
+        .map_err(|e| format!("writing command-stdout: {e}"))?;
+    fs::write(res.join("command-stderr"), tail(&out.stderr))
+        .map_err(|e| format!("writing command-stderr: {e}"))?;
     if !denied.is_empty() {
         let listing: Vec<&str> = denied.iter().map(String::as_str).collect();
         fs::write(res.join("denied"), listing.join("\n") + "\n")
@@ -96,19 +104,26 @@ fn run() -> Result<(), String> {
     // while this is presentation — and presentation duplicated across callers
     // is how one tool ends up reading two ways depending on who ran it.
     // llm-step used to re-render exactly this from `exit`/`stdout`/`stderr`.
-    fs::write(res.join("out"), report(exit, &out.stdout, &out.stderr, &denied))
-        .map_err(|e| format!("writing out: {e}"))?;
-    // `failed` PRESENT means the call failed, which for a shell is a non-zero
-    // exit. A marker entry rather than a banner inside `out`, because `out`
-    // here is arbitrary command output and says FAILED in passing all the time
-    // (SPEC, "CaosTools" — Writers).
-    if exit != 0 {
-        fs::write(res.join("failed"), format!("exit {exit}\n"))
-            .map_err(|e| format!("writing failed: {e}"))?;
-    }
-    // `prop`: the proposed tree. The harness mints the commit — this tool has
-    // no reason to know what a commit is.
-    link("/cas/newtree", res.join("prop"))?;
+    fs::write(res.join("stdout"), report(exit, &out.stdout, &out.stderr, &denied))
+        .map_err(|e| format!("writing stdout: {e}"))?;
+    // NO `failed` FOR A NON-ZERO EXIT. Under the root contract `failed` means
+    // nothing is applied, and what a command wrote is saved even when it then
+    // exits non-zero (a build's output, a half-finished edit to look at). The
+    // exit code leads `stdout`, which is how the model reads it.
+    //
+    // `root`: the new tree. The harness commits it for a source tree — this
+    // tool has no reason to know what a commit is.
+    link("/cas/newtree", res.join("root"))?;
+    caos(["put", path(&res), "/cas/out"])
+}
+
+/// A call the model got wrong: `{stdout, failed}`, and nothing to apply.
+fn refuse(message: &str) -> Result<(), String> {
+    let res = scratch("result")?;
+    fs::write(res.join("stdout"), format!("bash-tool: {message}\n"))
+        .map_err(|e| format!("writing stdout: {e}"))?;
+    fs::write(res.join("failed"), "bash-tool refused\n")
+        .map_err(|e| format!("writing failed: {e}"))?;
     caos(["put", path(&res), "/cas/out"])
 }
 

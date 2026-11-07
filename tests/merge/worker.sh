@@ -62,10 +62,10 @@ mint() { # <cas-name> <tree-oid> <message> [parent...]
   caos put-commit /tmp/commit "/cas/$dst" || fail "minting $dst"
 }
 
-# The result is a WRITER result -- `{prop, out}` (SPEC, "CaosTools") -- so the
-# merged commit is `prop` and the text for the model is `out`. It used to be the
-# bare commit, with llm-step composing the conflict report from the merged
-# tree; that made the tool's answer depend on who ran it.
+# The result is a WRITER result under the root contract -- `{stdout, root}`
+# (design/tool-contract.md) -- so the merged commit is `root`, the new object
+# for the source tree the merge was run on, and the text for the model is
+# `stdout`. `ours` is that source tree, bound as `root`.
 #
 # Everything the old test asked git is a line in the commit's raw bytes, or in
 # the tree they name.
@@ -73,19 +73,19 @@ merge_run() { # <ours-cas-path> <theirs-cas-path> [merge-base-cas-path] -> a req
   local base=()
   if [ -n "${3:-}" ]; then base=(--merge-base:@="$3"); fi
   caos prepare-request --base:hash="$(caos hash /cas/args/merge)" \
-    --wc:@="$1" --theirs:@="$2" "${base[@]}"
+    --root:@="$1" --theirs:@="$2" "${base[@]}"
 }
 result_commit() {
   caos get /cas/args/result >/dev/null
-  caos get /cas/args/result/prop >/dev/null
-  cat /cas/args/result/prop
+  caos get /cas/args/result/root >/dev/null
+  cat /cas/args/result/root
 }
 result_out() {
   caos get /cas/args/result >/dev/null
-  caos get /cas/args/result/out >/dev/null
-  cat /cas/args/result/out
+  caos get /cas/args/result/stdout >/dev/null
+  cat /cas/args/result/stdout
 }
-prop_hash() { caos get /cas/args/result >/dev/null; caos hash /cas/args/result/prop; }
+prop_hash() { caos get /cas/args/result >/dev/null; caos hash /cas/args/result/root; }
 commit_field() { printf '%s\n' "$1" | grep -m1 "^$2 " | cut -d' ' -f2- ; }
 # The merged tree, materialized: `caos get-hash` fetches by oid, `-r` walks it.
 merged_tree() { # <raw commit> -> a path

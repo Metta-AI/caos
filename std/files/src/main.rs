@@ -7,20 +7,19 @@
 //! path, a `help` and a place in `tool_help`/`run_tool` like any other, and
 //! `llm-step` is no longer the only way to reach them.
 //!
-//! THE INPUT IS `in`, the tree the tool runs over (`@in`: a caller can redirect
-//! it, and it defaults to the tree the tool's own path selects). Paths are
-//! relative to it and traverse code references, so `feature/dirty/README.md`
-//! reaches into a source tree. A reader's answer is a BLOB. A writer's is the
-//! tree a writer returns (SPEC, "Writers"): `prop`, the new tree for the harness
-//! to apply, `out`, what the model reads, and `failed` when the call failed.
+//! THE INPUT IS `root` (design/tool-contract.md, "`root`"): the object at the
+//! path the call named, bound as `/cas/args/root`, and absent when nothing is
+//! there. `read`, `write`, `edit` and `remove` work on that object itself;
+//! `ls`, `copy` and `move` on a directory or source tree, with `from` and `to`
+//! relative to it. Every answer is a tree: `stdout`, what the model reads, and
+//! `failed` on a mistake; a writer's adds `root`, the new object for the root
+//! path, or `deleted`. The harness puts it back and makes the commits above it.
 //!
-//! A call the model got wrong is a VALUE, never a failed worker: a reader says so
-//! in a `report` that opens `FAILED`, a writer in a `failed` marker over an
-//! unchanged `prop`. Only a broken installation (a transport error, a missing
-//! input) fails the job.
+//! A call the model got wrong is a VALUE, never a failed worker: `failed` and
+//! the reason in `stdout`. Only a broken installation (a transport error)
+//! fails the job.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -50,20 +49,18 @@ use Fail::{Infra, User};
 
 fn run() -> Result<(), String> {
     let op = read_arg("op")?;
-    let ws = arg("in");
-    if !Path::new(&ws).exists() {
-        return Err(format!(
-            "no input tree at {ws}: {op} runs over the tree bound as `in`"
-        ));
-    }
+    let bound = arg("root");
+    // Absent when nothing is at the root path: what `write` creates.
+    let root = fs::symlink_metadata(&bound).is_ok().then_some(bound);
+    let root = root.as_deref();
     match op.as_str() {
-        "read" => reader(read(&ws)),
-        "ls" => reader(ls(&ws)),
-        "write" => writer(&ws, "write", write(&ws)),
-        "edit" => writer(&ws, "edit", edit(&ws)),
-        "copy" => writer(&ws, "copy", copy(&ws)),
-        "move" => writer(&ws, "move", move_entry(&ws)),
-        "remove" => writer(&ws, "remove", remove(&ws)),
+        "read" => reader("read", read(root)),
+        "ls" => reader("ls", ls(root)),
+        "write" => writer("write", write(root)),
+        "edit" => writer("edit", edit(root)),
+        "copy" => writer("copy", copy(root)),
+        "move" => writer("move", move_entry(root)),
+        "remove" => writer("remove", remove(root)),
         other => Err(format!("unknown file tool {other:?}")),
     }
 }
@@ -83,46 +80,54 @@ fn put(dir: &Path) -> Result<(), String> {
     caos(["put", path(dir), "/cas/out"])
 }
 
-/// A reader's answer: the text itself, or a `report` that says `FAILED` and why.
-fn reader(outcome: Result<String, Fail>) -> Result<(), String> {
-    match outcome {
-        Ok(text) => {
-            let dir = scratch("files-out")?;
-            let file = dir.join("answer");
-            fs::write(&file, text).map_err(|e| format!("writing the answer: {e}"))?;
-            caos(["put", path(&file), "/cas/out"])
-        }
-        Err(User(message)) => {
-            let dir = scratch("files-out")?;
-            fs::write(dir.join("report"), format!("FAILED: {message}\n"))
-                .map_err(|e| format!("writing the report: {e}"))?;
-            put(&dir)
-        }
-        Err(Infra(error)) => Err(error),
-    }
+/// A failed call's answer: the reason as `stdout`, and the `failed` marker.
+fn failed(dir: &Path, op: &str, message: &str) -> Result<(), String> {
+    fs::write(dir.join("stdout"), format!("{op}: {message}\n"))
+        .map_err(|e| format!("writing stdout: {e}"))?;
+    fs::write(dir.join("failed"), format!("{op} failed\n"))
+        .map_err(|e| format!("writing failed: {e}"))
 }
 
-/// A writer's answer. On a mistake `prop` is the input, unchanged, so the
-/// harness has nothing to apply and the model reads why.
-fn writer(
-    ws: &str,
-    op: &str,
-    outcome: Result<(String, String, String), Fail>,
-) -> Result<(), String> {
+/// A reader's answer: `{stdout}`, or `{stdout, failed}` saying why.
+fn reader(op: &str, outcome: Result<String, Fail>) -> Result<(), String> {
     let dir = scratch("files-out")?;
-    let (prop, out, message, failed) = match outcome {
-        Ok((prop, out, message)) => (prop, out, Some(message), false),
-        Err(User(message)) => (ws.to_string(), message, None, true),
+    match outcome {
+        Ok(text) => {
+            fs::write(dir.join("stdout"), text).map_err(|e| format!("writing stdout: {e}"))?
+        }
+        Err(User(message)) => failed(&dir, op, &message)?,
         Err(Infra(error)) => return Err(error),
-    };
-    link(&prop, dir.join("prop"))?;
-    fs::write(dir.join("out"), out).map_err(|e| format!("writing out: {e}"))?;
-    if let Some(message) = message {
-        fs::write(dir.join("message"), message).map_err(|e| format!("writing message: {e}"))?;
     }
-    if failed {
-        fs::write(dir.join("failed"), format!("{op} failed\n"))
-            .map_err(|e| format!("writing failed: {e}"))?;
+    put(&dir)
+}
+
+/// What a writer puts at its root path.
+enum New {
+    /// A file with these contents.
+    Content(Vec<u8>),
+    /// An object already in CAS: the new directory.
+    Object(String),
+    /// Nothing: the root is removed.
+    Deleted,
+}
+
+/// A writer's answer: `{stdout, root | deleted}`, or `{stdout, failed}` with
+/// nothing to apply.
+fn writer(op: &str, outcome: Result<(New, String), Fail>) -> Result<(), String> {
+    let dir = scratch("files-out")?;
+    match outcome {
+        Ok((new, out)) => {
+            fs::write(dir.join("stdout"), out).map_err(|e| format!("writing stdout: {e}"))?;
+            match new {
+                New::Content(bytes) => fs::write(dir.join("root"), bytes)
+                    .map_err(|e| format!("writing root: {e}"))?,
+                New::Object(object) => link(&object, dir.join("root"))?,
+                New::Deleted => fs::write(dir.join("deleted"), format!("{op}\n"))
+                    .map_err(|e| format!("writing deleted: {e}"))?,
+            }
+        }
+        Err(User(message)) => failed(&dir, op, &message)?,
+        Err(Infra(error)) => return Err(error),
     }
     put(&dir)
 }
@@ -167,19 +172,6 @@ fn reject_parent(comps: &[String]) -> Result<(), Fail> {
         return Err(User("`..` is not allowed in tree paths".to_string()));
     }
     Ok(())
-}
-
-/// An OPTIONAL path: anything that names no component (absent, blank, `/`, `.`)
-/// is the ROOT, not a parse failure.
-fn components_opt(name: &str) -> Result<Vec<String>, Fail> {
-    match input(name)? {
-        None => Ok(Vec::new()),
-        Some(raw) => {
-            let comps = split_path(&raw);
-            reject_parent(&comps)?;
-            Ok(comps)
-        }
-    }
 }
 
 /// A REQUIRED path.
@@ -231,10 +223,9 @@ fn resolve(ws: &str, comps: &[String]) -> Result<PathBuf, Fail> {
 fn resolve_failure(relative: &str, stderr: &str) -> String {
     if stderr.contains("no such path") {
         format!(
-            "{relative} is not in this tree. Check the path first: `ls` its parent, and note \
-             an import lives where `import_source` put it (e.g. imports/<repo>/<revision>). \
+            "{relative} is not in this tree. Check the path first: `ls` its parent. \
              A mount such as caos-std/ exists only in the EVALUATED tree: evaluate its path \
-             and pass the result as `in`."
+             and pass `<hash>/<path>` as `root`."
         )
     } else {
         let reason = stderr.strip_prefix("caos: ").unwrap_or(stderr);
@@ -244,15 +235,37 @@ fn resolve_failure(relative: &str, stderr: &str) -> String {
 
 // ---- the readers -------------------------------------------------------------
 
-fn read(ws: &str) -> Result<String, Fail> {
-    let comps = components("file-path")?;
-    let p = resolve(ws, &comps)?;
-    if p.is_dir() {
-        return Err(User(format!("{} is a directory; use ls", comps.join("/"))));
+/// The root, or the model's mistake when nothing is there.
+fn present(root: Option<&str>) -> Result<&str, Fail> {
+    root.ok_or_else(|| {
+        User(
+            "nothing is at the root path. Check it with ls on the directory above it"
+                .to_string(),
+        )
+    })
+}
+
+/// The root as a directory: a tree as it is, a source tree as its code tree.
+fn directory(root: Option<&str>, otherwise: &str) -> Result<PathBuf, Fail> {
+    let dir = resolve(present(root)?, &[])?;
+    if !dir.is_dir() {
+        return Err(User(format!("the root is a file; {otherwise}")));
     }
-    caos(["get", path(&p)]).map_err(Infra)?;
-    let bytes = fs::read(&p).map_err(|e| Infra(format!("reading {}: {e}", p.display())))?;
-    bounded(&bytes)
+    Ok(dir)
+}
+
+/// The root as a file's bytes.
+fn file(root: Option<&str>, otherwise: &str) -> Result<Vec<u8>, Fail> {
+    let root = present(root)?;
+    if cas_kind(root).map_err(Infra)? != "blob" {
+        return Err(User(format!("the root is a directory; {otherwise}")));
+    }
+    caos(["get", root]).map_err(Infra)?;
+    fs::read(root).map_err(|e| Infra(format!("reading the root: {e}")))
+}
+
+fn read(root: Option<&str>) -> Result<String, Fail> {
+    bounded(&file(root, "use ls, or name a file in it")?)
 }
 
 /// Apply `read`'s bounds to raw bytes: a line window when `offset`/`limit` is
@@ -288,12 +301,8 @@ fn bounded(bytes: &[u8]) -> Result<String, Fail> {
     Ok(text.into_owned())
 }
 
-fn ls(ws: &str) -> Result<String, Fail> {
-    let comps = components_opt("path")?;
-    let dir = resolve(ws, &comps)?;
-    if !dir.is_dir() {
-        return Err(User(format!("{} is not a directory", comps.join("/"))));
-    }
+fn ls(root: Option<&str>) -> Result<String, Fail> {
+    let dir = directory(root, "use read")?;
     let children = entries(path(&dir)).map_err(Infra)?;
     let mut lines = Vec::with_capacity(children.len());
     for child in &children {
@@ -319,27 +328,27 @@ fn ls(ws: &str) -> Result<String, Fail> {
 
 // ---- the writers -------------------------------------------------------------
 //
-// Each returns `(prop, out, message)`: the CAS path of the new tree, what the
-// model reads, and the commit message the harness uses when it mints.
+// Each returns what goes at the root path and what the model reads. The
+// harness writes the commit message (the tool and the root path) unless a tool
+// has something better to say.
 
-type Written = (String, String, String);
+type Written = (New, String);
 
-fn write(ws: &str) -> Result<Written, Fail> {
-    let comps = components("file-path")?;
-    reject_protocol(&comps)?;
+fn write(root: Option<&str>) -> Result<Written, Fail> {
     let content =
         input("content")?.ok_or_else(|| User("write needs a string `content`".to_string()))?;
-    let prop = rebuild(ws, &comps, content.as_bytes(), None)?;
-    Ok((
-        prop,
-        format!("wrote {} ({} bytes)", comps.join("/"), content.len()),
-        format!("write {}", comps.join("/")),
-    ))
+    if let Some(root) = root {
+        if cas_kind(root).map_err(Infra)? != "blob" {
+            return Err(User(
+                "the root is a directory; write replaces one file".to_string(),
+            ));
+        }
+    }
+    let out = format!("wrote {} bytes", content.len());
+    Ok((New::Content(content.into_bytes()), out))
 }
 
-fn edit(ws: &str) -> Result<Written, Fail> {
-    let comps = components("file-path")?;
-    reject_protocol(&comps)?;
+fn edit(root: Option<&str>) -> Result<Written, Fail> {
     let old = input("old-string")?
         .filter(|s| !s.is_empty())
         .ok_or_else(|| User("edit needs a non-empty `old-string`".to_string()))?;
@@ -347,21 +356,9 @@ fn edit(ws: &str) -> Result<Written, Fail> {
         input("new-string")?.ok_or_else(|| User("edit needs a string `new-string`".to_string()))?;
     let replace_all = flag("replace-all")?;
 
-    let p = resolve(ws, &comps)?;
-    if p.is_dir() {
-        return Err(User(format!("{} is a directory", comps.join("/"))));
-    }
-    caos(["get", path(&p)]).map_err(Infra)?;
-    let bytes = fs::read(&p).map_err(|e| Infra(format!("reading {}: {e}", p.display())))?;
-    let mode = fs::metadata(&p)
-        .map(|m| m.permissions().mode())
-        .map_err(|e| Infra(format!("stat {}: {e}", p.display())))?;
-    let text = String::from_utf8(bytes).map_err(|_| {
-        User(format!(
-            "{} is not valid UTF-8; edit only text files",
-            comps.join("/")
-        ))
-    })?;
+    let bytes = file(root, "edit changes one file")?;
+    let text = String::from_utf8(bytes)
+        .map_err(|_| User("the root is not valid UTF-8; edit only text files".to_string()))?;
 
     let count = text.matches(old.as_str()).count();
     let replaced =
@@ -379,32 +376,23 @@ fn edit(ws: &str) -> Result<Written, Fail> {
             (_, true) => text.replace(old.as_str(), &new),
             (_, false) => text.replacen(old.as_str(), &new, 1),
         };
-    let prop = rebuild(ws, &comps, replaced.as_bytes(), Some(mode))?;
     let n = if replace_all { count } else { 1 };
-    Ok((
-        prop,
-        format!(
-            "edited {} ({n} replacement{})",
-            comps.join("/"),
-            if n == 1 { "" } else { "s" }
-        ),
-        format!("edit {}", comps.join("/")),
-    ))
+    let out = format!("edited ({n} replacement{})", if n == 1 { "" } else { "s" });
+    Ok((New::Content(replaced.into_bytes()), out))
 }
 
-fn copy(ws: &str) -> Result<Written, Fail> {
+fn copy(root: Option<&str>) -> Result<Written, Fail> {
+    let dir = directory(root, "copy works inside the directory that holds both paths")?;
     let from = components("from")?;
     let to = components("to")?;
     reject_protocol(&to)?;
-    let prop = copy_entry(ws, &from, &to)?;
-    Ok((
-        prop,
-        format!("copied {} to {}", from.join("/"), to.join("/")),
-        format!("copy {} to {}", from.join("/"), to.join("/")),
-    ))
+    let new = copy_entry(path(&dir), &from, &to)?;
+    let out = format!("copied {} to {}", from.join("/"), to.join("/"));
+    Ok((New::Object(new), out))
 }
 
-fn move_entry(ws: &str) -> Result<Written, Fail> {
+fn move_entry(root: Option<&str>) -> Result<Written, Fail> {
+    let dir = directory(root, "move works inside the directory that holds both paths")?;
     let from = components("from")?;
     let to = components("to")?;
     reject_protocol(&from)?;
@@ -424,46 +412,15 @@ fn move_entry(ws: &str) -> Result<Written, Fail> {
             to.join("/")
         )));
     }
-    let copied = copy_entry(ws, &from, &to)?;
-    let prop = remove_entry(&copied, &from)?;
-    Ok((
-        prop,
-        format!("moved {} to {}", from.join("/"), to.join("/")),
-        format!("move {} to {}", from.join("/"), to.join("/")),
-    ))
+    let copied = copy_entry(path(&dir), &from, &to)?;
+    let new = remove_entry(&copied, &from)?;
+    let out = format!("moved {} to {}", from.join("/"), to.join("/"));
+    Ok((New::Object(new), out))
 }
 
-fn remove(ws: &str) -> Result<Written, Fail> {
-    let comps = components("file-path")?;
-    reject_protocol(&comps)?;
-    let prop = remove_entry(ws, &comps)?;
-    Ok((
-        prop,
-        format!("removed {}", comps.join("/")),
-        format!("remove {}", comps.join("/")),
-    ))
-}
-
-/// Rebuild the tree with `comps` holding `content` (mode `mode`, default 0644):
-/// at each level every untouched entry is a link (staging resolves links by
-/// recorded hash, so nothing else is fetched) and the target component is
-/// descended into or written. A source tree boundary on the way is restored by
-/// `caos put`, which is how editing inside one makes a child commit.
-fn rebuild(ws: &str, comps: &[String], content: &[u8], mode: Option<u32>) -> Result<String, Fail> {
-    let work = scratch(&fresh_name("files")).map_err(Infra)?;
-    let relative = comps.join("/");
-    worker_common::files::materialize(ws, &work, std::slice::from_ref(&relative)).map_err(Infra)?;
-    refuse_symlinks(&work, &comps[..comps.len() - 1], "write/edit")?;
-    let target = work.join(&relative);
-    fs::create_dir_all(target.parent().unwrap()).map_err(|e| Infra(e.to_string()))?;
-    fs::write(&target, content).map_err(|e| Infra(e.to_string()))?;
-    if let Some(mode) = mode {
-        fs::set_permissions(&target, fs::Permissions::from_mode(mode))
-            .map_err(|e| Infra(e.to_string()))?;
-    }
-    let out = fresh("files-out");
-    caos(["put", path(&work), &out]).map_err(Infra)?;
-    Ok(out)
+fn remove(root: Option<&str>) -> Result<Written, Fail> {
+    present(root)?;
+    Ok((New::Deleted, "removed".to_string()))
 }
 
 fn refuse_symlinks(work: &Path, ancestors: &[String], what: &str) -> Result<(), Fail> {
@@ -541,6 +498,20 @@ fn remove_entry(ws: &str, comps: &[String]) -> Result<String, Fail> {
         fs::remove_file(&target)
     };
     removal.map_err(|e| Infra(format!("removing {}: {e}", target.display())))?;
+    // A directory the removal left empty goes too: `caos put` would keep it
+    // as an empty tree, which no checkout of it can show.
+    let mut parent = target.parent().map(Path::to_path_buf);
+    while let Some(dir) = parent.filter(|dir| *dir != work) {
+        let empty = fs::read_dir(&dir)
+            .map_err(|e| Infra(format!("reading {}: {e}", dir.display())))?
+            .next()
+            .is_none();
+        if !empty {
+            break;
+        }
+        fs::remove_dir(&dir).map_err(|e| Infra(format!("removing {}: {e}", dir.display())))?;
+        parent = dir.parent().map(Path::to_path_buf);
+    }
     let out = fresh("files-out");
     caos(["put", path(&work), &out]).map_err(Infra)?;
     Ok(out)
@@ -577,6 +548,7 @@ mod tests {
         );
         assert!(message.starts_with("caos-std/README.md is not in this tree"));
         assert!(message.contains("EVALUATED tree"), "{message}");
+        assert!(message.contains("`root`"), "{message}");
         let other = resolve_failure("a", "caos: \"a\" traverses a non-directory");
         assert_eq!(other, "resolving a: \"a\" traverses a non-directory");
     }

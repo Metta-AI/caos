@@ -1,22 +1,23 @@
 // The `move-sed` tool's worker. Its docs live in the sibling `.caos-expr`
 // here-string, not in this header (SPEC, "CaosTools").
 //
-// A writer run on the session (SPEC, "Writers"). Args, under /cas/args:
+// A writer under the root contract (design/tool-contract.md). Args, under
+// /cas/args:
 //
-//	in           the session tree it was run on
-//	dir          the session directory whose entries to rename
+//	root         the directory whose entries to rename (a source tree's
+//	             commit is renamed inside its code tree)
 //	pattern      a Go regular expression, matched against each entry's name
 //	replacement  the new name, with $1 / ${name} for the pattern's groups
 //	dry-run      optional: "true" lists the renames and changes nothing
 //
-// The result is {prop, out, message, failed?}. `prop` is the session with
-// `dir` rebuilt: every matching entry under its new name, everything else
-// linked as it was, so a layer and its sidecar files move in ONE proposal
-// (design/publish-stack.md, "move-sed"). Nothing in the session is
-// checked out: the rebuilt folders are links to the CAS entries they keep.
+// The result is {stdout, root, commit-message} or {stdout, failed}. `root` is
+// the directory rebuilt: every matching entry under its new name, everything
+// else linked as it was, so a layer and its sidecar files move in ONE change
+// (design/publish-stack.md, "move-sed"). Nothing is checked out: the rebuilt
+// folder links to the CAS entries it keeps. The harness puts it back.
 //
-// A refusal proposes `in` unchanged and marks `failed`: the agent reads it
-// and corrects the call. Only a broken environment is a job error.
+// A refusal is a value the agent reads and corrects. Only a broken
+// environment is a job error.
 package main
 
 import (
@@ -30,7 +31,7 @@ import (
 )
 
 const (
-	in     = "/cas/args/in"
+	root   = "/cas/args/root"
 	result = "/tmp/move-sed-result"
 )
 
@@ -67,51 +68,32 @@ func entries(dir string) []string {
 	return names
 }
 
-// splitDir checks the directory's session path and splits it. The empty
-// string and "." are the root.
-func splitDir(raw string) []string {
-	path := strings.Trim(strings.TrimSpace(raw), "/")
-	if path == "" || path == "." {
-		return nil
+// directory is the root as a folder: a tree as it is, a source tree's commit
+// as its code tree.
+func directory() string {
+	if !w.Exists(root) {
+		refuse("nothing is at the root path: root is the directory whose entries to rename, such as sources/repo")
 	}
-	parts := strings.Split(path, "/")
-	for _, part := range parts {
-		if part == "" || part == "." || part == ".." {
-			refuse("dir must be a session-relative path without . or .., not %q", raw)
-		}
+	switch k := w.Caos("kind", root); k {
+	case "tree":
+		w.Get(root)
+		return root
+	case "commit":
+		const code = "/cas/move-sed-code"
+		w.Caos("resolve", w.Caos("hash", root), "", code)
+		w.Get(code)
+		return code
+	default:
+		refuse("the root is a %s, not a directory", k)
+		return ""
 	}
-	return parts
-}
-
-// walk fetches the directory level by level and returns its CAS path. A path
-// through a file is a mistake, and one through a gitlink is code: this tool
-// rebuilds session folders, never commits.
-func walk(parts []string) string {
-	dir := in
-	for i, part := range parts {
-		next := filepath.Join(dir, part)
-		sofar := strings.Join(parts[:i+1], "/")
-		if !w.Exists(next) {
-			refuse("dir: no such path: %s", sofar)
-		}
-		switch k := w.Caos("kind", next); k {
-		case "tree":
-		case "commit":
-			refuse("dir: %s is a source tree. This tool renames entries of the session tree; for files inside code use move.", sofar)
-		default:
-			refuse("dir: %s is a %s, not a directory", sofar, k)
-		}
-		w.Get(next)
-		dir = next
-	}
-	return dir
 }
 
 type rename struct{ from, to string }
 
 // plan computes the renames and refuses, before anything changes, everything
 // that would make the result ambiguous or lossy.
-func plan(names []string, atRoot bool, pattern, replacement string) []rename {
+func plan(names []string, pattern, replacement string) []rename {
 	if m := regexp.MustCompile(`\\[0-9]`).FindString(replacement); m != "" {
 		refuse("replacement %q uses sed's %s. Go's syntax is $%s (or ${%s}); %s would be written into the name literally.",
 			replacement, m, m[1:], m[1:], m)
@@ -137,7 +119,9 @@ func plan(names []string, atRoot bool, pattern, replacement string) []rename {
 		if to == name {
 			continue
 		}
-		if atRoot && (name == ".caos" || to == ".caos") {
+		// The worker cannot tell the session's top from any other folder, and
+		// a .caos anywhere is metadata: never rename or shadow one.
+		if name == ".caos" || to == ".caos" {
 			refuse(".caos is protocol metadata and cannot be renamed or shadowed; anchor the pattern so it does not match it")
 		}
 		if to == "" || to == "." || to == ".." || strings.Contains(to, "/") {
@@ -164,47 +148,24 @@ func plan(names []string, atRoot bool, pattern, replacement string) []rename {
 	return renames
 }
 
-// rebuild stages `src` (a CAS folder, or "" for one that does not exist yet)
-// at `dst`, with the path `parts` below it replaced by `node`. Each folder on
-// the way is rebuilt from links to its other entries; nothing else is listed.
-func rebuild(src, dst string, parts []string, node string) {
-	w.Must(os.MkdirAll(dst, 0o755))
-	head := parts[0]
-	if src != "" {
-		for _, name := range entries(src) {
-			if name != head {
-				w.Must(os.Symlink(filepath.Join(src, name), filepath.Join(dst, name)))
-			}
+// finish writes the result and stores it at /cas/out: the new directory as
+// `root`, or `failed` and nothing to apply.
+func finish(newRoot, out, message string, failed bool) {
+	w.Must(os.MkdirAll(result, 0o755))
+	w.Must(os.WriteFile(filepath.Join(result, "stdout"), []byte(out), 0o644))
+	if failed {
+		w.Must(os.WriteFile(filepath.Join(result, "failed"), []byte("move-sed refused\n"), 0o644))
+	} else {
+		w.Must(os.Symlink(newRoot, filepath.Join(result, "root")))
+		if message != "" {
+			w.Must(os.WriteFile(filepath.Join(result, "commit-message"), []byte(message), 0o644))
 		}
 	}
-	if len(parts) == 1 {
-		w.Must(os.Symlink(node, filepath.Join(dst, head)))
-		return
-	}
-	child := ""
-	if src != "" && w.Exists(filepath.Join(src, head)) {
-		child = filepath.Join(src, head)
-	}
-	rebuild(child, filepath.Join(dst, head), parts[1:], node)
-}
-
-// finish writes the writer result and stores it at /cas/out.
-func finish(prop, out, message string, failed bool) {
-	w.Must(os.MkdirAll(result, 0o755))
-	w.Must(os.WriteFile(filepath.Join(result, "out"), []byte(out), 0o644))
-	if message != "" {
-		w.Must(os.WriteFile(filepath.Join(result, "message"), []byte(message), 0o644))
-	}
-	if failed {
-		w.Must(os.WriteFile(filepath.Join(result, "failed"), []byte(out), 0o644))
-	}
-	w.Must(os.Symlink(prop, filepath.Join(result, "prop")))
 	w.Put(result, "/cas/out")
 }
 
 func main() {
 	w.Main(func() {
-		w.Get(in)
 		defer func() {
 			r := recover()
 			if r == nil {
@@ -214,35 +175,30 @@ func main() {
 			if !ok {
 				panic(r)
 			}
-			finish(in, "FAILED: "+no.msg+"\n", "", true)
+			finish("", "move-sed: "+no.msg+"\n", "", true)
 		}()
 
-		rawDir, _ := arg("dir")
-		parts := splitDir(rawDir)
+		dir := directory()
 		pattern := required("pattern")
 		replacement, _ := arg("replacement")
 		dry, _ := arg("dry-run")
 		dryRun := strings.TrimSpace(dry) == "true"
 
-		dir := walk(parts)
 		names := entries(dir)
-		renames := plan(names, len(parts) == 0, pattern, replacement)
-		label := strings.Join(parts, "/")
-		if label == "" {
-			label = "the session root"
-		}
+		renames := plan(names, pattern, replacement)
 
 		var report strings.Builder
 		if dryRun {
-			fmt.Fprintf(&report, "dry run: %d rename(s) in %s, nothing changed:\n", len(renames), label)
+			fmt.Fprintf(&report, "dry run: %d rename(s), nothing changed:\n", len(renames))
 		} else {
-			fmt.Fprintf(&report, "renamed %d entr%s in %s:\n", len(renames), map[bool]string{true: "y", false: "ies"}[len(renames) == 1], label)
+			fmt.Fprintf(&report, "renamed %d entr%s:\n", len(renames), map[bool]string{true: "y", false: "ies"}[len(renames) == 1])
 		}
 		for _, r := range renames {
 			fmt.Fprintf(&report, "  %s -> %s\n", r.from, r.to)
 		}
 		if dryRun {
-			finish(in, report.String(), "", false)
+			// Writing back what was there changes nothing.
+			finish(dir, report.String(), "", false)
 			return
 		}
 
@@ -261,12 +217,6 @@ func main() {
 			w.Must(os.Symlink(filepath.Join(dir, name), filepath.Join(staged, target)))
 		}
 		w.Put(staged, "/cas/renamed")
-		prop := "/cas/renamed"
-		if len(parts) > 0 {
-			rebuild(in, "/tmp/move-sed-prop", parts, "/cas/renamed")
-			w.Put("/tmp/move-sed-prop", "/cas/prop")
-			prop = "/cas/prop"
-		}
-		finish(prop, report.String(), fmt.Sprintf("move-sed: %s: %d rename(s)\n", label, len(renames)), false)
+		finish("/cas/renamed", report.String(), fmt.Sprintf("move-sed: %d rename(s)\n", len(renames)), false)
 	})
 }
