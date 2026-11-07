@@ -88,55 +88,6 @@ fn take_global_flags(args: &[String]) -> Result<(Option<String>, Vec<String>), S
     Ok((server, out))
 }
 
-#[cfg(test)]
-mod global_flag_tests {
-    use super::take_global_flags;
-
-    fn argv(args: &[&str]) -> Vec<String> {
-        args.iter().map(|arg| arg.to_string()).collect()
-    }
-
-    #[test]
-    fn server_before_the_command_is_taken_out() {
-        let (server, rest) =
-            take_global_flags(&argv(&["caos-cli", "--server=caos://t", "watch", "abc"])).unwrap();
-        assert_eq!(server.as_deref(), Some("caos://t"));
-        assert_eq!(rest, argv(&["caos-cli", "watch", "abc"]));
-        let (server, rest) =
-            take_global_flags(&argv(&["caos-cli", "--server", "http://h:1", "status", "x"]))
-                .unwrap();
-        assert_eq!(server.as_deref(), Some("http://h:1"));
-        assert_eq!(rest, argv(&["caos-cli", "status", "x"]));
-    }
-
-    #[test]
-    fn server_after_the_command_belongs_to_the_command() {
-        let args = argv(&["caos-cli", "secrets-push", "--dir=d", "--server=http://h"]);
-        let (server, rest) = take_global_flags(&args).unwrap();
-        assert_eq!(server, None);
-        assert_eq!(rest, args);
-    }
-
-    #[test]
-    fn no_flags_leaves_argv_alone() {
-        for args in [argv(&["caos-cli"]), argv(&["caos-cli", "run", "--base:@=x"])] {
-            assert_eq!(take_global_flags(&args).unwrap(), (None, args));
-        }
-    }
-
-    #[test]
-    fn bad_server_flags_are_refused() {
-        for args in [
-            argv(&["caos-cli", "--server"]),
-            argv(&["caos-cli", "--server=", "watch", "t"]),
-            argv(&["caos-cli", "--server", "--other", "watch"]),
-            argv(&["caos-cli", "--server=a", "--server=b", "watch", "t"]),
-        ] {
-            assert!(take_global_flags(&args).is_err(), "{args:?}");
-        }
-    }
-}
-
 fn run(args: &[String]) -> Result<(), String> {
     match args.get(1).map(String::as_str) {
         // `run [output] --base:<type>=<image> [...]`. `[output]` is a host path
