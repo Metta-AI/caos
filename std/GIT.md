@@ -92,10 +92,10 @@ the old name; `caos-std/move-sed` renames a layer and its sidecar in one call
 ```text
 import_source(source="https://github.com/<owner>/<repo>.git",
               revision="main", into="sources/<repo>/00-base")
-copy(from="sources/<repo>/00-base", to="sources/<repo>/99-dirty")
+copy(root="sources/<repo>", from="00-base", to="99-dirty")
 ... edit sources/<repo>/99-dirty ...
-move(from="sources/<repo>/99-dirty", to="sources/<repo>/01-<name>")
-write(file-path="sources/<repo>/01-<name>.pr.md",
+move(root="sources/<repo>", from="99-dirty", to="01-<name>")
+write(root="sources/<repo>/01-<name>.pr.md",
       content="<PR title>\n\n<PR body>\n")
 run_tool(path="caos-std/stack-publish", arguments={"stack": "sources/<repo>"})
 ```
@@ -237,10 +237,10 @@ merge it into the first layer, then each layer into the one after it:
 
 ```text
 import_source(source=..., revision="main", into="sources/repo/00-base-2")
-remove(file-path="sources/repo/00-base")
-remove(file-path="sources/repo/00-base.source.json")
-move(from="sources/repo/00-base-2", to="sources/repo/00-base")
-move(from="sources/repo/00-base-2.source.json", to="sources/repo/00-base.source.json")
+remove(root="sources/repo/00-base")
+remove(root="sources/repo/00-base.source.json")
+move(root="sources/repo", from="00-base-2", to="00-base")
+move(root="sources/repo", from="00-base-2.source.json", to="00-base.source.json")
 merge(source-tree="sources/repo/01-feature",
       theirs="<full hash of sources/repo/00-base>")
 merge(source-tree="sources/repo/02-tests",
@@ -561,10 +561,13 @@ reach usually means the grant is missing.
 
 - This file is `std/GIT.md`, upper case. `read` and `ls` cannot see `caos-std/`
   directly: `eval_path(path="caos-std")` gives a tree hash, then
-  `ls(root=<hash>)` and `read(file-path="GIT.md", root=<hash>)`. A lowercase
+  `ls(root=<hash>)` and `read(root="<hash>/GIT.md")`. A lowercase
   `git.md` is "no such path".
-- `edit` takes `file-path`, `old-string` and `new-string` (hyphens, not
-  underscores), and the old string must occur exactly once.
+- Every file tool takes `root`, the path it works on, relative to the session:
+  the file for `read`, `write`, `edit` and `remove`; the directory holding both
+  paths for `copy` and `move`, whose `from` and `to` are relative to it.
+- `edit` takes `old-string` and `new-string` (hyphens, not underscores), and
+  the old string must occur exactly once.
 - `theirs` for `merge` is a full commit hash or the path of a source tree in
   the session, never a branch name.
 - `copy` and `move` refuse an existing destination; `remove` first. `move`

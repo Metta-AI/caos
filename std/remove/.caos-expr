@@ -3,10 +3,9 @@
 # from the tree the build sees: editing the docs re-keys this tool's ArgTree and
 # nothing it builds from.
 HELP=<<END
-Remove a file or directory, and everything under it, from the session. Removing a source tree removes the whole tree from the session. Prefer this over rm via bash: it needs no `paths` declaration.
-@param file-path Path to remove, such as feature/01-change/old.txt.
+Remove a file, a directory with everything under it, or a whole source tree. `root` is what to remove, such as sources/repo/00-base-2. A directory left empty goes too. Prefer this over rm via bash.
 @writer
-@in
+@root
 END
 IMAGE=run --base:@=DEEP-DEPS/rustc --src:@=DEEP-DEPS/files
 curry --base=$IMAGE --op=remove --help=$HELP

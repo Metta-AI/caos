@@ -63,15 +63,17 @@ needs `paths`:
 |---|---|
 | read, list or search | `read`, `ls`, `grep` |
 | create or change a file | `write`, `edit` |
-| copy a file or directory (a source tree stays a source tree) | `copy` (`from`, `to`) |
-| move or rename | `move` (`from`, `to`) |
-| delete | `remove` (`file-path`) |
+| copy a file or directory (a source tree stays a source tree) | `copy` (`root`, `from`, `to`) |
+| move or rename | `move` (`root`, `from`, `to`) |
+| delete | `remove` (`root`) |
 | see history or changes | `log`, `show`, `diff` |
 
 `read`, `ls`, `write`, `edit`, `copy`, `move`, `remove`, `grep`, `log`, `show` and `diff`
-are entries under `std/`, reached as `caos-std/<name>` like any other tool. They take an
-`in` tree, which defaults to the session. `llm-step` still registers its own copies
-for the turns it drives itself; those are being retired in favor of these.
+are entries under `std/`, reached as `caos-std/<name>` like any other tool. The file
+tools take `root`, the path they work on (design/tool-contract.md); `grep`, `log`, `show`
+and `diff` still take an `in` tree, which defaults to the session, until they move to
+`root` too. `llm-step` still registers its own copies for the turns it drives itself;
+those are being retired in favor of these.
 
 `import-source`, `publish-source`, `agent-spawn`, `agent-wait`, `agent-harvest` and `run-async`
 are entries for OPERATIONS OF THE STEP (`@op` in their help): they write the session's own

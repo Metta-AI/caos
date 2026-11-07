@@ -15,7 +15,9 @@ use session_protocol::v3::Oid;
 /// What the model is told the `root` parameter is.
 pub const ROOT_DOC: &str = "The path this tool works on, relative to the session \
                             root: a file, a directory, or a source tree such as \
-                            sources/<repo>/<layer>. `.` is the whole session. \
+                            sources/<repo>/<layer>. `.` is the whole session. A tool \
+                            that only reads also takes `<hash>[/<path>]`, inside an \
+                            object that is not in the session (an eval_path result). \
                             Required: nothing is implied by where the tool sits.";
 
 /// A `root` argument as path components, relative to the session root. `.`
@@ -33,6 +35,43 @@ pub fn components(root: &str) -> Result<Vec<String>, String> {
     Ok(trimmed.split('/').map(str::to_string).collect())
 }
 
+/// Where a root is: a path in the session, or a path inside an object that is
+/// not in it, named by its hash (`<hash>[/<path>]`, as `eval_path` gives one).
+/// Only a reader may have the second: a writer's result goes back into the
+/// session.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Located {
+    Session(Vec<String>),
+    Object(Oid, Vec<String>),
+}
+
+pub fn locate(root: &str) -> Result<Located, String> {
+    let trimmed = root.trim().trim_matches('/');
+    let (first, rest) = trimmed.split_once('/').unwrap_or((trimmed, ""));
+    if first.len() == 40 && first.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let oid = Oid::parse(&first.to_ascii_lowercase(), "root object")?;
+        return Ok(Located::Object(oid, components(rest)?));
+    }
+    Ok(Located::Session(components(trimmed)?))
+}
+
+/// The object at `components` inside the object `oid`, whatever kind it is.
+pub fn resolve_object(
+    store: &dyn ObjectStore,
+    oid: &Oid,
+    components: &[String],
+) -> Result<Option<(Mode, Oid)>, String> {
+    let mode = if store.read_commit(oid).is_ok() {
+        Mode::Commit
+    } else if store.read_tree(oid).is_ok() {
+        Mode::Tree
+    } else {
+        store.read_blob(oid).map_err(String::from)?;
+        Mode::Blob
+    };
+    resolve_from(store, (mode, oid.clone()), components)
+}
+
 /// The object at `components` under `tree`, descending into a gitlink's commit
 /// as into a directory. `None` when nothing is there; an error when something
 /// on the way is a file.
@@ -41,7 +80,15 @@ pub fn resolve(
     tree: &Oid,
     components: &[String],
 ) -> Result<Option<(Mode, Oid)>, String> {
-    let mut at = (Mode::Tree, tree.clone());
+    resolve_from(store, (Mode::Tree, tree.clone()), components)
+}
+
+fn resolve_from(
+    store: &dyn ObjectStore,
+    start: (Mode, Oid),
+    components: &[String],
+) -> Result<Option<(Mode, Oid)>, String> {
+    let mut at = start;
     for (index, name) in components.iter().enumerate() {
         let dir = match at.0 {
             Mode::Tree => at.1.clone(),
@@ -247,6 +294,35 @@ mod tests {
         assert_eq!(path("/sources/repo/"), vec!["sources", "repo"]);
         assert!(components(".caos/tools").is_err());
         assert!(components("a/../b").is_err());
+    }
+
+    #[test]
+    fn a_root_can_be_a_path_inside_an_object_named_by_hash() {
+        let mut store = MemoryStore::new();
+        let (root, layer) = session(&mut store);
+        let hash = root.as_str();
+        assert_eq!(
+            locate("sources/repo").unwrap(),
+            Located::Session(path("sources/repo"))
+        );
+        let Located::Object(oid, inside) = locate(&format!("{hash}/sources/repo/01-a")).unwrap()
+        else {
+            panic!("a hash prefix names an object");
+        };
+        assert_eq!(oid, root);
+        assert_eq!(
+            resolve_object(&store, &oid, &inside).unwrap(),
+            Some((Mode::Commit, layer.clone()))
+        );
+        // The commit itself, and a file inside it through its code tree.
+        assert_eq!(
+            resolve_object(&store, &layer, &[]).unwrap(),
+            Some((Mode::Commit, layer.clone()))
+        );
+        assert_eq!(
+            resolve_object(&store, &layer, &path("README.md")).unwrap().unwrap().0,
+            Mode::Blob
+        );
     }
 
     #[test]

@@ -3,9 +3,8 @@
 # from the tree the build sees: editing the docs re-keys this tool's ArgTree and
 # nothing it builds from.
 HELP=<<END
-List a directory: one entry per line, directories (and source trees) with a trailing `/`. Paths start at the root of the tree this tool runs over (the session, unless `in` names another) and traverse code references, for example feature/dirty/src. Prefer this over `ls` via bash. Listings are cut at 1000 entries.
-@param [path] Directory to list; omit for the root itself.
-@in
+List a directory: one entry per line, directories (and source trees) with a trailing `/`. `root` is the directory or source tree: a path in the session (`.` for its top), or `<hash>[/<path>]` for one that is not in the session, such as an evaluated caos-std/. Prefer this over `ls` via bash. Listings are cut at 1000 entries.
+@root
 END
 IMAGE=run --base:@=DEEP-DEPS/rustc --src:@=DEEP-DEPS/files
 curry --base=$IMAGE --op=ls --help=$HELP
