@@ -828,7 +828,7 @@ mod config_tests {
         }
     }
     #[test]
-    fn a_server_is_named_by_argument_only() {
+    fn a_missing_server_names_the_global_flag() {
         let named = Config {
             server: Some("http://arg".into()),
             ..Config::default()
