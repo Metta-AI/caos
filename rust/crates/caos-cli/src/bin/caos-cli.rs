@@ -207,7 +207,8 @@ fn usage(args: &[String]) -> String {
     let rev = build_rev();
     format!(
         "{prog} ({rev})\n\
-         usage:\n  \
+         usage: {prog} [--server=<url>] <command> ...\n  \
+         (--server names the caos server, overriding the checkout's `caos` git remote)\n  \
          {prog} run [output] --base:<type>=<image> [--name=value | --name:@=path ...]\n  \
          {prog} curry [--unbind=<name> ...] --base:<type>=<arg tree> [--name=value | --name:@=path ...]\n    \
          (an image is --base:@=<dir>, --base:docker=<ref> or --base:hash=<oid>)\n  \
