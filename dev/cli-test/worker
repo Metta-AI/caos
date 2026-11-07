@@ -156,8 +156,9 @@ git add -A && git commit -qm testtree
 # here is the client's own `eval-path`, the same walk `:@=` does.
 if [ -d ./DEEP-DEPS/llm-step ]; then
   step=$("$CAOS_CLI" eval-path DEEP-DEPS/llm-step) || fail "evaluating DEEP-DEPS/llm-step"
-  CAOS_MCP_ARGS="--server=$CAOS_SERVER_URL --llm-step:hash=${step##* }"
-  export CAOS_MCP_ARGS
+  CAOS_MCP_SERVER="--server=$CAOS_SERVER_URL"
+  CAOS_MCP_ARGS="--llm-step:hash=${step##* }"
+  export CAOS_MCP_SERVER CAOS_MCP_ARGS
 fi
 
 # A SESSION'S CONTENT is named by locator, and the server fetches it: so this
