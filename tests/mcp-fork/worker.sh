@@ -22,7 +22,7 @@ export HOME
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 hook() { # <event JSON>; prints the hook's stdout
-  printf "%s\n" "$1" | "$CAOS_CLI" mcp hook $CAOS_MCP_ARGS "$(mcp_base_arg)"
+  printf "%s\n" "$1" | "$CAOS_CLI" $CAOS_MCP_SERVER mcp hook $CAOS_MCP_ARGS "$(mcp_base_arg)"
 }
 prompt() { # <session> <prompt text>
   hook "$(jq -nc --arg s "$1" --arg p "$2" \
@@ -106,7 +106,7 @@ echo "== a session rooted on G3 forks with --base ==" >&2
 # Made with no --base, as every session was before roots parented their
 # content commit: it shares no history with the client repository, so git
 # finds no base to merge that repository's commit in from.
-bare_hook() { printf "%s\n" "$1" | "$CAOS_CLI" mcp hook $CAOS_MCP_ARGS; }
+bare_hook() { printf "%s\n" "$1" | "$CAOS_CLI" $CAOS_MCP_SERVER mcp hook $CAOS_MCP_ARGS; }
 o="resume-o-$stamp"
 bare_hook "$(jq -nc --arg s "$o" '{hook_event_name:"UserPromptSubmit",session_id:$s,prompt:"a G3-rooted session"}')" >/dev/null
 bare_hook "$(jq -nc --arg s "$o" '{hook_event_name:"Stop",session_id:$s,last_assistant_message:"done"}')" >/dev/null
