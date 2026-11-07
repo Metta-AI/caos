@@ -52,29 +52,21 @@ fn input(name: &str) -> Result<Option<String>, String> {
         .map_err(|e| format!("reading {name}: {e}"))
 }
 
-/// The answer for a call the model got wrong.
+/// The answer for a call the model got wrong: `{stdout, failed}`.
 fn failed(message: &str) -> Result<(), String> {
     let dir = scratch("grep-out")?;
-    fs::write(dir.join("report"), format!("FAILED: {message}\n"))
-        .map_err(|e| format!("writing the report: {e}"))?;
+    fs::write(dir.join("stdout"), format!("grep: {message}\n"))
+        .map_err(|e| format!("writing stdout: {e}"))?;
+    fs::write(dir.join("failed"), "grep failed\n")
+        .map_err(|e| format!("writing failed: {e}"))?;
     caos(["put", path(&dir), "/cas/out"])
 }
 
+/// The answer under the root contract (design/tool-contract.md): `{stdout}`.
 fn answer(text: &str) -> Result<(), String> {
-    let file = scratch("grep-out")?.join("answer");
-    fs::write(&file, text).map_err(|e| format!("writing the answer: {e}"))?;
-    caos(["put", path(&file), "/cas/out"])
-}
-
-/// A path argument's components: a leading `/` is tolerated, and empty and `.`
-/// segments drop out.
-fn split_path(raw: &str) -> Vec<String> {
-    raw.trim()
-        .trim_start_matches('/')
-        .split('/')
-        .filter(|c| !c.is_empty() && *c != ".")
-        .map(str::to_string)
-        .collect()
+    let dir = scratch("grep-out")?;
+    fs::write(dir.join("stdout"), text).map_err(|e| format!("writing stdout: {e}"))?;
+    caos(["put", path(&dir), "/cas/out"])
 }
 
 fn start() -> Result<(), String> {
@@ -84,28 +76,23 @@ fn start() -> Result<(), String> {
     if let Err(error) = regex::Regex::new(&pattern) {
         return failed(&format!("invalid pattern: {error}"));
     }
-    let comps = split_path(&input("path")?.unwrap_or_default());
-    if comps.iter().any(|c| c == "..") {
-        return failed("`..` is not allowed in tree paths");
+    // The scope is the root: a file, a directory, or a source tree, which
+    // resolving with no path turns into its code tree.
+    let root = arg("root");
+    if fs::symlink_metadata(&root).is_err() {
+        return failed("nothing is at the root path. Check it with ls on the directory above it");
     }
-    let relative = comps.join("/");
+    let relative = String::new();
     let scope = "/cas/grep-scope";
     let output = std::process::Command::new("caos")
-        .args(["resolve", &cas_hash(&arg("in"))?, &relative, scope])
+        .args(["resolve", &cas_hash(&root)?, "", scope])
         .output()
         .map_err(|e| format!("launching caos resolve: {e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let reason = stderr.trim_end();
         let reason = reason.strip_prefix("caos: ").unwrap_or(reason);
-        return failed(&format!(
-            "{}: {reason}",
-            if relative.is_empty() {
-                "the tree"
-            } else {
-                &relative
-            }
-        ));
+        return failed(&format!("the root: {reason}"));
     }
 
     // The fold is the rgrep image with the pattern bound. Its cache key is
@@ -141,7 +128,16 @@ fn render() -> Result<(), String> {
         if text.is_empty() {
             return answer("no matches");
         }
-        let rendered: String = text.lines().map(|l| format!("{scope}:{l}\n")).collect();
+        let rendered: String = text
+            .lines()
+            .map(|l| {
+                if scope.is_empty() {
+                    format!("{l}\n")
+                } else {
+                    format!("{scope}:{l}\n")
+                }
+            })
+            .collect();
         return answer(rendered.trim_end());
     }
 
@@ -199,16 +195,5 @@ impl Render {
             }
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_scope_splits_the_way_the_file_tools_split_paths() {
-        assert_eq!(split_path("/a//b/./c"), ["a", "b", "c"]);
-        assert!(split_path(" . ").is_empty());
     }
 }

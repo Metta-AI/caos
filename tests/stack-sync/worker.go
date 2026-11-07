@@ -131,7 +131,7 @@ func use(id, name string, input map[string]any) map[string]any {
 
 func shell(id, cmd string, paths ...string) map[string]any {
 	return use(id, "run_tool", map[string]any{"path": "tools/sh",
-		"arguments": map[string]any{"cmd": cmd, "paths": paths}})
+		"arguments": map[string]any{"root": ".", "cmd": cmd, "paths": paths}})
 }
 
 func write(id, path, content string) map[string]any {

@@ -133,7 +133,7 @@ func use(id, name string, input map[string]any) map[string]any {
 
 func shell(id, cmd, path string) map[string]any {
 	return use(id, "run_tool", map[string]any{"path": "tools/sh",
-		"arguments": map[string]any{"cmd": cmd, "paths": []string{path}}})
+		"arguments": map[string]any{"root": ".", "cmd": cmd, "paths": []string{path}}})
 }
 
 func write(id, path, content string) map[string]any {
@@ -239,8 +239,8 @@ func main() {
 		m1 := "Add the feature (" + salt + ")\n\nWhy it exists,\nover two lines."
 		m2 := "Test the feature (" + salt + ")\n\nOne body line."
 		m2b := "Test the feature, reworded (" + salt + ")\n\nA republish: only this message changed."
-		squash := use("tu_squash", "run_tool", map[string]any{"path": "tools/squash", "arguments": map[string]any{"plan": "mystack.plan"}})
-		squash2 := use("tu_squash2", "run_tool", map[string]any{"path": "tools/squash", "arguments": map[string]any{"plan": "mystack.plan"}})
+		squash := use("tu_squash", "run_tool", map[string]any{"path": "tools/squash", "arguments": map[string]any{"root": ".", "plan": "mystack.plan"}})
+		squash2 := use("tu_squash2", "run_tool", map[string]any{"path": "tools/squash", "arguments": map[string]any{"root": ".", "plan": "mystack.plan"}})
 		publish := func(id, source string) map[string]any {
 			return use(id, "publish_source", map[string]any{"source_tree": source,
 				"repository": "https://caos-squash-publish.invalid/repo.git", "branch": "feature", "force": true})

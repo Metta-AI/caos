@@ -1,21 +1,22 @@
 // The `create-squashed-stack` tool's worker. Its docs live in the sibling `.caos-expr`
 // here-string, not in this header (SPEC, "CaosTools").
 //
-// A writer run on the session (SPEC, "Writers"). Args, under /cas/args:
+// A writer under the root contract (design/tool-contract.md). Args, under
+// /cas/args:
 //
-//	in    the session tree it was run on
-//	plan  the session path of the plan file
+//	root  the directory holding the plan and everything it names
+//	plan  the path of the plan file, relative to root
 //
-// The plan names everything else: `onto`, `into`, and one block per layer of
-// `layer=`, `commit=` and `message=` lines.
+// The plan names everything else, relative to root: `onto`, `into`, and one
+// block per layer of `layer=`, `commit=` and `message=` lines.
 //
-// The result is {prop, out, message, failed?}. `prop` is the session
-// with `into` replaced by {<layer>: <squashed commit>}. It is built from links
-// to the CAS entries it keeps, which `caos put` records by oid, so nothing in
-// the session is checked out.
+// The result is {stdout, root, commit-message} or {stdout, failed}. `root` is
+// the directory with `into` replaced by {<layer>: <squashed commit>}. It is
+// built from links to the CAS entries it keeps, which `caos put` records by
+// oid, so nothing is checked out.
 //
-// A refusal proposes `in` unchanged and marks `failed`: the agent reads it and
-// acts (merges, fixes the plan). Only a broken environment is a job error.
+// A refusal is a value: the agent reads it and acts (merges, fixes the plan).
+// Only a broken environment is a job error.
 package main
 
 import (
@@ -31,10 +32,32 @@ import (
 )
 
 const (
-	in     = "/cas/args/in"
 	result = "/tmp/squash-result"
 	repo   = "/tmp/squash-repo"
 )
+
+// in is the root as a folder: a tree as it is, a source tree's commit as its
+// code tree. Set first thing in main.
+var in string
+
+// directory finds the root and returns it as a folder.
+func directory() string {
+	const root = "/cas/args/root"
+	if !exists(root) {
+		refuse("nothing is at the root path: root is the directory holding the plan and the stack, such as `.`")
+	}
+	switch k := kind(root); k {
+	case "tree":
+		return root
+	case "commit":
+		const code = "/cas/squash-code"
+		run("caos", "resolve", hash(root), "", code)
+		return code
+	default:
+		refuse("the root is a %s, not a directory", k)
+		return ""
+	}
+}
 
 // refusal is a problem with the input, answered as a value.
 type refusal struct{ msg string }
@@ -377,17 +400,19 @@ func rebuild(src, dst string, parts []string, node string) {
 	rebuild(child, filepath.Join(dst, head), parts[1:], node)
 }
 
-// finish writes the writer result and stores it at /cas/out.
-func finish(prop, out, message string, failed bool) {
+// finish writes the result and stores it at /cas/out: the new directory as
+// `root`, or `failed` and nothing to apply.
+func finish(newRoot, out, message string, failed bool) {
 	w.Must(os.MkdirAll(result, 0o755))
-	w.Must(os.WriteFile(filepath.Join(result, "out"), []byte(out), 0o644))
-	if message != "" {
-		w.Must(os.WriteFile(filepath.Join(result, "message"), []byte(message), 0o644))
-	}
+	w.Must(os.WriteFile(filepath.Join(result, "stdout"), []byte(out), 0o644))
 	if failed {
-		w.Must(os.WriteFile(filepath.Join(result, "failed"), []byte(out), 0o644))
+		w.Must(os.WriteFile(filepath.Join(result, "failed"), []byte("create-squashed-stack refused\n"), 0o644))
+	} else {
+		w.Must(os.Symlink(newRoot, filepath.Join(result, "root")))
+		if message != "" {
+			w.Must(os.WriteFile(filepath.Join(result, "commit-message"), []byte(message), 0o644))
+		}
 	}
-	w.Must(os.Symlink(prop, filepath.Join(result, "prop")))
 	run("caos", "put", result, "/cas/out")
 }
 
@@ -402,9 +427,10 @@ func main() {
 			if !ok {
 				panic(r)
 			}
-			finish(in, "FAILED: "+no.msg+"\n", "", true)
+			finish("", "FAILED: "+no.msg+"\n", "", true)
 		}()
 
+		in = directory()
 		get(in)
 		get("/cas/args/plan")
 		planPath := strings.Join(splitPath("plan", strings.TrimSpace(string(w.Check(os.ReadFile("/cas/args/plan"))))), "/")
@@ -437,8 +463,8 @@ func main() {
 		report.WriteString("Next: publish_source each, bottom to top, with force=true.\n")
 		run("caos", "put", squashed, "/cas/squashed")
 
-		rebuild(in, "/tmp/squash-prop", strings.Split(into, "/"), "/cas/squashed")
-		run("caos", "put", "/tmp/squash-prop", "/cas/prop")
-		finish("/cas/prop", report.String(), "create-squashed-stack: "+into+"\n", false)
+		rebuild(in, "/tmp/squash-root", strings.Split(into, "/"), "/cas/squashed")
+		run("caos", "put", "/tmp/squash-root", "/cas/new-root")
+		finish("/cas/new-root", report.String(), "create-squashed-stack: "+into+"\n", false)
 	})
 }

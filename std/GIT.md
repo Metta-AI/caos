@@ -73,7 +73,7 @@ sources/<repo>/
 - **`99-dirty`** is where you work between layers. Edit it freely, and let its
   history grow. It has no `.pr.md`, so it is never published. When the work in
   it is a finished chunk, `move` it to the next layer name
-  (`move(from="sources/<repo>/99-dirty", to="sources/<repo>/02-<name>")`),
+  (`move(root="sources/<repo>", from="99-dirty", to="02-<name>")`),
   write `sources/<repo>/02-<name>.pr.md`, then `copy` that layer to a fresh
   `99-dirty` to carry on.
 - **Make a new layer only where you would normally start a new layer of a
@@ -181,7 +181,7 @@ examples that follow use the stack shown just before them.
 
 ### Merging
 
-`merge(source-tree=Y, theirs=X)` (run as `run_tool(path="caos-std/merge", arguments={...})`)
+`merge(root=Y, theirs=X)` (run as `run_tool(path="caos-std/merge", arguments={...})`)
 merges `X` into the gitlink `Y` and always mints a merge commit with parents `Y` and `X`.
 It picks the highest common ancestor as the base. The optional `merge-base` overrides
 that, which you only need to replay a change onto a history that lacks its old
@@ -208,7 +208,7 @@ Edit `sources/repo/01-feature` (A becomes A2), then merge each layer into the
 one after it, earliest first:
 
 ```text
-merge(source-tree="sources/repo/02-tests",
+merge(root="sources/repo/02-tests",
       theirs="<full hash of sources/repo/01-feature>")
 
 sources/repo/01-feature  -> A2  parent A
@@ -241,9 +241,9 @@ remove(root="sources/repo/00-base")
 remove(root="sources/repo/00-base.source.json")
 move(root="sources/repo", from="00-base-2", to="00-base")
 move(root="sources/repo", from="00-base-2.source.json", to="00-base.source.json")
-merge(source-tree="sources/repo/01-feature",
+merge(root="sources/repo/01-feature",
       theirs="<full hash of sources/repo/00-base>")
-merge(source-tree="sources/repo/02-tests",
+merge(root="sources/repo/02-tests",
       theirs="<full hash of sources/repo/01-feature>")
 ```
 
@@ -254,9 +254,9 @@ of the previous layer.
 
 ```text
 remove sources/repo/01-feature; copy sources/repo/00-base -> sources/repo/01-feature
-merge(source-tree="sources/repo/01-feature", theirs="<A>", merge-base="<H>")
+merge(root="sources/repo/01-feature", theirs="<A>", merge-base="<H>")
 remove sources/repo/02-tests;   copy sources/repo/01-feature -> sources/repo/02-tests
-merge(source-tree="sources/repo/02-tests",   theirs="<B>", merge-base="<A>")
+merge(root="sources/repo/02-tests",   theirs="<B>", merge-base="<A>")
 ```
 
 ### Dropping, combining, splitting
@@ -281,9 +281,9 @@ such as `02` to `03` then `01` to `02` has no ordering problem:
 
 ```text
 run_tool(path="caos-std/move-sed", arguments={
-  "dir": "sources/repo", "pattern": "^02-tests(\\..+)?$", "replacement": "03-tests$1"})
+  "root": "sources/repo", "pattern": "^02-tests(\\..+)?$", "replacement": "03-tests$1"})
 run_tool(path="caos-std/move-sed", arguments={
-  "dir": "sources/repo", "pattern": "^01-feature(\\..+)?$", "replacement": "02-y$1"})
+  "root": "sources/repo", "pattern": "^01-feature(\\..+)?$", "replacement": "02-y$1"})
 ```
 
 `replacement` uses Go's `$1` / `${name}`, never sed's `\1`. The result lists

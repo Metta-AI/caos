@@ -1,7 +1,8 @@
 # The `create-squashed-stack` tool (design/stacks.md, "Publishing"): the std/go
 # worker image with this directory's program curried onto it, plus the `help`
-# it is described by. A writer run on the session: `@in` hands it the
-# session tree, and it proposes that tree with the plan's `into` replaced.
+# it is described by. A writer under the root contract: `root` is the
+# directory holding the plan and the stack, and it answers with that directory
+# with the plan's `into` replaced.
 HELP=<<END
 Squash a stack to one commit per layer, for publishing each layer as a branch
 with a linear history, as a plan file says. The layers keep their own merge
@@ -21,7 +22,8 @@ The plan is one key=value per line:
   message=Test the feature
 
 onto and into come once, before the first layer=. onto and each commit are a
-session path to a gitlink or a full commit hash. Each layer= starts a block
+path to a gitlink, relative to root, or a full commit hash; into is a path
+relative to root. Each layer= starts a block
 that becomes <into>/<layer>, with one commit= and its message= lines, which in
 order are that layer's commit message.
 
@@ -33,8 +35,8 @@ previous run wrote there. Refused, naming both, unless each layer's commit
 contains the one before it (or onto): merge a changed lower layer up first.
 
 Then publish_source each <into>/<layer>, bottom to top, with force=true.
-@param plan Session path of the plan file, e.g. `mystack.plan`.
+@param plan Path of the plan file, relative to root, e.g. `mystack.plan`.
 @writer
-@in
+@root
 END
 curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --help=$HELP

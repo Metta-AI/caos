@@ -3,9 +3,11 @@
 // Runs std/move-sed over a fixture session holding a stack the way
 // design/publish-stack.md lays one out: sources/repo with 00-base and its
 // .source.json, two layers with their .pr.md descriptions, a 99-dirty, plus a
-// source tree and a file at the root. A success is checked by the tree it
-// proposes: it must equal the fixture rebuilt with exactly those entries
-// renamed. A refusal must propose the fixture unchanged and mark `failed`.
+// source tree and a file at the root. Under the root contract
+// (design/tool-contract.md) each case binds one directory of it as `root`. A
+// success is checked by the directory it answers with: it must equal that
+// directory rebuilt with exactly those entries renamed. A refusal must mark
+// `failed` and answer no `root`.
 //
 // Every fixture message carries --test-salt, so a salted run is a cache miss.
 //
@@ -55,10 +57,23 @@ func mint(name, tree string, ts int, msg string, parents ...string) string {
 type testCase struct {
 	name    string
 	args    []string
-	dir     string            // the fixture directory the renames apply to ("" = root)
+	dir     string            // the fixture path bound as root ("" = the session's top, "-" = nothing)
 	renames map[string]string // old entry name -> new; nil for a refusal
 	dryRun  bool
 	says    []string
+}
+
+var seq int
+
+// object is the object at `path` inside the tree `tree`, as a CAS path.
+func object(tree, path string) string {
+	if path == "" {
+		return "/cas/" + filepath.Base(tree)
+	}
+	seq++
+	dest := fmt.Sprintf("/cas/object-%d", seq)
+	w.Caos("resolve", w.Hash(tree), path, dest)
+	return dest
 }
 
 var cases []testCase
@@ -114,53 +129,45 @@ func build() {
 	mint("l2", mktree("l2-t", "f.txt=base", "a.txt=one", "b.txt=two"), 1700000200, "layer 2", l1)
 	conv = session("/tmp/conv", "", nil)
 
-	args := func(dir, pattern, replacement string, extra ...string) []string {
-		a := []string{"--pattern=" + pattern, "--replacement=" + replacement}
-		if dir != "" {
-			a = append(a, "--dir="+dir)
-		}
-		return append(a, extra...)
+	args := func(pattern, replacement string, extra ...string) []string {
+		return append([]string{"--pattern=" + pattern, "--replacement=" + replacement}, extra...)
 	}
 	cases = []testCase{
 		// A layer and its description, renamed together: the split in
 		// design/stacks.md, where 01-feature becomes 02-y.
-		{name: "split", args: args("sources/repo", `^01-feature(\..+)?$`, "02-y$1"), dir: "sources/repo",
+		{name: "split", args: args(`^01-feature(\..+)?$`, "02-y$1"), dir: "sources/repo",
 			renames: map[string]string{"01-feature": "02-y", "01-feature.pr.md": "02-y.pr.md"}},
 		// A shift up by one, and a named group.
-		{name: "shift", args: args("sources/repo", `^02-(?P<rest>tests.*)$`, "03-${rest}"), dir: "sources/repo",
+		{name: "shift", args: args(`^02-(?P<rest>tests.*)$`, "03-${rest}"), dir: "sources/repo",
 			renames: map[string]string{"02-tests": "03-tests", "02-tests.pr.md": "03-tests.pr.md"}},
-		// The root, named as `.`, with .caos left alone because the pattern is anchored.
-		{name: "root", args: args(".", `^notes\.txt$`, "NOTES.txt"), dir: "",
+		// The session's top, with .caos left alone because the pattern is anchored.
+		{name: "top", args: args(`^notes\.txt$`, "NOTES.txt"), dir: "",
 			renames: map[string]string{"notes.txt": "NOTES.txt"}},
-		// A dry run lists the renames and proposes the session unchanged.
-		{name: "dry-run", args: args("sources/repo", `^01-feature(\..+)?$`, "02-y$1", "--dry-run=true"),
+		// A dry run lists the renames and answers the directory unchanged.
+		{name: "dry-run", args: args(`^01-feature(\..+)?$`, "02-y$1", "--dry-run=true"), dir: "sources/repo",
 			dryRun: true, says: []string{"dry run", "01-feature -> 02-y", "01-feature.pr.md -> 02-y.pr.md"}},
 		// Refusals, each before anything changes.
-		{name: "collide", args: args("sources/repo", `^01-feature$`, "02-tests"),
+		{name: "collide", args: args(`^01-feature$`, "02-tests"), dir: "sources/repo",
 			says: []string{"01-feature would become 02-tests, which exists and is not being renamed"}},
-		{name: "duplicate", args: args("sources/repo", `^0[12]-(feature|tests)$`, "same"),
+		{name: "duplicate", args: args(`^0[12]-(feature|tests)$`, "same"), dir: "sources/repo",
 			says: []string{"both 01-feature and 02-tests would become same"}},
-		{name: "no-match", args: args("sources/repo", `^zzz`, "x"),
+		{name: "no-match", args: args(`^zzz`, "x"), dir: "sources/repo",
 			says: []string{"no entry matches", "01-feature.pr.md"}},
-		{name: "no-op", args: args("sources/repo", `^01-feature$`, "01-feature"),
+		{name: "no-op", args: args(`^01-feature$`, "01-feature"), dir: "sources/repo",
 			says: []string{"keeps its name"}},
-		{name: "sed-group", args: args("sources/repo", `^01-(.*)$`, `02-\1`),
+		{name: "sed-group", args: args(`^01-(.*)$`, `02-\1`), dir: "sources/repo",
 			says: []string{`uses sed's \1`, "$1"}},
-		{name: "bad-regex", args: args("sources/repo", `(`, "x"),
+		{name: "bad-regex", args: args(`(`, "x"), dir: "sources/repo",
 			says: []string{"not a valid Go regular expression"}},
-		{name: "slash", args: args("sources/repo", `^01-feature$`, "a/b"),
+		{name: "slash", args: args(`^01-feature$`, "a/b"), dir: "sources/repo",
 			says: []string{`would become "a/b", which is not one directory entry name`}},
-		{name: "in-source-tree", args: args("src/sub", `.`, "x"),
-			says: []string{"src is a source tree", "use move"}},
-		{name: "missing-dir", args: args("sources/nowhere", `.`, "x"),
-			says: []string{"no such path: sources/nowhere"}},
-		{name: "a-file", args: args("notes.txt", `.`, "x"),
-			says: []string{"notes.txt is a blob, not a directory"}},
-		{name: "caos", args: args(".", `^\.caos$`, "x"),
+		{name: "nothing", args: args(`.`, "x"), dir: "-",
+			says: []string{"nothing is at the root path"}},
+		{name: "a-file", args: args(`.`, "x"), dir: "notes.txt",
+			says: []string{"the root is a blob, not a directory"}},
+		{name: "caos", args: args(`^\.caos$`, "x"), dir: "",
 			says: []string{".caos is protocol metadata"}},
-		{name: "dotdot", args: args("sources/../repo", `.`, "x"),
-			says: []string{"without . or .."}},
-		{name: "no-pattern", args: []string{"--dir=sources/repo", "--replacement=x"},
+		{name: "no-pattern", args: []string{"--replacement=x"}, dir: "sources/repo",
 			says: []string{"pattern is required"}},
 	}
 }
@@ -175,7 +182,11 @@ func next(s int) string {
 func launch(i int) {
 	c := cases[i]
 	w.Step(fmt.Sprintf("case %d: %s", i, c.name))
-	args := append([]string{"prepare-request", "--base:hash=" + w.Hash("/cas/args/tool"), "--in:@=/cas/conv"}, c.args...)
+	args := []string{"prepare-request", "--base:hash=" + w.Hash("/cas/args/tool")}
+	if c.dir != "-" {
+		args = append(args, "--root:@="+object("/cas/conv", c.dir))
+	}
+	args = append(args, c.args...)
 	request := w.Caos(args...)
 	w.Caos("run-request-then", request, "--then:hash="+next(i))
 }
@@ -184,33 +195,33 @@ func check(i int) {
 	c := cases[i]
 	const r = "/cas/args/result"
 	w.Get(r)
-	for _, part := range []string{"prop", "out"} {
-		w.True(w.Exists(filepath.Join(r, part)), "case %s: the result has no %s", c.name, part)
-	}
-	out := w.Read(filepath.Join(r, "out"))
+	w.True(w.Exists(filepath.Join(r, "stdout")), "case %s: the result has no stdout", c.name)
+	out := w.Read(filepath.Join(r, "stdout"))
 	failed := w.Exists(filepath.Join(r, "failed"))
-	prop := w.Hash(filepath.Join(r, "prop"))
 	for _, s := range c.says {
 		w.True(strings.Contains(out, s), "case %s does not say %q: %s", c.name, s, out)
 	}
 	switch {
 	case c.renames != nil:
 		w.True(!failed, "case %s was refused: %s", c.name, out)
-		expect := session("/tmp/expect", c.dir, c.renames)
-		w.True(prop == expect, "case %s: the proposal is not the fixture with %v renamed in %q; out: %s", c.name, c.renames, c.dir, out)
+		session("/tmp/expect", c.dir, c.renames)
+		expect := w.Hash(object("/cas/expect", c.dir))
+		got := w.Hash(filepath.Join(r, "root"))
+		w.True(got == expect, "case %s: the answer is not %q with %v renamed; out: %s", c.name, c.dir, c.renames, out)
 		for from, to := range c.renames {
 			w.True(strings.Contains(out, from+" -> "+to), "case %s: out does not list %s -> %s: %s", c.name, from, to, out)
 		}
-		w.True(w.Exists(filepath.Join(r, "message")), "case %s: no commit message for the session", c.name)
+		w.True(w.Exists(filepath.Join(r, "commit-message")), "case %s: no commit message", c.name)
 		fmt.Fprintf(os.Stderr, "  ok: %s", out)
 	case c.dryRun:
 		w.True(!failed, "case %s was refused: %s", c.name, out)
-		w.True(prop == conv, "case %s: a dry run changed the session", c.name)
+		w.True(w.Hash(filepath.Join(r, "root")) == w.Hash(object("/cas/conv", c.dir)),
+			"case %s: a dry run changed the directory", c.name)
 		fmt.Fprintf(os.Stderr, "  ok: %s", out)
 	default:
 		w.True(failed, "case %s was not refused: %s", c.name, out)
-		w.True(strings.HasPrefix(out, "FAILED: "), "case %s has no FAILED banner: %s", c.name, out)
-		w.True(prop == conv, "case %s: a refusal changed the session", c.name)
+		w.True(strings.HasPrefix(out, "move-sed: "), "case %s does not say who refused: %s", c.name, out)
+		w.True(!w.Exists(filepath.Join(r, "root")), "case %s: a refusal answered a root", c.name)
 		fmt.Fprintf(os.Stderr, "  ok: %s", out)
 	}
 }

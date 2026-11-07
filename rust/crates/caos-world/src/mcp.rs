@@ -29,15 +29,15 @@ no path says how caos is doing here.
 strings (an array or object where the help says so).
 - start(path, arguments), then result(ticket): the same without waiting. start returns a \
 ticket; result says pending, or gives the output, or says how it failed.
-- eval-path(path): evaluate a path and get the hash of what it produces. Pass the hash \
-as `in` to read, ls or grep to look inside it.
+- eval-path(path): evaluate a path and get the hash of what it produces. Pass \
+`<hash>[/<path>]` as `root` to read, ls or grep to look inside it.
 
 A tool is a directory of the session. The standard ones are under caos-std/: read, \
 ls, write, edit, copy, move, remove, grep, log, show, diff, merge, import-source, \
 publish-source, bash-tool, caos-build, caos-test, github and more. caos-std exists only in \
 the EVALUATED tree, so to see what is there: eval-path(\"caos-std\"), then run \
-caos-std/read with file-path README.md and `in` set to that hash. Call help on a tool \
-before you use one you have not used.
+caos-std/read with `root` set to <that hash>/README.md. Every tool that works on a tree \
+takes its path as `root`. Call help on a tool before you use one you have not used.
 
 To work on code in caos, import it with import-source into sources/<repo>/00-base, copy \
 that to sources/<repo>/99-dirty, edit the copy with the file tools, move it to a layer \
@@ -138,8 +138,8 @@ pub fn tools() -> Vec<Value> {
             "name": "eval-path",
             "description": "Evaluate a path in the caos session and return the hash of \
                             what it produces: the build product of a tree, without having to \
-                            know which tool makes it. caos-std exists only this way. Pass the \
-                            hash as `in` to read, ls or grep to look inside it.",
+                            know which tool makes it. caos-std exists only this way. Pass \
+                            `<hash>[/<path>]` as `root` to read, ls or grep to look inside it.",
             "inputSchema": with_injected(json!({
                 "type": "object",
                 "properties": {

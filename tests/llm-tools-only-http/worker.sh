@@ -108,7 +108,7 @@ grep -qF "hello tools" /tmp/read.observation || fail "the recorded observation l
 
 stage "a second call, run to completion with one blocking request"
 call_params toolu_write run_tool \
-  '{"arguments":{"cmd":"echo written > out.txt"},"path":"main/tools/sh"}'
+  '{"arguments":{"root":"main","cmd":"echo written > out.txt"},"path":"main/tools/sh"}'
 post /eval/run "${params[@]}"
 [ "$code" = 200 ] || fail "eval/run: HTTP $code: $body"
 case "$body" in
