@@ -1464,10 +1464,10 @@ impl GitTransport {
             "--no-write-fetch-head",
             "--negotiation-tip",
             tip,
-            CAOS_REMOTE,
+            self.remote(),
             hash,
         ])
-        .map_err(|e| format!("fetching {hash} from {CAOS_REMOTE}: {e}"))
+        .map_err(|e| format!("fetching {hash} from {}: {e}", self.remote()))
     }
 }
 
