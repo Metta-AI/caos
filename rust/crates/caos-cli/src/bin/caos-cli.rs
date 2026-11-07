@@ -29,6 +29,13 @@ fn main() -> ExitCode {
     }));
     caos::set_secret_readers(caos_cli::secret_store::reader_keys());
     let args: Vec<String> = std::env::args().collect();
+    let args = match take_global_flags(&args) {
+        Ok(args) => args,
+        Err(err) => {
+            eprintln!("{}: {err}", prog_name(&args));
+            return ExitCode::FAILURE;
+        }
+    };
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
