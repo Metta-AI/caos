@@ -292,6 +292,8 @@ func main() {
 		// which the client reads as a flag with a nonsense value.
 		w.True(contains(args, "--base:@@=git+caos://local?rev="+seed) && contains(args, "--server="+serverURL) && contains(args, readersArg),
 			"the tool server is not told the server, the content and the readers, each as its own argument: %v", args)
+		w.True(len(args) > 2 && args[0] == "--server="+serverURL && args[1] == "mcp" && args[2] == "serve",
+			"the tool server is not named the server before `mcp serve`: %v", args)
 
 		// -------------------------------------------------------------------
 		w.Step("stage 1 in dev mode seeds a session and leaves the checkout clean")
