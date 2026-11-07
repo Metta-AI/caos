@@ -66,7 +66,8 @@ const CLAUDE_CODE_MODEL: &str = "claude-code";
 /// which step runs the tools, and where a new session's content comes from.
 #[derive(Clone, Debug, Default)]
 pub struct Config {
-    /// `--server=<url>`; the environment otherwise ([`Config::server`]).
+    /// The global `caos-cli --server=<url>` ahead of `mcp`
+    /// ([`caos::server_override`]); nothing else names it.
     server: Option<String>,
     /// The `--llm-step:@@=<locator>` argument, verbatim.
     step: Option<String>,
