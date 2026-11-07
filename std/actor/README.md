@@ -10,8 +10,11 @@ real crash between push and reply is not injected (a re-applied message is the
 same observable), and laziness is checked from inside the inner, not by
 counting server object reads. Both are Go programs on `std/go`. Open question 6
 (history fetched on every write) is resolved for the write path: the wrapper
-moves the branch with a direct receive-pack command and an empty pack instead
-of `git push`, so it fetches no history (see the question). Daemons are deliberately set aside; see
+reads the branch with `caos ref-get` and moves it with `caos ref-set
+--expected=<observed head>`, a compare-and-swap the server checks under the
+ref's lock, so it pushes nothing and fetches no history (see the question and
+[design/refs.md](../../design/refs.md)). It first did this by speaking
+receive-pack directly, which `tests/actor-ref` still covers. Daemons are deliberately set aside; see
 [Deferred: daemons](#deferred-daemons).
 
 Builds on [client-owned session refs](../../design/client-owned-session-refs.md)
@@ -353,7 +356,8 @@ detection.
      not move, and the right `<old>` is accepted. The result is an ordinary
      branch that git can fetch. This resolves the history cost of this
      question for the write path, and needs no server change. `std/actor`
-     should use it;
+     used it until `caos ref-set` (design/refs.md) gave workers the same
+     compare-and-swap as one command;
    - squash periodically (question 2), which bounds the chain;
    - add a small server-side push-by-oid endpoint, which breaks "no server
      change".
