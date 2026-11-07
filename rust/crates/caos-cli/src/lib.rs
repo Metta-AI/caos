@@ -2780,7 +2780,7 @@ mod tests {
         git(&repo, &["config", "user.email", "alice@example.com"]);
         git(
             &repo,
-            &["remote", "add", CAOS_REMOTE, remote.to_str().unwrap()],
+            &["remote", "add", caos::CAOS_REMOTE, remote.to_str().unwrap()],
         );
         git(
             &repo,
