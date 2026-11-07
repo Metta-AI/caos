@@ -237,8 +237,10 @@ run_tool(path="caos-std/stack-sync", arguments={"stack": "sources/repo"})
 run_tool(path="caos-std/stack-publish", arguments={"stack": "sources/repo"})
 ```
 
-By hand: import the new upstream tip at a fresh path, put it at `00-base`, and
-merge it into the first layer, then each layer into the one after it:
+By hand, only where `stack-sync` cannot run (it refuses, or the layers are not
+a stack directory): import the new upstream tip at a fresh path, put it at
+`00-base`, and merge it into the first layer, then each layer into the one
+after it:
 
 ```text
 import_source(source=..., revision="main", into="sources/repo/00-base-2")
