@@ -436,7 +436,7 @@ echo "== an unreachable caos server is named, not waited on ==" >&2
 # a real cloud container showed. A refused port is the testable half: it proves the
 # probe runs and that its message names the server. The swallowing half is the same
 # code path with a timeout instead of a refusal.
-open_server "--server=http://127.0.0.1:9 ${CAOS_MCP_ARGS#* }"
+open_server "--server=http://127.0.0.1:9" "$CAOS_MCP_ARGS"
 send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 await '"id":1' 10 >/dev/null || fail "the handshake did not answer without a server"
 # `help` with no path, for a session: it says
