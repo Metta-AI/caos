@@ -202,7 +202,7 @@ git add generated mcp-marker
 git -c user.name=test -c user.email=test@caos commit -qm mcp-generated-tools
 session="mcp-path-$(date +%s)-$$"
 printf '{"hook_event_name":"UserPromptSubmit","session_id":"%s","prompt":"test generated tools"}\n' "$session" \
-  | "$CAOS_CLI" mcp hook $CAOS_MCP_ARGS "$(mcp_base_arg)"
+  | "$CAOS_CLI" $CAOS_MCP_SERVER mcp hook $CAOS_MCP_ARGS "$(mcp_base_arg)"
 key=$(printf 'cc/%s' "$session" | od -An -tx1 | tr -d ' \n')
 # The prompt hook recorded it on the server; fetch it.
 git fetch -q caos "+refs/caos/v4/sessions/$key/head:refs/caos/v4/sessions/$key/head"
@@ -287,7 +287,7 @@ git add slow
 git -c user.name=test -c user.email=test@caos commit -qm slow-tool
 held="mcp-held-$(date +%s)-$$"
 hook() { # <event JSON>
-  printf '%s\n' "$1" | "$CAOS_CLI" mcp hook $CAOS_MCP_ARGS "$(mcp_base_arg)"
+  printf '%s\n' "$1" | "$CAOS_CLI" $CAOS_MCP_SERVER mcp hook $CAOS_MCP_ARGS "$(mcp_base_arg)"
 }
 hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$held\",\"prompt\":\"run slow\"}"
 held_ref="refs/caos/v4/sessions/$(printf 'cc/%s' "$held" | od -An -tx1 | tr -d ' \n')/head"
