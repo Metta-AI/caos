@@ -74,7 +74,7 @@ echo "== with no server, the handshake and the list still answer, and help says 
 # slower than that from the session with no tools and no reason, and a handshake
 # that crossed an iroh relay from a cold container lost that race. Only a call
 # needs the server, and a call to a dead one must say so.
-open_server "--server=http://127.0.0.1:9 --llm-step:hash=0000000000000000000000000000000000000000"
+open_server "--server=http://127.0.0.1:9" "--llm-step:hash=0000000000000000000000000000000000000000"
 send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 init=$(await '"id":1' 10) || fail "the handshake did not answer without a server"
 for needle in 'instructions' 'help(path)' 'run(path' 'eval-path' 'caos-std'; do
