@@ -90,8 +90,8 @@ The step is named by locator, pinned to the commit the client was built from:
 checkout, so a path in one (`caos-std/llm-step`) names nothing. That locator is
 also what a `reader:@@=` grant on caos's `std/llm-step` matches (SPEC.md,
 "Secrets"). The server, the content a new session starts from, and the
-secret readers are arguments of their own (`--server`, `--base:@@=`,
-`--secret-readers`); setup computes the content locator from the checkout's
+secret readers are arguments of their own (`--server`, before `mcp` because
+it is the client's global flag; `--base:@@=` and `--secret-readers` after it); setup computes the content locator from the checkout's
 `origin` and `HEAD` when it is on GitHub, so what is not committed and pushed is
 not in the session.
 
