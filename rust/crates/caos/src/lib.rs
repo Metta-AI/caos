@@ -609,6 +609,9 @@ pub struct GitTransport {
     /// Keeping it here prevents a transport from silently switching repos if
     /// the process working directory changes after discovery.
     work_dir: PathBuf,
+    /// What git is told to push to and fetch from: the `caos` remote's name,
+    /// or the URL of a [`set_server_override`] in force when this was opened.
+    remote: String,
 }
 
 impl GitTransport {
