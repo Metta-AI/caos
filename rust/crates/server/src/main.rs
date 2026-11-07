@@ -22,6 +22,9 @@
 //!   on another stack, so a reader descends into it (`status`).
 //! * `POST /sub-run` — admit an exact detached child under an in-flight job's
 //!   existing server-side run stack and secret store.
+//! * `GET /ref?name=<ref>`, `POST /ref` — read a named mutable ref under
+//!   `refs/heads/`, or move one with a compare-and-swap (see [`mod refs`]).
+//!   `caos ref-then` waits on one, as a continuation.
 //! * `GET /eval?root:<type>=<value>[&path=<p>]` — walk `.caos-expr` from a root
 //!   down to a path and return what falls out as `"<type> <hash>"`. The root is
 //!   a TYPED argument, named by the caller as everything else in caos is:
@@ -62,6 +65,7 @@ mod import;
 mod locator;
 mod mcp;
 mod push;
+mod refs;
 mod remote_git;
 mod repair;
 mod runner;
@@ -655,6 +659,7 @@ fn env_or(key: &str, default: &str) -> String {
 }
 
 /// An error that maps cleanly onto an HTTP status code + body.
+#[derive(Debug)]
 pub(crate) struct HttpError {
     status: u16,
     message: String,
@@ -896,6 +901,10 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
             request.as_reader().read_to_end(&mut body)?;
             compute::submit(config, &body, &secrets, token.as_deref())
         }
+        // Named mutable refs under refs/heads/ (`caos ref-get` / `ref-set`):
+        // read one here, move one with a compare-and-swap below. See
+        // [`mod refs`]. Ahead of the catch-all GET, which serves /object/.
+        Method::Get if path == "/ref" => refs::get_endpoint(config, &query),
         Method::Get => match path.strip_prefix("/object/") {
             Some(hash) if !hash.is_empty() => storage::get_object(config, hash),
             _ => Err(HttpError::new(404, "not found")),
@@ -908,6 +917,11 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
             let mut body = Vec::new();
             request.as_reader().read_to_end(&mut body)?;
             storage::post_object(config, &body)
+        }
+        Method::Post if path == "/ref" => {
+            let mut body = String::new();
+            request.as_reader().read_to_string(&mut body)?;
+            refs::set_endpoint(config, &body)
         }
         Method::Post if path == "/git/import" => import::endpoint(config, request),
         Method::Post if path == "/git/push" => push::endpoint(config, request),

@@ -2,8 +2,7 @@
 # directory yields the test's ARG TREE, which dev/run-test then runs.
 #
 # A WORKER TEST. `sub-run` is a worker verb — it exists so a job can dispatch
-# work it will not wait for — and all three fixtures here were already workers.
-# The client did two things neither of which was under test: it curried and ran
-# them, which a worker does with prepare-request/run-request-then, and it polled
-# the server for an object, which `caos get-hash` does.
-curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --self:@=self.sh --delayed:@=delayed.sh --launch:@=launch.sh --settle:@=settle.sh
+# work it will not wait for — and every part here is a worker: one Go program
+# that plays the test, the self-dispatching fixture, the launcher and the
+# detached job, chosen by --role.
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go

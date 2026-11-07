@@ -4,7 +4,7 @@
 //
 // `Q = actor { state-ref, inner, request-id, message }` has two positions:
 //
-//   - start reads the branch head (`git ls-remote`, then a depth-1 `tree:0`
+//   - start reads the branch head (`caos ref-get`, then a depth-1 `tree:0`
 //     fetch of that one commit), takes the `state/` subtree oid from the head,
 //     builds the inner request and tail-calls it with Q (plus the observed head
 //     and the input state) as the callback;
@@ -16,28 +16,22 @@
 //
 // Neither position checks the state out: it travels as a tree oid.
 //
-// THE BRANCH IS MOVED WITHOUT `git push`. A push is a command line
-// "<old> <new> <ref>" plus a pack, and the pack may be empty when the server
-// already has the new object, which it does: `caos put-commit` put it there.
-// So finish POSTs that one command and an empty pack to git-receive-pack, and
-// the server does the compare-and-swap (a stale <old> is answered `ng`). No
-// scratch repository, no fetch of the parent, no history. `git push` cannot
-// do this: it resolves the new commit in a local repository and walks its
-// ancestry to build a pack, which needs every ancestor commit ("a deep
-// checkout"), and a partial clone with a promisor remote does not avoid that
-// (README.md, open question 6; tests/actor-ref proves the direct route).
+// THE BRANCH IS READ AND MOVED WITH `caos ref-get` AND `caos ref-set`, not with
+// git. `ref-set --expected=<observed head>` is a compare-and-swap the server
+// checks under the ref's lock, and the new commit is already on the server
+// (`caos put-commit` put it there), so nothing is pushed: no scratch
+// repository, no fetch of the parent, no history. `git push` cannot do this:
+// it resolves the new commit in a local repository and walks its ancestry to
+// build a pack, which needs every ancestor commit (README.md, open question
+// 6). The wrapper used to speak receive-pack directly to the same effect;
+// tests/actor-ref still proves that route works for git clients.
 package main
 
 import (
 	"bytes"
-	"crypto/sha1"
-	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"caos/w"
@@ -46,7 +40,7 @@ import (
 const (
 	stateEntry = "state"
 	noHead     = "none"
-	zeros      = "0000000000000000000000000000000000000000"
+	absent     = "absent"
 	gitDir     = "/tmp/actor-git"
 )
 
@@ -81,14 +75,26 @@ func serverURL() string {
 	return url
 }
 
+// refGet records the commit ref names at the CAS path and reports true, or
+// false if there is no such ref (`caos ref-get` exits 2 and writes nothing).
+// Any other failure ends the request.
+func refGet(ref, path string) bool {
+	cmd := exec.Command("caos", "ref-get", ref, path)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 2 {
+		return false
+	}
+	w.True(err == nil, "caos ref-get %s %s: %v: %s", ref, path, err, strings.TrimSpace(stderr.String()))
+	return true
+}
+
 // readRef is the branch's head on the server, or "" if the branch is absent.
-func readRef(ref string) string {
-	out := run("git", "ls-remote", "--refs", serverURL(), ref)
-	for _, line := range strings.Split(out, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) == 2 && fields[1] == ref {
-			return fields[0]
-		}
+// `caos ref-get` records the head at the CAS path `at`, a fresh one per read.
+func readRef(ref, at string) string {
+	if refGet(ref, at) {
+		return caos("hash", at)
 	}
 	return ""
 }
@@ -139,7 +145,7 @@ func main() {
 }
 
 func start(stateRef string) {
-	head := readRef(stateRef)
+	head := readRef(stateRef, "/cas/head")
 	statePath, stateOid := "", ""
 	if head != "" {
 		stateOid = stateOf(head)
@@ -201,83 +207,31 @@ func publish(stateRef, head, newState string) {
 
 	old := head
 	if old == "" {
-		old = zeros
+		old = absent
 	}
-	status, err := setRef(serverURL(), stateRef, old, candidate)
-	if err == nil && status == "" {
+	complaint, err := setRef(stateRef, old, "/cas/new-commit")
+	if err == nil {
 		return
 	}
 	// Ambiguous or refused: re-read the ref to learn what actually happened.
-	switch observed := readRef(stateRef); {
+	switch observed := readRef(stateRef, "/cas/observed-head"); {
 	case observed == candidate:
 		return
 	case observed == head:
-		w.True(false, "moving %s: %s %v", stateRef, status, err)
+		w.True(false, "moving %s: %v: %s", stateRef, err, complaint)
 	default:
-		w.True(false, "lost the race for %s: %s %v", stateRef, status, err)
+		w.True(false, "lost the race for %s: %v: %s", stateRef, err, complaint)
 	}
 }
 
-func pkt(s string) string { return fmt.Sprintf("%04x%s", len(s)+4, s) }
-
-// emptyPack is a valid pack holding no objects: "PACK", version 2, count 0,
-// and the SHA-1 of those twelve bytes.
-func emptyPack() []byte {
-	header := []byte("PACK\x00\x00\x00\x02\x00\x00\x00\x00")
-	sum := sha1.Sum(header)
-	return append(header, sum[:]...)
-}
-
-// setRef asks git-receive-pack to move ref from old to new, sending no objects.
-// It returns "" when the server accepted the update, else the server's
-// complaint (a stale <old> arrives as `ng <ref> <reason>`).
-func setRef(url, ref, old, new string) (string, error) {
-	var body bytes.Buffer
-	body.WriteString(pkt(fmt.Sprintf("%s %s %s\x00 report-status agent=caos-actor\n", old, new, ref)))
-	body.WriteString("0000")
-	body.Write(emptyPack())
-	req, err := http.NewRequest("POST", url+"/git-receive-pack", &body)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/x-git-receive-pack-request")
-	req.Header.Set("Accept", "application/x-git-receive-pack-result")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("git-receive-pack answered %s: %s", resp.Status, data)
-	}
-	unpacked, accepted := false, false
-	var complaint []string
-	for rest := string(data); len(rest) >= 4; {
-		n, err := strconv.ParseUint(rest[:4], 16, 16)
-		if err != nil || n < 4 && n != 0 || int(n) > len(rest) {
-			return "", fmt.Errorf("malformed report-status: %q", data)
-		}
-		if n == 0 {
-			rest = rest[4:]
-			continue
-		}
-		line := strings.TrimSpace(rest[4:n])
-		rest = rest[n:]
-		switch {
-		case line == "unpack ok":
-			unpacked = true
-		case line == "ok "+ref:
-			accepted = true
-		default:
-			complaint = append(complaint, line)
-		}
-	}
-	if unpacked && accepted && len(complaint) == 0 {
-		return "", nil
-	}
-	return strings.Join(complaint, "; "), nil
+// setRef moves ref from old to the commit recorded at the CAS path newPath
+// with a compare-and-swap, returning the server's complaint rather than
+// failing: a refusal (a stale old value) and an ambiguous outcome (the reply
+// lost) are told apart by re-reading the ref.
+func setRef(ref, old, newPath string) (string, error) {
+	cmd := exec.Command("caos", "ref-set", ref, "--new:@="+newPath, "--expected="+old)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	return strings.TrimSpace(stderr.String()), err
 }
