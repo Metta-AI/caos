@@ -1176,7 +1176,7 @@ impl GitTransport {
         // whatever actually defeated the retries, which is the only interesting
         // one (it cost a debugging session — the visible error said "reference
         // already exists" while the real failure was unknown).
-        Err(format!("pushing {hash} to {CAOS_REMOTE}: {last}"))
+        Err(format!("pushing {hash} to {}: {last}", self.remote()))
     }
 
     fn push_req_ref(&self, hash: &str) -> Result<(), String> {
