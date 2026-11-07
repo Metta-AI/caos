@@ -45,6 +45,44 @@ fn main() -> ExitCode {
     }
 }
 
+/// Consume the flags that come BEFORE the command and apply to all of them,
+/// returning argv with them removed, so every command still sees its own
+/// arguments from `args[2..]`.
+///
+/// `--server=<url>` (or `--server <url>`) names the caos server for this
+/// invocation, overriding the checkout's `caos` git remote — for every
+/// command: `caos-cli --server=caos://<ticket> watch <ticket>`. Only flags
+/// ahead of the command are global; a `--server` after it belongs to that
+/// command (`mcp`, `secrets-push` and `tui` take their own).
+fn take_global_flags(args: &[String]) -> Result<Vec<String>, String> {
+    let mut rest = args.iter().skip(1);
+    let mut server = None;
+    let mut out = vec![args.first().cloned().unwrap_or_default()];
+    while let Some(arg) = rest.next() {
+        let value = if let Some(value) = arg.strip_prefix("--server=") {
+            value.to_string()
+        } else if arg == "--server" {
+            rest.next()
+                .cloned()
+                .ok_or("--server needs a URL: --server=<url>")?
+        } else {
+            out.push(arg.clone());
+            break;
+        };
+        if server.replace(value).is_some() {
+            return Err("--server given more than once".to_string());
+        }
+    }
+    out.extend(rest.cloned());
+    if let Some(server) = server {
+        if server.starts_with('-') || server.chars().any(char::is_control) {
+            return Err(format!("invalid --server URL: {server:?}"));
+        }
+        caos::set_server_override(&server)?;
+    }
+    Ok(out)
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     match args.get(1).map(String::as_str) {
         // `run [output] --base:<type>=<image> [...]`. `[output]` is a host path
