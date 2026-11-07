@@ -189,6 +189,10 @@ pub struct TreeTool {
     /// The tool declared `@call`: bind this tool call's id as `call`. See
     /// [`Help::call`].
     pub call: bool,
+    /// The tool declared `@request-id`: an optional `request-id` parameter that
+    /// the harness fills with the tool call's id when the caller omits it. See
+    /// [`Help::request_id`].
+    pub request_id: bool,
     /// The tool declared `@scope <param>`: the SOURCE TREE it runs over, and
     /// changes if it is a writer, is the one the argument `<param>` names. See
     /// [`Help::scope`].
@@ -212,6 +216,14 @@ const IN_DOC: &str = "The tree to run over. Defaults to the source tree this \
                       tool sits in, which for a tool the session itself \
                       generated is usually not the tree you mean.";
 
+/// What `@request-id` offers the model (design/tool-contract.md, "`@request-id`").
+/// Leaving it out is the normal case: the harness fills in the call's own id.
+pub const REQUEST_ID: &str = "request-id";
+const REQUEST_ID_DOC: &str = "Leave this out: each call is then its own run, \
+                              never answered from an earlier call's cached result. \
+                              Pass a value only to share one result between calls \
+                              on purpose.";
+
 impl TreeTool {
     /// A named tool from its parsed help.
     fn new(name: &str, help: Help) -> TreeTool {
@@ -224,6 +236,14 @@ impl TreeTool {
                 ty: ArgType::Tree,
             });
         }
+        if help.request_id && !args.iter().any(|a| a.name == REQUEST_ID) {
+            args.push(TreeArg {
+                name: REQUEST_ID.to_string(),
+                doc: REQUEST_ID_DOC.to_string(),
+                required: false,
+                ty: ArgType::Text,
+            });
+        }
         TreeTool {
             name: name.to_string(),
             doc: help.doc,
@@ -232,6 +252,7 @@ impl TreeTool {
             writer: help.writer,
             wants_in: help.wants_in,
             call: help.call,
+            request_id: help.request_id,
             scope: help.scope,
             op: help.op,
         }
@@ -479,6 +500,14 @@ pub struct Help {
     /// and the call id is unique to the call yet the same when a call is
     /// recovered, so a retry gets the stored result and a new call does not.
     pub call: bool,
+    /// `@request-id`: the tool reads or changes something outside caos, so a
+    /// result must never be reused by a later call that merely has the same
+    /// arguments. It gets an optional `request-id` parameter, which the harness
+    /// fills with the tool call's id when the caller leaves it out
+    /// (design/tool-contract.md, "`@request-id`"). The call id rather than a
+    /// random value because it is just as unique and it is in the transcript.
+    /// Replaces `@call`.
+    pub request_id: bool,
     /// `@scope <param>`: the tool runs over, and a writer changes, the SOURCE
     /// TREE the argument `<param>` names (the path of a code reference in the
     /// session, such as `feature/01-change`).
@@ -531,6 +560,7 @@ fn parse_help(ctx: &str, text: &str) -> Help {
     let mut writer = false;
     let mut wants_in = false;
     let mut call = false;
+    let mut request_id = false;
     let mut scope: Option<String> = None;
     let mut op: Option<String> = None;
     let mut in_tags = false;
@@ -560,6 +590,9 @@ fn parse_help(ctx: &str, text: &str) -> Help {
         } else if trimmed == "@call" {
             in_tags = true;
             call = true;
+        } else if trimmed == "@request-id" {
+            in_tags = true;
+            request_id = true;
         } else if let Some(rest) = trimmed
             .strip_prefix("@scope")
             .filter(|rest| rest.starts_with(char::is_whitespace))
@@ -586,7 +619,7 @@ fn parse_help(ctx: &str, text: &str) -> Help {
             in_tags = true;
             eprintln!(
                 "{ctx}: unknown block tag @{tag} — ignored \
-                 (known: @param, @git, @writer, @in, @call, @scope, @op)"
+                 (known: @param, @git, @writer, @in, @call, @request-id, @scope, @op)"
             );
         } else if !in_tags {
             // Description text — everything before the first block tag.
@@ -609,6 +642,7 @@ fn parse_help(ctx: &str, text: &str) -> Help {
         writer,
         wants_in,
         call,
+        request_id,
         scope,
         op,
     }
@@ -1978,6 +2012,22 @@ mod tests {
     }
 
     #[test]
+    fn request_id_is_an_optional_parameter_offered_once() {
+        let h = parse_help("t", "Talks to GitHub.\n@param path The path.\n@request-id");
+        assert!(h.request_id);
+        let tool = TreeTool::new("t", h);
+        let offered: Vec<_> = tool.args.iter().filter(|a| a.name == REQUEST_ID).collect();
+        assert_eq!(offered.len(), 1);
+        assert!(!offered[0].required);
+        // A tool that already declared it by hand is not offered it twice.
+        let h = parse_help("t", "d\n@param [request-id] Its own words.\n@request-id");
+        let tool = TreeTool::new("t", h);
+        assert_eq!(tool.args.len(), 1);
+        assert_eq!(tool.args[0].doc, "Its own words.");
+        assert!(!parse_help("t", "d\n@param path The path.").request_id);
+    }
+
+    #[test]
     fn a_tag_this_parser_cannot_act_on_is_never_absorbed() {
         // A misspelled `@writer` must not leave a writer silently read-only:
         // the proposal would be discarded as a value and the edit would just
@@ -2288,6 +2338,7 @@ mod tests {
             writer: false,
             wants_in: false,
             call: false,
+            request_id: false,
             scope: None,
             op: None,
         };
@@ -2310,6 +2361,7 @@ mod tests {
             writer: false,
             wants_in: false,
             call: false,
+            request_id: false,
             scope: None,
             op: None,
         };
@@ -2343,6 +2395,7 @@ mod tests {
             writer: false,
             wants_in: false,
             call: false,
+            request_id: false,
             scope: None,
             op: None,
         };
