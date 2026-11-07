@@ -374,7 +374,19 @@ func mcpServers(a args, locator string) map[string]any {
 	// EACH ITS OWN ARGV ELEMENT. Appended to the locator's string they are a
 	// single argument (`--llm-step:@@=… --server=…`), which the client reads as
 	// one flag with a nonsense value.
-	list, _ := caos["args"].([]any)
+	// The server's placeholder is an element of its own, ahead of `mcp`, and
+	// becomes the global flags: one argument, or none.
+	var list []any
+	given, _ := caos["args"].([]any)
+	for _, item := range given {
+		if item == sharedServer {
+			for _, global := range serverArgs(a) {
+				list = append(list, global)
+			}
+			continue
+		}
+		list = append(list, item)
+	}
 	for _, extra := range sharedArgs(a) {
 		list = append(list, extra)
 	}
