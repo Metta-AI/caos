@@ -149,7 +149,8 @@ git add -A && git commit -qm testtree
 # THE ARGUMENTS `caos mcp` TAKES, for a test that drives it. `caos mcp` reads no
 # checkout: it is told the server, the step and (for a session's first prompt)
 # where its content comes from, all by name. Set only for a test that carries
-# DEEP-DEPS/llm-step.
+# DEEP-DEPS/llm-step. The server is the client's GLOBAL flag, so it is its own
+# variable and goes BEFORE `mcp`: `"$CAOS_CLI" $CAOS_MCP_SERVER mcp hook $CAOS_MCP_ARGS`.
 #
 # THE STEP IS A HASH, not a path: a path names a file in a checkout. Evaluating it
 # here is the client's own `eval-path`, the same walk `:@=` does.
