@@ -34,7 +34,7 @@ commits. They are written to into as one folder of gitlinks, replacing what a
 previous run wrote there. Refused, naming both, unless each layer's commit
 contains the one before it (or onto): merge a changed lower layer up first.
 
-Then publish_source each <into>/<layer>, bottom to top, with force=true.
+Then caos-std/publish-source each <into>/<layer>, bottom to top, with force=true and expected (the head you read).
 @param plan Path of the plan file, relative to root, e.g. `mystack.plan`.
 @writer
 @root

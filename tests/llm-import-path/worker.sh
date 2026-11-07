@@ -25,7 +25,7 @@ cat > /tmp/stub/response-2.json <<'JSON'
 {"content":[{"type":"tool_use","id":"help","name":"tool_help","input":{"path":"tools/import-source"}},{"type":"tool_use","id":"import","name":"run_tool","input":{"path":"tools/import-source","arguments":{"root":"imports/hello","source":"https://github.com/octocat/Hello-World.git","into":"base"}}}],"stop_reason":"tool_use"}
 JSON
 cat > /tmp/stub/response-3.json <<'JSON'
-{"content":[{"type":"tool_use","id":"read","name":"read","input":{"file-path":"imports/hello/base/README"}},{"type":"tool_use","id":"occupied","name":"run_tool","input":{"path":"tools/import-source","arguments":{"root":"imports/hello","source":"https://github.com/octocat/Hello-World.git","into":"base"}}},{"type":"tool_use","id":"stray","name":"run_tool","input":{"path":"tools/import-source","arguments":{"root":"imports","source":"https://github.com/octocat/Hello-World.git","into":"other","branch":"main"}}}],"stop_reason":"tool_use"}
+{"content":[{"type":"tool_use","id":"read","name":"read","input":{"file-path":"imports/hello/base/README"}},{"type":"tool_use","id":"occupied","name":"run_tool","input":{"path":"tools/import-source","arguments":{"root":"imports/hello","source":"https://github.com/octocat/Hello-World.git","into":"base"}}},{"type":"tool_use","id":"stray","name":"run_tool","input":{"path":"tools/import-source","arguments":{"root":"imports","source":"https://github.com/octocat/Hello-World.git","into":"other","branch":"main"}}},{"type":"tool_use","id":"local","name":"run_tool","input":{"path":"tools/import-source","arguments":{"root":"imports","source":"/tmp/repo","into":"local"}}},{"type":"tool_use","id":"missing","name":"run_tool","input":{"path":"tools/import-source","arguments":{"root":"imports","source":"https://github.com/octocat/Hello-World.git","revision":"refs/heads/caos-nonexistent-import-fixture","into":"missing"}}}],"stop_reason":"tool_use"}
 JSON
 printf '%s\n' '{"content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}' > /tmp/stub/response-4.json
 start_stub /tmp/stub
@@ -47,9 +47,14 @@ grep -q "into" /tmp/help.text || fail "tool_help did not describe the entry: $(c
 grep -q "Unused name inside root" /tmp/help.text || fail "tool_help lost the parameter docs: $(cat /tmp/help.text)"
 grep -qF 'Hello World!' /tmp/stub/request-4.json || fail "the read could not see the imported blob"
 
-# Mistakes are values the model can act on: a taken path, and an argument the operation
-# does not declare, each a single error result.
-for call in occupied stray; do
+# The import is reached only by path: llm-step registers no import tool of its own.
+jq -e '.tools | any(.name == "import_source") | not' /tmp/stub/request-1.json >/dev/null \
+  || fail "the session still offers the built-in import_source"
+
+# Mistakes are values the model can act on: a taken path, an argument the operation
+# does not declare, a source that is not an HTTPS repository, and a revision the
+# remote does not have, each a single error result.
+for call in occupied stray local missing; do
   jq -e --arg id "$call" '[.messages[].content | select(type == "array") | .[] | select(.type == "tool_result" and .tool_use_id == $id)] | length == 1 and .[0].is_error == true' /tmp/stub/request-4.json >/dev/null \
     || fail "$call did not yield one error result"
 done

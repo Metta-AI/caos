@@ -1,10 +1,5 @@
-//! Read-only history tools over the existing Git store.
-//!
-//! These declared `@git` and it did nothing: that tag binds `wc`/`refs` for a
-//! DISPATCHED tool, and these run IN-PROCESS against the session's own
-//! store (`execute` takes it directly). `parsed_declarations_are_byte_identical`
-//! is the proof that dropping it changed nothing — a flag tag contributes
-//! neither description nor parameters.
+//! Read-only history tools over the existing Git store. They run IN-PROCESS
+//! against the session's own store (`execute` takes it directly).
 
 use session_protocol::v3::git_store::HistoryQuery;
 use session_protocol::v3::{GitStore, ObjectStore, Oid};

@@ -11,14 +11,8 @@
 //! the session.
 
 mod async_work;
-mod ci_status;
 mod githist;
-mod import_source;
 mod progress;
-mod publish_source;
-mod stack_merge_to_master;
-mod stack_publish;
-mod stack_sync;
 mod record;
 mod root;
 mod source_trees;
@@ -1092,12 +1086,6 @@ fn run_op(
     started: Option<&CallRecord>,
 ) -> Result<bool, String> {
     match (op, started) {
-        ("import-source", _) => import_source::execute(state, site).map(|()| true),
-        ("publish-source", _) => publish_source::execute(state, site).map(|()| true),
-        ("stack-publish", _) => stack_publish::execute(state, site).map(|()| true),
-        ("stack-sync", _) => stack_sync::execute(state, site).map(|()| true),
-        ("stack-merge-to-master", _) => stack_merge_to_master::execute(state, site).map(|()| true),
-        ("ci-status", _) => ci_status::execute(state, site).map(|()| true),
         ("agent-spawn", _) => spawn_agent_call(cfg, state, site),
         ("agent-harvest", _) => harvest_agent_call(state, site).map(|()| true),
         ("run-async", _) => run_async_call(cfg, state, site).map(|()| true),
@@ -1190,14 +1178,6 @@ fn drive_call(
     }
     if call.name == subagents::HARVEST_TOOL {
         harvest_agent_call(state, &site)?;
-        return Ok(true);
-    }
-    if call.name == "publish_source" {
-        publish_source::execute(state, &site)?;
-        return Ok(true);
-    }
-    if call.name == "import_source" {
-        import_source::execute(state, &site)?;
         return Ok(true);
     }
     if call.name == async_work::TOOL_NAME {
@@ -1580,36 +1560,6 @@ fn prepare_grep(cfg: &Config, call: &Value, ws: &str) -> Result<Prepared, String
 /// there is one only when the tool asked for it — the tree is the biggest thing
 /// that can enter an ArgTree, and the ArgTree is the cache key
 /// (SPEC, "CaosTools" — Receiving args).
-/// Split the bound arguments into the ones that ride on the TOOL'S CURRY and
-/// the tree bound as the REQUEST's `in`.
-///
-/// `in` is bound in exactly ONE place whichever side supplied it — the
-/// request — because `caos curry` refuses a rebind, and binding the caller's
-/// tree in the curry while the request bound the default would be exactly
-/// that. So the caller's `in` is lifted out of the curry args here.
-///
-/// With no `in` supplied, the default is the tree the tool's own path selected,
-/// and only for a tool that declared `@in`.
-type Bindings<'a> = Vec<(&'a str, Arg<'a>)>;
-
-fn split_input<'a>(
-    ready: &'a [(String, tools::ReadyArg)],
-    wants_in: bool,
-    ws: &'a str,
-) -> (Bindings<'a>, Bindings<'a>) {
-    let args = ready
-        .iter()
-        .filter(|(name, _)| name != "in")
-        .map(|(name, value)| (name.as_str(), value.arg()))
-        .collect();
-    let input = match ready.iter().find(|(name, _)| name == "in") {
-        Some((_, supplied)) => vec![("in", supplied.arg())],
-        None if wants_in => vec![("in", Arg::Path(ws))],
-        None => Vec::new(),
-    };
-    (args, input)
-}
-
 fn prepared_request(
     image: &str,
     args: &[(&str, Arg<'_>)],
@@ -1667,7 +1617,6 @@ fn launch_resolved_tool(
         )?;
         return resume(cfg, state, turn);
     }
-    let (ws, wc) = materialize_source_tree(state, &commit)?;
     let relative = read_arg("tool-lookup")?;
     let image = arg("result");
     let site = CallSite::at(&turn.request, &call, &current.message_id);
@@ -1706,37 +1655,10 @@ fn launch_resolved_tool(
     if tool.root {
         return launch_root_tool(cfg, state, turn, &call, &tool, &image, &current.message_id);
     }
+    // A tool without `@root` reads nothing of the session: its arguments are its
+    // whole input (design/tool-contract.md, "Tags").
     let nested = json!({"id": id, "input":
         call.input.get("arguments").cloned().unwrap_or_else(|| json!({}))});
-    // A tool that declares `@scope <param>` runs over, and a writer changes, the
-    // source tree its argument names, not the one its path happens to sit in:
-    // `merge` is reached at `caos-std/merge` and advances `feature/01-change`.
-    let selected = tool
-        .scope
-        .as_deref()
-        .and_then(|param| nested["input"][param].as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let (name, commit, ws, wc) = match selected {
-        None => (name, commit, ws, wc),
-        Some(selected) => match source_tree_target(&state.session()?, Some(selected)) {
-            Ok(Some((scoped, scoped_commit))) => {
-                let (scoped_ws, scoped_wc) = materialize_source_tree(state, &scoped_commit)?;
-                (Some(scoped), scoped_commit, scoped_ws, scoped_wc)
-            }
-            Ok(None) | Err(_) => {
-                let why = source_tree_target(&state.session()?, Some(selected))
-                    .err()
-                    .unwrap_or_else(|| format!("unknown source tree {selected:?}"));
-                site.failed(
-                    state,
-                    &error_block(id, &why),
-                    name.map(|name| (name, commit)),
-                )?;
-                return resume(cfg, state, turn);
-            }
-        },
-    };
     let session = state.session()?.tree().clone();
     let bound = match tools::tree_tool_args(&nested, &tool, Some(session.as_str())) {
         Ok(bound) => bound,
@@ -1753,17 +1675,10 @@ fn launch_resolved_tool(
         .iter()
         .map(|(key, value)| Ok((key.clone(), value.ready()?)))
         .collect::<Result<_, String>>()?;
-    let (args, input) = split_input(&ready, tool.wants_in, ws.as_str());
-    let mut args = args;
-    if tool.git {
-        args.push(("wc", Arg::Path(&wc)));
-        if let Some(refs) = cfg.merge_refs.as_deref() {
-            args.push(("refs", Arg::Lit(refs)));
-        }
-    }
-    if tool.call {
-        args.push(("call", Arg::Lit(&call.id)));
-    }
+    let mut args: Vec<(&str, Arg)> = ready
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.arg()))
+        .collect();
     // `@request-id` the caller left out: the call's own id, so this call is its
     // own run and the transcript says which key it used.
     if tool.request_id && !args.iter().any(|(name, _)| *name == tools::REQUEST_ID) {
@@ -1771,7 +1686,7 @@ fn launch_resolved_tool(
     }
     let task = (|| {
         let curried = caos_curry(Arg::Hash(&tool_tree), &args)?;
-        let task_text = prepare_request(Arg::Hash(&curried), &input)?;
+        let task_text = prepare_request(Arg::Hash(&curried), &[])?;
         Oid::parse(&task_text, "tree tool task")
     })();
     let task = match task {
@@ -1882,9 +1797,6 @@ fn launch_root_tool(
     if let Some((_, oid)) = &object {
         caos(["get-hash", oid.as_str(), &materialized])?;
         args.push((tools::ROOT, Arg::Path(&materialized)));
-    }
-    if tool.call {
-        args.push(("call", Arg::Lit(id)));
     }
     if tool.request_id && !args.iter().any(|(name, _)| *name == tools::REQUEST_ID) {
         args.push((tools::REQUEST_ID, Arg::Lit(id)));
@@ -3352,15 +3264,6 @@ fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
     // Everything below implements no entry and has no path, so declaring it here
     // is the only way to reach it at all.
     let mut registry = tools::declarations();
-    let mut publish = with_source_tree(tools::tree_tool_declaration(&tools::builtin_tool(
-        "publish_source",
-        publish_source::HELP,
-    )));
-    // Help types are what a curried arg can carry, which has no boolean; this
-    // built-in reads its input as JSON, so it can take a real one.
-    publish["input_schema"]["properties"]["force"]["type"] = json!("boolean");
-    publish["input_schema"]["properties"]["allow_ignored"]["type"] = json!("boolean");
-    registry.push(publish);
     if cfg.run_and_update_ref_image.is_some() {
         registry.extend(subagents::declarations());
         registry.push(async_work::declaration());
@@ -4773,263 +4676,6 @@ mod tests {
                 return Err("lost acknowledgment".into());
             }
             Ok(())
-        }
-    }
-
-    #[test]
-    fn import_pin_survives_lost_ack_restart_and_a_competing_observation() {
-        for competing in [false, true] {
-            let args = json!({"source":"https://example.com/repo.git","revision":"main","into":"imports/base"});
-            let golden = golden_with_first("import_source", args.clone()).unwrap();
-            let call = Call {
-                id: "first".into(),
-                name: "import_source".into(),
-                input: args,
-            };
-            let site = CallSite::at(&golden.request, &call, ASSISTANT_ID);
-            let first = json!({"commit":"a".repeat(40)});
-            let second = json!({"commit":"b".repeat(40)});
-            let mut record = site.stub(None);
-            record.status = CallStatus::Started;
-            let race = competing.then(|| Transition::ToolStart {
-                record,
-                payloads: vec![(
-                    "import.json".into(),
-                    canonical_payload_bytes(&second).unwrap(),
-                )],
-            });
-            let store = ImportStore {
-                objects: golden.store,
-                head: golden.head.clone(),
-                race,
-                lost_ack: true,
-            };
-            let mut state = progress::State::from_store(
-                store,
-                "refs/conversations/session/head".into(),
-                golden.head,
-            )
-            .unwrap();
-            let expected = if competing { &second } else { &first };
-            assert_eq!(
-                import_source::pin(&mut state, &site, &first)
-                    .unwrap()
-                    .as_ref(),
-                Some(expected)
-            );
-            let head = state.head().clone();
-            // Reloading from the persisted head must preserve the first winning observation.
-            state.reload().unwrap();
-            assert_eq!(
-                import_source::pin(&mut state, &site, &json!({"commit":"c".repeat(40)}))
-                    .unwrap()
-                    .as_ref(),
-                Some(expected)
-            );
-            assert_eq!(*state.head(), head);
-            assert!(state
-                .session()
-                .unwrap()
-                .source_trees()
-                .unwrap()
-                .is_empty());
-            let imported = Oid::parse(expected["commit"].as_str().unwrap(), "import").unwrap();
-            import_source::attach(&mut state, &site, "imports/base", &imported, expected).unwrap();
-            assert!(import_source::pin(&mut state, &site, &first)
-                .unwrap()
-                .is_none());
-        }
-    }
-
-    #[test]
-    fn publication_pin_keeps_commit_and_lease_across_source_edits_and_restart() {
-        use session_protocol::v3::{Descriptor, PublicationRecord, PublicationStatus};
-        for rejected in [false, true] {
-            let args = json!({"source_tree":"feature/lower","repository":"https://example.com/repo.git","branch":"topic"});
-            let golden = golden_with_first("publish_source", args.clone()).unwrap();
-            let call = Call {
-                id: "first".into(),
-                name: "publish_source".into(),
-                input: args,
-            };
-            let site = CallSite::at(&golden.request, &call, ASSISTANT_ID);
-            let store = ImportStore {
-                objects: golden.store,
-                head: golden.head.clone(),
-                race: None,
-                lost_ack: true,
-            };
-            let mut state = progress::State::from_store(
-                store,
-                "refs/conversations/session/head".into(),
-                golden.head,
-            )
-            .unwrap();
-            let commit = Oid::parse(&"a".repeat(40), "source").unwrap();
-            let old = Oid::parse(&"b".repeat(40), "old").unwrap();
-            let descriptor = Descriptor {
-                source_base: old.clone(),
-                source_head: commit.clone(),
-                target_base: old.clone(),
-                policy: "preserve".into(),
-                implementation: "caos/server-push".into(),
-                commit_policy: "preserve".into(),
-            };
-            let session = state.session().unwrap().identity().unwrap().id;
-            let key = publish_source::invocation(&session, &site).unwrap()[..32].to_string();
-            let id = ids::publication_id(
-                &session,
-                &key,
-                &ids::projection_id(&descriptor.to_value()).unwrap(),
-                &commit,
-                "https://example.com/repo.git",
-                "refs/heads/topic",
-                Some(&old),
-            )
-            .unwrap();
-            let pending = PublicationRecord {
-                id,
-                key,
-                descriptor,
-                planned_head: commit.clone(),
-                expected_old: Some(old.clone()),
-                repository: "https://example.com/repo.git".into(),
-                refname: "refs/heads/topic".into(),
-                source_tree_name: "feature/lower".into(),
-                status: PublicationStatus::Pending,
-                evidence: None,
-                observed: None,
-            };
-            let saved = publish_source::pin(&mut state, &site, &pending)
-                .unwrap()
-                .unwrap();
-            assert_eq!(saved, pending);
-            let newer = Oid::parse(&"c".repeat(40), "newer source").unwrap();
-            state
-                .append(Transition::FilesApply {
-                    files: vec![(
-                        "feature/lower".into(),
-                        Some((Mode::Commit, newer.encode_line())),
-                    )],
-                })
-                .unwrap();
-            state.reload().unwrap();
-            let mut competing = pending.clone();
-            competing.planned_head = newer.clone();
-            competing.expected_old = None;
-            let recovered = publish_source::pin(&mut state, &site, &competing)
-                .unwrap()
-                .unwrap();
-            assert_eq!(recovered, pending);
-            let outcome = if rejected {
-                publish_source::reconcile(
-                    &recovered,
-                    session_protocol::v3::publication::Outcome::new(
-                        PublicationStatus::Conflict,
-                        "validation-rejected",
-                        Some("Source contains ignored files".into()),
-                        None,
-                    ),
-                    || panic!("validation rejection must not observe the remote"),
-                )
-            } else {
-                // Git may resend after a lost acknowledgment and report a
-                // rejected old value even though its first push succeeded.
-                publish_source::reconcile(
-                    &recovered,
-                    session_protocol::v3::publication::Outcome::new(
-                        PublicationStatus::Conflict,
-                        "lease-rejected",
-                        None,
-                        None,
-                    ),
-                    || Ok(Some(commit.clone())),
-                )
-            };
-            publish_source::finish(&mut state, &site, &pending, Some(outcome)).unwrap();
-            let view = state.session().unwrap();
-            assert_eq!(
-                view.source_tree("feature/lower").unwrap().unwrap().commit,
-                newer
-            );
-            let receipt = view.publication(&pending.id).unwrap().unwrap();
-            assert_eq!(
-                receipt.status,
-                if rejected {
-                    PublicationStatus::Conflict
-                } else {
-                    PublicationStatus::Complete
-                }
-            );
-            assert_eq!(receipt.planned_head, commit);
-            assert_eq!(receipt.expected_old, Some(old));
-            assert!(publish_source::pin(&mut state, &site, &competing)
-                .unwrap()
-                .is_none());
-        }
-    }
-
-    #[test]
-    fn import_attachment_is_atomic_replayable_and_does_not_overwrite() {
-        for race_path in [
-            None,
-            Some("imports/base"),
-            Some("imports/base.source.json"),
-            Some("imports"),
-        ] {
-            let args = json!({"source":"https://example.com/repo.git","into":"imports/base"});
-            let golden = golden_with_first("import_source", args.clone()).unwrap();
-            let imported = Oid::parse(&"b".repeat(40), "import").unwrap();
-            let race = race_path.map(|path| Transition::FilesApply {
-                files: vec![(path.to_string(), Some((Mode::Blob, b"keep".to_vec())))],
-            });
-            let store = ImportStore {
-                objects: golden.store,
-                head: golden.head.clone(),
-                race,
-                lost_ack: true,
-            };
-            let mut state = progress::State::from_store(
-                store,
-                "refs/conversations/session/head".into(),
-                golden.head,
-            )
-            .unwrap();
-            assert!(state
-                .session()
-                .unwrap()
-                .source_trees()
-                .unwrap()
-                .is_empty());
-            let call = Call {
-                id: "first".into(),
-                name: "import_source".into(),
-                input: args,
-            };
-            let site = CallSite::at(&golden.request, &call, ASSISTANT_ID);
-            let provenance = json!({"repository":"https://example.com/repo.git","commit":imported});
-            import_source::attach(&mut state, &site, "imports/base", &imported, &provenance)
-                .unwrap();
-            let head = state.head().clone();
-            import_source::attach(&mut state, &site, "imports/base", &imported, &provenance)
-                .unwrap();
-            assert_eq!(*state.head(), head, "replay added another transition");
-            let view = state.session().unwrap();
-            let record = view.tool("first").unwrap().unwrap();
-            let block: Value =
-                serde_json::from_slice(&view.payload(&observation_path(&record)).unwrap()).unwrap();
-            if let Some(path) = race_path {
-                assert_eq!(view.snapshot().read(path).unwrap().unwrap(), b"keep");
-                assert_eq!(block["is_error"], true);
-                assert!(record.files.is_empty());
-            } else {
-                assert_eq!(
-                    view.source_tree("imports/base").unwrap().unwrap().commit,
-                    imported
-                );
-                assert!(view.snapshot().exists("imports/base.source.json").unwrap());
-                assert_eq!(record.files.len(), 2);
-            }
         }
     }
 }

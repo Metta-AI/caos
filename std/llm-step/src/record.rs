@@ -200,8 +200,8 @@ fn mint_prompt(
 /// The commit a content locator names, in `store` with its history. The server
 /// is asked first: a `git+caos://` locator names it, and any commit a
 /// session was made from before is still there. Otherwise the commit is
-/// fetched from the repository the locator names, with the GitHub token the
-/// `import-source` tool would use, and the push that follows carries its history
+/// fetched from the repository the locator names, with the mounted GitHub
+/// token for a github.com URL, and the push that follows carries its history
 /// to the server. A locator pins its commit, so the answer is the rev it names.
 fn content_commit(store: &GitStore, locator: &str) -> Result<Oid, String> {
     let parsed = git_locator::parse_git_ref(locator)?;
@@ -219,7 +219,7 @@ fn content_commit(store: &GitStore, locator: &str) -> Result<Oid, String> {
         ));
     }
     let url = parsed.fetch_url();
-    let token = crate::import_source::token_file(&url)
+    let token = github_token_file(&url)
         .map(std::fs::read_to_string)
         .transpose()
         .map_err(|_| "reading the GitHub token".to_string())?;
@@ -227,6 +227,16 @@ fn content_commit(store: &GitStore, locator: &str) -> Result<Oid, String> {
         .fetch_commit_from(&url, &commit, token.as_deref().map(str::trim_end))
         .map_err(|error| format!("fetching {locator}: {error}"))?;
     Ok(commit)
+}
+
+/// The mounted GitHub token, offered only to a github.com URL: it is a GitHub
+/// credential, not one for every HTTPS repository a locator can name.
+fn github_token_file(url: &str) -> Option<&'static str> {
+    const TOKEN: &str = "/secret/github-token";
+    let github = git_locator::import::remote(url).is_ok_and(|(host, _)| {
+        host.eq_ignore_ascii_case("github.com") || host.eq_ignore_ascii_case("github.com:443")
+    });
+    (github && std::path::Path::new(TOKEN).exists()).then_some(TOKEN)
 }
 
 /// The tree a session's content was seeded from: its root's tree, found by
