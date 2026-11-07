@@ -210,10 +210,10 @@ Bottom to top:
    is imported and becomes `00-base`; `00-base.source.json` gets the new commit
    and observation time.
 2. **Each layer**, in name order. A described layer has a branch; its remote
-   head R is read. Unless R is the layer's tip, R is imported before anything
-   reads it, when the session's store does not hold it: a commit someone else
-   pushed is on GitHub but not in the server's store, and fetching it from the
-   server fails ("not our ref"). The agent never imports R itself.
+   head R is read. Every R the stack does not already hold is imported before
+   anything reads it: a commit someone else pushed is on GitHub but not in the
+   server's store, and reading it from there fails ("not our ref"). The agent
+   never imports the trunk or R itself before a sync.
    - R absent: not published yet. R equal to the layer's tip: in sync. R an
      ancestor of the tip: local edits are ahead, and publishing will
      fast-forward. Nothing to do in any of these.
