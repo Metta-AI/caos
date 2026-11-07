@@ -561,6 +561,35 @@ pub fn check_server_reachable(url: &str) -> Result<(), String> {
 /// caos <url>`). Push/fetch use it.
 pub const CAOS_REMOTE: &str = "caos";
 
+/// A server URL that replaces the `caos` remote for this whole process: what
+/// `caos-cli --server=<url> <command> ...` sets, before any transport exists.
+///
+/// Process-wide rather than threaded through each command, because the flag
+/// applies to every command and transports are opened in many places (the
+/// tui, its launcher, `secrets-push`), each by discovering the checkout. A
+/// transport reads it once, when it is opened ([`GitTransport::discover`]).
+static SERVER_OVERRIDE: OnceLock<String> = OnceLock::new();
+
+/// Make every transport this process opens talk to `url` instead of the
+/// checkout's `caos` remote. Git takes a URL wherever it takes a remote name,
+/// and every push, fetch and `ls-remote` names its refspecs explicitly, so the
+/// URL stands in for the remote with no configuration written to the repo.
+/// Set once; a second call is an error rather than a silent switch.
+pub fn set_server_override(url: &str) -> Result<(), String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("--server needs a URL".to_string());
+    }
+    SERVER_OVERRIDE
+        .set(url.to_string())
+        .map_err(|_| "the server is already set for this process".to_string())
+}
+
+/// The override [`set_server_override`] installed, if any.
+pub fn server_override() -> Option<&'static str> {
+    SERVER_OVERRIDE.get().map(String::as_str)
+}
+
 /// Transport over the server as a `caos` git remote, used by `caos-cli`. Objects
 /// are built in the local working repo (cheap, in-process via gix) and exchanged
 /// with the server by negotiated git push/fetch — so a large unchanged tree costs
