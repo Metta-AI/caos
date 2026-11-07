@@ -99,7 +99,7 @@ esac
 close_server
 
 echo "== the real step: the same five tools, and none of the old registry ==" >&2
-open_server "$CAOS_MCP_ARGS"
+open_server "$CAOS_MCP_SERVER" "$CAOS_MCP_ARGS"
 send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 init=$(await '"id":1' 10) || fail "the handshake did not answer"
 # The instructions are how the model learns what to do with five tools and no
