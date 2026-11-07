@@ -113,8 +113,10 @@ it fast-forwards the branch; the PR follows.
   observes the remote again, so importing the same branch at a fresh path gives
   you its new tip. Public repositories need no token.
 - The destination path and its `.source.json` sibling must both be unused.
-  To import a newer tip while `00-base` exists, import it at a fresh path such
-  as `sources/<repo>/00-base-2` (see "Updating the base").
+  To bring a stack's `00-base` to a newer tip, run `caos-std/stack-sync`,
+  which fetches the trunk and every layer's branch itself (see "Updating the
+  base"); do not import first. Import a newer tip at a fresh path such as
+  `sources/<repo>/00-base-2` only for a source tree that is not a stack.
 - Read the imported repo's own `AGENTS.md` / `CLAUDE.md` before editing: they
   govern that code.
 - The commits inside a branch do not matter, only its net diff: branches are
@@ -224,17 +226,22 @@ trunk's head at `00-base`, adopts a branch GitHub rewrote with the same
 content (merging a stacked PR rebases the branches above it) under the layer's
 local edits, merges in a branch someone else pushed to, restacks each layer
 onto the one below, and reports a layer whose PR was merged (removing it with
-`remove-merged=true`). It pushes nothing: run `stack-publish` after it, and
-every push is a fast-forward. A merge conflict stops it at that layer and names
-the `merge` call that gives you a ledger to resolve.
+`remove-merged=true`). It fetches every remote commit it needs itself, the
+trunk's new head and commits someone else pushed to a layer's branch, so do
+not run `caos-std/import-source` on the trunk or a branch before running it: start with
+`stack-sync`. It pushes nothing: run `stack-publish` after it, and every push
+is a fast-forward. A merge conflict stops it at that layer and names the
+`merge` call that gives you a ledger to resolve.
 
 ```text
 run_tool(path="caos-std/stack-sync", arguments={"root": "sources/repo"})
 run_tool(path="caos-std/stack-publish", arguments={"root": "sources/repo"})
 ```
 
-By hand: import the new upstream tip at a fresh path, put it at `00-base`, and
-merge it into the first layer, then each layer into the one after it:
+By hand, only where `stack-sync` cannot run (it refuses, or the layers are not
+a stack directory): import the new upstream tip at a fresh path, put it at
+`00-base`, and merge it into the first layer, then each layer into the one
+after it:
 
 ```text
 run_tool(path="caos-std/import-source", arguments={"root": "sources/repo",
