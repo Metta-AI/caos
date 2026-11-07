@@ -267,14 +267,20 @@ func stepLocator(a args) string {
 	return "--llm-step:@@=github:" + a.repo + "?rev=" + a.commit + "&dir=std/llm-step"
 }
 
-// What every `caos mcp` process is told beyond the step, each as its own argument:
-// the server, where a new session's content comes from, and the secret
+// The client's global flags, which go BEFORE `mcp`: the server, when one is
+// named. Each its own argument.
+func serverArgs(a args) []string {
+	if a.server == "" {
+		return nil
+	}
+	return []string{"--server=" + a.server}
+}
+
+// What every `caos mcp` process is told after `mcp` beyond the step, each as its
+// own argument: where a new session's content comes from, and the secret
 // readers it presents. None of it is read from the checkout.
 func sharedArgs(a args) []string {
 	var list []string
-	if a.server != "" {
-		list = append(list, "--server="+a.server)
-	}
 	if a.content != "" {
 		list = append(list, "--base:@@="+a.content)
 	}
