@@ -1436,10 +1436,10 @@ impl GitTransport {
             "fetch",
             "--quiet",
             "--no-write-fetch-head",
-            CAOS_REMOTE,
+            self.remote(),
             hash,
         ])
-        .map_err(|e| format!("fetching {hash} from {CAOS_REMOTE}: {e}"))
+        .map_err(|e| format!("fetching {hash} from {}: {e}", self.remote()))
     }
 
     /// Fetch object `hash` like [`Self::fetch_object`], but negotiate with `tip`
