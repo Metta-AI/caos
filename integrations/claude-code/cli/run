@@ -49,7 +49,9 @@ if [ -z "$step" ]; then
     fi
     step="git+caos://local?rev=${dev_sha}&dir=std/llm-step"
 fi
-mcp_args=("--server=$server" "--llm-step:@@=$step")
+# The server is the client's global flag and goes BEFORE `mcp`; the rest after.
+server_args=("--server=$server")
+mcp_args=("--llm-step:@@=$step")
 if [ -n "${CAOS_BASE:-}" ]; then
     mcp_args+=("--base:@@=$CAOS_BASE")
 fi
@@ -62,17 +64,24 @@ if ! command -v jq >/dev/null 2>&1; then
     exit 1
 fi
 placeholder="CAOS_MCP_ARGS_HERE"
+server_placeholder="CAOS_SERVER_ARG_HERE"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 quoted=""
 for argument in "${mcp_args[@]}"; do
     quoted+=" '${argument}'"
 done
+quoted_server=""
+for argument in "${server_args[@]}"; do
+    quoted_server+=" '${argument}'"
+done
 jq --arg quoted "${quoted# }" --arg p "$placeholder" \
-    'walk(if type == "string" then sub($p; $quoted) else . end)' \
+    --arg server "${quoted_server# }" --arg sp "$server_placeholder" \
+    'walk(if type == "string" then sub($sp; $server) | sub($p; $quoted) else . end)' \
     "$here/../shared/settings.json" > "$work/settings.json"
 jq --argjson given "$(printf '%s\n' "${mcp_args[@]}" | jq -R . | jq -s .)" --arg p "$placeholder" \
-    '.mcpServers.caos.args |= map(if . == $p then $given[] else . end)' \
+    --argjson server "$(printf '%s\n' "${server_args[@]}" | jq -R . | jq -s .)" --arg sp "$server_placeholder" \
+    '.mcpServers.caos.args |= map(if . == $p then $given[] elif . == $sp then $server[] else . end)' \
     "$here/../shared/mcp.json" > "$work/mcp.json"
 mcp_config="$work/mcp.json"
 

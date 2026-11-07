@@ -10,16 +10,17 @@ replay `caos tui` performs for a session it started itself
 Two commands make that work:
 
 ```text
-caos mcp hook     record one Claude Code hook payload (JSON on stdin)
-caos mcp serve    a stdio bridge to the server's tool server (POST /mcp)
+caos --server=<url> mcp hook     record one Claude Code hook payload (JSON on stdin)
+caos --server=<url> mcp serve    a stdio bridge to the server's tool server (POST /mcp)
 ```
 
 Both are told, by argument, everything they need. **Neither reads a checkout.** A
 process has no repository to be standing in, and a path (`--llm-step:@=std/llm-step`)
-is refused by name because it would name a file in one:
+is refused by name because it would name a file in one. The server is the
+client's GLOBAL flag, so it comes before `mcp`; a `--server` after `mcp` is
+refused with the form that works. The rest come after `mcp`:
 
 ```text
---server=<url>                the caos server
 --llm-step:@@=<git locator>   the step that runs the tools, pinned: git+…?rev=<40 hex>&dir=std/llm-step
 --base:@@=<git locator>       what a NEW session starts from (the hook; optional)
 --secret-readers=<key …>      the secret reader keys this process presents (else the checkout's git config)
@@ -143,11 +144,12 @@ absolute path from its own location and has no such constraint.
 
 `settings.json` points every hook at `caos mcp hook` (and denies the GitHub tools caos covers, below).
 `mcp.json` declares the tool server.
-Both carry the placeholder `CAOS_MCP_ARGS_HERE` where those arguments go: `run`
-fills it from `CAOS_SERVER_URL`, `CAOS_STEP` (by default the server's own
-`refs/caos/dev`) and `CAOS_BASE`, and the cloud installer fills it with the
-server, a step locator pinned to the commit the installed client was built from,
-and the content locator its setup computed.
+Both carry two placeholders: `CAOS_SERVER_ARG_HERE` before `mcp`, where the
+global `--server=<url>` goes, and `CAOS_MCP_ARGS_HERE` after it, where the rest
+go. `run` fills them from `CAOS_SERVER_URL`, `CAOS_STEP` (by default the
+server's own `refs/caos/dev`) and `CAOS_BASE`, and the cloud installer fills
+them with the server, a step locator pinned to the commit the installed client
+was built from, and the content locator its setup computed.
 
 **`${CLAUDE_PROJECT_DIR}` expands in a hook command but NOT in `mcp.json`.**
 Claude Code sets that variable in the environment *of* a spawned stdio server;

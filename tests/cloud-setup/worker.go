@@ -249,6 +249,9 @@ func main() {
 			"the prompt hook does not name the step as a quoted shell word: %s", prompt)
 		w.True(strings.Contains(prompt, "'--base:@@=git+caos://local?rev="+seed+"'") && strings.Contains(prompt, "'--server="+serverURL+"'") && strings.Contains(prompt, "'"+readersArg+"'"),
 			"the prompt hook does not name the server, the content and the readers: %s", prompt)
+		// The server is the client's GLOBAL flag: only ahead of `mcp` is it read.
+		w.True(strings.Contains(prompt, "caos '--server="+serverURL+"' mcp hook "),
+			"the prompt hook does not name the server before `mcp`: %s", prompt)
 		w.True(!strings.Contains(prompt, "${CAOS_BIN"),
 			"the shared asset's ${CAOS_BIN} placeholder survived into the config: %s", prompt)
 		w.True(hookCommand(settings, "SessionStart") == "caos-cloud-session-start",
@@ -289,6 +292,8 @@ func main() {
 		// which the client reads as a flag with a nonsense value.
 		w.True(contains(args, "--base:@@=git+caos://local?rev="+seed) && contains(args, "--server="+serverURL) && contains(args, readersArg),
 			"the tool server is not told the server, the content and the readers, each as its own argument: %v", args)
+		w.True(len(args) > 2 && args[0] == "--server="+serverURL && args[1] == "mcp" && args[2] == "serve",
+			"the tool server is not named the server before `mcp serve`: %v", args)
 
 		// -------------------------------------------------------------------
 		w.Step("stage 1 in dev mode seeds a session and leaves the checkout clean")

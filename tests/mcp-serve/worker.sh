@@ -26,8 +26,8 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 # is request/response with UNSOLICITED notifications interleaved, so a reader
 # has to skip lines it did not ask for rather than assume the next line is its
 # answer.
-open_server() { # <arguments: the server and the step>
-  coproc SERVER { "$CAOS_CLI" mcp serve $1 2>/tmp/mcp-serve.err; }
+open_server() { # <the global --server flag> <arguments: the step>
+  coproc SERVER { "$CAOS_CLI" $1 mcp serve $2 2>/tmp/mcp-serve.err; }
   SERVER_IN=${SERVER[1]}
   SERVER_OUT=${SERVER[0]}
 }
@@ -74,7 +74,7 @@ echo "== with no server, the handshake and the list still answer, and help says 
 # slower than that from the session with no tools and no reason, and a handshake
 # that crossed an iroh relay from a cold container lost that race. Only a call
 # needs the server, and a call to a dead one must say so.
-open_server "--server=http://127.0.0.1:9 --llm-step:hash=0000000000000000000000000000000000000000"
+open_server "--server=http://127.0.0.1:9" "--llm-step:hash=0000000000000000000000000000000000000000"
 send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 init=$(await '"id":1' 10) || fail "the handshake did not answer without a server"
 for needle in 'instructions' 'help(path)' 'run(path' 'eval-path' 'caos-std'; do
@@ -99,7 +99,7 @@ esac
 close_server
 
 echo "== the real step: the same five tools, and none of the old registry ==" >&2
-open_server "$CAOS_MCP_ARGS"
+open_server "$CAOS_MCP_SERVER" "$CAOS_MCP_ARGS"
 send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 init=$(await '"id":1' 10) || fail "the handshake did not answer"
 # The instructions are how the model learns what to do with five tools and no
@@ -202,7 +202,7 @@ git add generated mcp-marker
 git -c user.name=test -c user.email=test@caos commit -qm mcp-generated-tools
 session="mcp-path-$(date +%s)-$$"
 printf '{"hook_event_name":"UserPromptSubmit","session_id":"%s","prompt":"test generated tools"}\n' "$session" \
-  | "$CAOS_CLI" mcp hook $CAOS_MCP_ARGS "$(mcp_base_arg)"
+  | "$CAOS_CLI" $CAOS_MCP_SERVER mcp hook $CAOS_MCP_ARGS "$(mcp_base_arg)"
 key=$(printf 'cc/%s' "$session" | od -An -tx1 | tr -d ' \n')
 # The prompt hook recorded it on the server; fetch it.
 git fetch -q caos "+refs/caos/v4/sessions/$key/head:refs/caos/v4/sessions/$key/head"
@@ -287,7 +287,7 @@ git add slow
 git -c user.name=test -c user.email=test@caos commit -qm slow-tool
 held="mcp-held-$(date +%s)-$$"
 hook() { # <event JSON>
-  printf '%s\n' "$1" | "$CAOS_CLI" mcp hook $CAOS_MCP_ARGS "$(mcp_base_arg)"
+  printf '%s\n' "$1" | "$CAOS_CLI" $CAOS_MCP_SERVER mcp hook $CAOS_MCP_ARGS "$(mcp_base_arg)"
 }
 hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$held\",\"prompt\":\"run slow\"}"
 held_ref="refs/caos/v4/sessions/$(printf 'cc/%s' "$held" | od -An -tx1 | tr -d ' \n')/head"
@@ -436,7 +436,7 @@ echo "== an unreachable caos server is named, not waited on ==" >&2
 # a real cloud container showed. A refused port is the testable half: it proves the
 # probe runs and that its message names the server. The swallowing half is the same
 # code path with a timeout instead of a refusal.
-open_server "--server=http://127.0.0.1:9 ${CAOS_MCP_ARGS#* }"
+open_server "--server=http://127.0.0.1:9" "$CAOS_MCP_ARGS"
 send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 await '"id":1' 10 >/dev/null || fail "the handshake did not answer without a server"
 # `help` with no path, for a session: it says

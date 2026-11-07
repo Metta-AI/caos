@@ -167,14 +167,18 @@ else
     exit 1
 fi
 
-# The server is an argument, not an environment variable. Without one the tool
-# server still starts and `help` says what is missing.
+# The server is an argument, not an environment variable: the client's global
+# --server, which goes BEFORE `mcp`. Without one the tool server still starts and
+# `help` says what is missing.
 server_arg=()
 if resolved "${CAOS_MCP_DEFAULT_SERVER:-}"; then
     server_arg=("--server=$CAOS_MCP_DEFAULT_SERVER")
 fi
-# The reader keys too: without them every tool runs with no secret granted.
+# The reader keys too, after `mcp`: without them every tool runs with no secret
+# granted.
+reader_arg=()
 if resolved "${CAOS_SECRET_READERS:-}"; then
-    server_arg+=("--secret-readers=$CAOS_SECRET_READERS")
+    reader_arg=("--secret-readers=$CAOS_SECRET_READERS")
 fi
-exec "$bin" mcp serve ${server_arg[@]+"${server_arg[@]}"} "$llm_step"
+exec "$bin" ${server_arg[@]+"${server_arg[@]}"} mcp serve \
+    ${reader_arg[@]+"${reader_arg[@]}"} "$llm_step"

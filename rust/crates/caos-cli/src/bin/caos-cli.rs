@@ -59,7 +59,7 @@ fn main() -> ExitCode {
 /// invocation, overriding the checkout's `caos` git remote — for every
 /// command: `caos-cli --server=caos://<ticket> watch <ticket>`. Only flags
 /// ahead of the command are global; a `--server` after it belongs to that
-/// command (`mcp`, `secrets-push` and `tui` take their own).
+/// command (`secrets-push` and `tui` take their own; `mcp` takes only this one).
 fn take_global_flags(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
     let mut rest = args.iter().skip(1);
     let mut server = None;
@@ -224,7 +224,7 @@ fn usage(args: &[String]) -> String {
          {prog} chat <name> [-m <message>] [--base <revspec>] [--log] [--username <name>] [session options]\n    \
          (a session names its two workers: --llm-step:@=<path> --llm-call:@=<path>,\n     \
          typed like any image arg — caos-std/<name> in a repo that mounted caos)\n  \
-         {prog} mcp <hook | serve | diag> --server=<url> --llm-step:@@=<locator> [--base:@@=<locator>]\n    \
+         {prog} --server=<url> mcp <hook | serve | diag> --llm-step:@@=<locator> [--base:@@=<locator>]\n    \
          (Claude Code: the hook that records a session, and the MCP tool server it spawns)\n  \
          {prog} run-tool <script | name> [--name=value ...]\n  \
          {prog} eval-path [--tree=<oid>] <path>\n  \

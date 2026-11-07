@@ -14,7 +14,7 @@
 //! the ref is the whole record.
 //!
 //! NOTHING HERE READS A CHECKOUT. A process knows the server it talks to (from
-//! `--server=<url>`, or the environment), the step that runs tools
+//! the global `caos-cli --server=<url> mcp ...`), the step that runs tools
 //! (`--llm-step:@@=<locator>`) and, for a session's first prompt, where its
 //! content comes from (`--base:@@=<locator>`); the rest is a request to the
 //! server. A harness that wants uncommitted files in a session commits and
@@ -66,7 +66,8 @@ const CLAUDE_CODE_MODEL: &str = "claude-code";
 /// which step runs the tools, and where a new session's content comes from.
 #[derive(Clone, Debug, Default)]
 pub struct Config {
-    /// `--server=<url>`; the environment otherwise ([`Config::server`]).
+    /// The global `caos-cli --server=<url>` ahead of `mcp`
+    /// ([`caos::server_override`]); nothing else names it.
     server: Option<String>,
     /// The `--llm-step:@@=<locator>` argument, verbatim.
     step: Option<String>,
@@ -84,7 +85,10 @@ pub struct Config {
 
 impl Config {
     fn parse(args: &[String]) -> Result<(Self, Vec<&str>), String> {
-        let mut config = Config::default();
+        let mut config = Config {
+            server: caos::server_override().map(String::from),
+            ..Config::default()
+        };
         let mut turn = TurnOptions::default();
         let mut rest = Vec::new();
         for argument in args {
@@ -96,8 +100,11 @@ impl Config {
                 })?);
             } else if argument == "--agents-md" {
                 config.agents_md = true;
-            } else if let Some(url) = argument.strip_prefix("--server=") {
-                config.server = Some(url.to_string());
+            } else if argument == "--server" || argument.starts_with("--server=") {
+                return Err(format!(
+                    "{argument}: the server is a global flag, named before the command: \
+                     `caos-cli --server=<url> mcp ...`"
+                ));
             } else if let Some(locator) = argument.strip_prefix("--base:@@=") {
                 config.base = Some(locator.to_string());
             } else if argument.starts_with("--base=") || argument.starts_with("--base:") {
@@ -115,9 +122,10 @@ impl Config {
 
     /// The server this process talks to.
     fn server(&self) -> Result<String, String> {
-        self.server
-            .clone()
-            .ok_or_else(|| "no caos server: pass --server=<url>".to_string())
+        self.server.clone().ok_or_else(|| {
+            "no caos server: pass it before the command, `caos-cli --server=<url> mcp ...`"
+                .to_string()
+        })
     }
 }
 
@@ -137,10 +145,10 @@ pub fn cli_mcp(args: &[String]) -> Result<(), String> {
 fn usage() -> String {
     format!(
         "usage:\n  \
-         caos mcp hook    (reads one Claude Code hook payload on stdin)\n  \
-         caos mcp serve   (workspace tool server; JSON-RPC on stdio)\n\n\
-         Both take the server (--server=<url>) and name the step that \
-         runs this session's tools:\n  \
+         caos --server=<url> mcp hook    (reads one Claude Code hook payload on stdin)\n  \
+         caos --server=<url> mcp serve   (workspace tool server; JSON-RPC on stdio)\n\n\
+         Both need the server, as the global --server=<url> before `mcp`, and name the \
+         step that runs this session's tools:\n  \
          {}\n\
          and the hook takes `--base:@@=<git locator>` for what a new session starts from, \
          and `--agents-md` to answer the prompt that creates it with the session's \
@@ -773,16 +781,14 @@ mod config_tests {
     }
 
     #[test]
-    fn the_arguments_name_the_server_the_step_and_the_base() {
+    fn the_arguments_name_the_step_and_the_base() {
         let given = args(&[
             "hook",
-            "--server=http://s",
             "--llm-step:@@=github:o/r?rev=abc",
             "--base:@@=github:o/c?rev=def",
         ]);
         let (config, rest) = Config::parse(&given).unwrap();
         assert_eq!(rest, ["hook"]);
-        assert_eq!(config.server.as_deref(), Some("http://s"));
         assert_eq!(
             config.step.as_deref(),
             Some("--llm-step:@@=github:o/r?rev=abc")
@@ -793,6 +799,19 @@ mod config_tests {
         let (config, rest) = Config::parse(&given).unwrap();
         assert_eq!(rest, ["hook"]);
         assert!(config.agents_md);
+    }
+
+    /// The server is the global flag, ahead of `mcp`; one after it is refused
+    /// with the form that works, rather than ignored.
+    #[test]
+    fn a_server_after_mcp_is_refused_with_the_global_form() {
+        for given in [
+            args(&["hook", "--server=http://s"]),
+            args(&["serve", "--server", "http://s"]),
+        ] {
+            let error = Config::parse(&given).unwrap_err();
+            assert!(error.contains("caos-cli --server=<url> mcp"), "{error}");
+        }
     }
 
     /// `--base=<sha>` named a commit in a checkout, and nothing reads one now.
@@ -807,7 +826,7 @@ mod config_tests {
         }
     }
     #[test]
-    fn a_server_is_named_by_argument_only() {
+    fn a_missing_server_names_the_global_flag() {
         let named = Config {
             server: Some("http://arg".into()),
             ..Config::default()

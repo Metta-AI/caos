@@ -3,7 +3,7 @@
     "caos": {
       "type": "stdio",
       "command": "${CAOS_BIN:-caos}",
-      "args": ["mcp", "serve", "CAOS_MCP_ARGS_HERE"]
+      "args": ["CAOS_SERVER_ARG_HERE", "mcp", "serve", "CAOS_MCP_ARGS_HERE"]
     }
   }
 }

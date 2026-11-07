@@ -253,9 +253,10 @@ def _run_hook(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
         result = subprocess.run(
             [
                 bin_path,
+                # The client's global flag: it goes before `mcp`.
+                f"--server={server}",
                 "mcp",
                 "hook",
-                f"--server={server}",
                 step,
                 *_base_args(),
                 # Hermes reads AGENTS.md from where `hermes serve` was started,

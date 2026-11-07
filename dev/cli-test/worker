@@ -149,14 +149,16 @@ git add -A && git commit -qm testtree
 # THE ARGUMENTS `caos mcp` TAKES, for a test that drives it. `caos mcp` reads no
 # checkout: it is told the server, the step and (for a session's first prompt)
 # where its content comes from, all by name. Set only for a test that carries
-# DEEP-DEPS/llm-step.
+# DEEP-DEPS/llm-step. The server is the client's GLOBAL flag, so it is its own
+# variable and goes BEFORE `mcp`: `"$CAOS_CLI" $CAOS_MCP_SERVER mcp hook $CAOS_MCP_ARGS`.
 #
 # THE STEP IS A HASH, not a path: a path names a file in a checkout. Evaluating it
 # here is the client's own `eval-path`, the same walk `:@=` does.
 if [ -d ./DEEP-DEPS/llm-step ]; then
   step=$("$CAOS_CLI" eval-path DEEP-DEPS/llm-step) || fail "evaluating DEEP-DEPS/llm-step"
-  CAOS_MCP_ARGS="--server=$CAOS_SERVER_URL --llm-step:hash=${step##* }"
-  export CAOS_MCP_ARGS
+  CAOS_MCP_SERVER="--server=$CAOS_SERVER_URL"
+  CAOS_MCP_ARGS="--llm-step:hash=${step##* }"
+  export CAOS_MCP_SERVER CAOS_MCP_ARGS
 fi
 
 # A SESSION'S CONTENT is named by locator, and the server fetches it: so this
