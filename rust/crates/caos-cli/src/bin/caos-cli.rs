@@ -30,7 +30,12 @@ fn main() -> ExitCode {
     }));
     caos::set_secret_readers(caos_cli::secret_store::reader_keys());
     let args: Vec<String> = std::env::args().collect();
-    let args = match take_global_flags(&args) {
+    let args = match take_global_flags(&args).and_then(|(server, args)| {
+        if let Some(server) = server {
+            caos::set_server_override(&server)?;
+        }
+        Ok(args)
+    }) {
         Ok(args) => args,
         Err(err) => {
             eprintln!("{}: {err}", prog_name(&args));
