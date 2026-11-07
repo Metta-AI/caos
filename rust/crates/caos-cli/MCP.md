@@ -144,11 +144,12 @@ absolute path from its own location and has no such constraint.
 
 `settings.json` points every hook at `caos mcp hook` (and denies the GitHub tools caos covers, below).
 `mcp.json` declares the tool server.
-Both carry the placeholder `CAOS_MCP_ARGS_HERE` where those arguments go: `run`
-fills it from `CAOS_SERVER_URL`, `CAOS_STEP` (by default the server's own
-`refs/caos/dev`) and `CAOS_BASE`, and the cloud installer fills it with the
-server, a step locator pinned to the commit the installed client was built from,
-and the content locator its setup computed.
+Both carry two placeholders: `CAOS_SERVER_ARG_HERE` before `mcp`, where the
+global `--server=<url>` goes, and `CAOS_MCP_ARGS_HERE` after it, where the rest
+go. `run` fills them from `CAOS_SERVER_URL`, `CAOS_STEP` (by default the
+server's own `refs/caos/dev`) and `CAOS_BASE`, and the cloud installer fills
+them with the server, a step locator pinned to the commit the installed client
+was built from, and the content locator its setup computed.
 
 **`${CLAUDE_PROJECT_DIR}` expands in a hook command but NOT in `mcp.json`.**
 Claude Code sets that variable in the environment *of* a spawned stdio server;
